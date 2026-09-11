@@ -13,6 +13,7 @@ function reader(rec: Partial<DecryptedServiceCredential> & { slug: string }): Se
     secret: SECRET,
     delivery: "broker",
     host: "api.x.com",
+    deployments: true,
     enabled: true,
     ...rec,
   };
@@ -218,6 +219,39 @@ test("WHAT path allowlist: an out-of-allowlist path is refused", async () => {
   assert.equal(cap.calls.length, 0);
 });
 
+test("WHAT path allowlist: percent-encoded parent traversal never escapes the prefix", async () => {
+  const mk = () => reader({ slug: "x-firehose", allowedPathPrefixes: ["/2/tweets/search"] });
+  const evil = [
+    "https://api.x.com/2/tweets/search/../secrets", // literal
+    "https://api.x.com/2/tweets/search/..%2fsecrets", // encoded slash
+    "https://api.x.com/2/tweets/search/%2e%2e/secrets", // encoded dots (URL-normalized out of prefix)
+    "https://api.x.com/2/tweets/search/%2e%2e%2fsecrets", // fully encoded
+    "https://api.x.com/2/tweets/search/%252e%252e%252fsecrets", // double-encoded
+    "https://api.x.com/2/tweets/search/..%5csecrets", // encoded backslash
+    "https://api.x.com/2/tweets/search/%zz", // undecodable
+  ];
+  for (const url of evil) {
+    const cap = captureFetch();
+    const r = await brokerCredentialCall(
+      base({ reader: mk(), body: { credential: "x-firehose", url }, fetchImpl: cap.fetch }),
+    );
+    assert.equal(r.status, 403, url);
+    assert.match(JSON.stringify(r.json), /path_not_allowed/, url);
+    assert.equal(cap.calls.length, 0, `no upstream fetch for ${url}`);
+  }
+  // benign lookalikes still pass: dots inside a segment are not dot segments
+  const cap = captureFetch();
+  const ok = await brokerCredentialCall(
+    base({
+      reader: mk(),
+      body: { credential: "x-firehose", url: "https://api.x.com/2/tweets/search/v1..v2/some%20file" },
+      fetchImpl: cap.fetch,
+    }),
+  );
+  assert.equal(ok.status, 200);
+  assert.equal(cap.calls.length, 1);
+});
+
 test("a disabled credential is refused even when the token still names it (live re-check)", async () => {
   const cap = captureFetch();
   const r = await brokerCredentialCall(
@@ -285,4 +319,141 @@ test("a missing slug or url is a 400 bad_request", async () => {
     400,
   );
   assert.equal((await brokerCredentialCall(base({ body: { credential: "x-firehose" } }))).status, 400);
+});
+
+test("actor attestation is opt-in and taken from capability claims", async () => {
+  for (const actor of [undefined, false, true]) {
+    const cap = captureFetch();
+    const result = await brokerCredentialCall(
+      base({
+        claims: { ...claims(["x-firehose"]), actorId: "actor-42" },
+        reader: reader({ slug: "x-firehose", injection: actor === undefined ? {} : { actor } }),
+        fetchImpl: cap.fetch,
+      }),
+    );
+    assert.equal(result.status, 200);
+    assert.equal(cap.calls[0]!.headers["x-qm-actor"], actor ? "actor-42" : undefined);
+    assert.equal(cap.calls[0]!.headers.Authorization, `Bearer ${SECRET}`);
+  }
+});
+
+test("callers cannot supply an actor header even when attestation is disabled", async () => {
+  for (const actor of [false, true]) {
+    for (const key of ["x-qm-actor", "X-QM-Actor"]) {
+      const cap = captureFetch();
+      const result = await brokerCredentialCall(
+        base({
+          body: { credential: "x-firehose", url: "https://api.x.com/", headers: { [key]: "other-actor" } },
+          reader: reader({ slug: "x-firehose", injection: { actor } }),
+          fetchImpl: cap.fetch,
+        }),
+      );
+      assert.equal(result.status, 400);
+      assert.deepEqual(result.json, { error: "reserved_header", message: "x-qm-actor is set only by the broker" });
+      assert.equal(cap.calls.length, 0);
+    }
+  }
+});
+
+test("actor attestation fails closed for malformed identities and injection configuration", async () => {
+  for (const actorId of ["", "a\r\nb", "a b", "é", "a".repeat(257)]) {
+    const cap = captureFetch();
+    const result = await brokerCredentialCall(
+      base({
+        claims: { ...claims(["x-firehose"]), actorId },
+        reader: reader({ slug: "x-firehose", injection: { actor: true } }),
+        fetchImpl: cap.fetch,
+      }),
+    );
+    assert.equal(result.status, 403);
+    assert.equal(cap.calls.length, 0);
+  }
+  for (const injection of [{ actor: "yes" }, { header: "X-QM-Actor" }, { scheme: "Bearer\n" }]) {
+    const cap = captureFetch();
+    const result = await brokerCredentialCall(
+      base({
+        reader: reader({ slug: "x-firehose", injection: injection as never }),
+        fetchImpl: cap.fetch,
+      }),
+    );
+    assert.equal(result.status, 503);
+    assert.equal(cap.calls.length, 0);
+  }
+});
+
+test("actor-attested credentials require exact host while legacy subdomain matching remains", async () => {
+  for (const actor of [false, true]) {
+    const cap = captureFetch();
+    const result = await brokerCredentialCall({
+      claims: claims(["relay"]),
+      body: { credential: "relay", url: "https://child.example.test/read" },
+      orgScopeId: "org:default-org",
+      reader: reader({ slug: "relay", host: "example.test", injection: { actor } }),
+      fetchImpl: cap.fetch,
+    });
+    assert.equal(result.status, actor ? 403 : 200);
+    assert.equal(cap.calls.length, actor ? 0 : 1);
+  }
+  const cap = captureFetch();
+  const result = await brokerCredentialCall({
+    claims: claims(["relay"]),
+    body: { credential: "relay", url: "https://example.test/read" },
+    orgScopeId: "org:default-org",
+    reader: reader({ slug: "relay", host: "example.test", injection: { actor: true } }),
+    fetchImpl: cap.fetch,
+  });
+  assert.equal(result.status, 200);
+  assert.equal(cap.calls[0]!.headers["x-qm-actor"], "U1");
+});
+
+test("actor attestation rejects alternate ports before sending credentials", async () => {
+  const cap = captureFetch();
+  const result = await brokerCredentialCall({
+    claims: claims(["relay"]),
+    body: { credential: "relay", url: "https://example.test:8443/read" },
+    orgScopeId: "org:default-org",
+    reader: reader({ slug: "relay", host: "example.test", injection: { actor: true } }),
+    fetchImpl: cap.fetch,
+  });
+  assert.equal(result.status, 403);
+  assert.equal(cap.calls.length, 0);
+});
+
+test("a deployment token is refused when the credential is switched off for published apps, and audited with the app id when it is on", async () => {
+  const cap = captureFetch();
+  const audits: Array<{ action: string; detail?: string }> = [];
+  const audit = (e: { action: string; detail?: string }) => audits.push(e);
+  const asApp = { ...claims(["x-firehose"]), actorId: "publisher", deployment: "dpl-1" };
+  const off = await brokerCredentialCall(
+    base({
+      claims: asApp,
+      reader: reader({ slug: "x-firehose", deployments: false, allowedPathPrefixes: ["/2/tweets/search/"] }),
+      fetchImpl: cap.fetch,
+      audit,
+    }),
+  );
+  assert.equal(off.status, 403);
+  assert.equal((off.json as { error: string }).error, "not_available_to_deployments");
+  assert.equal(cap.calls.length, 0, "nothing is fetched upstream");
+  const on = await brokerCredentialCall(
+    base({
+      claims: asApp,
+      reader: reader({ slug: "x-firehose", deployments: true, allowedPathPrefixes: ["/2/tweets/search/"] }),
+      fetchImpl: cap.fetch,
+      audit,
+    }),
+  );
+  assert.equal(on.status, 200);
+  assert.equal(cap.calls.length, 1);
+  assert.deepEqual(
+    audits.map((e) => [e.action, e.detail]),
+    [
+      ["credential.broker.denied", "not_available_to_deployments"],
+      ["credential.broker.use", "deployment:dpl-1"],
+    ],
+  );
+  const agent = await brokerCredentialCall(
+    base({ reader: reader({ slug: "x-firehose", deployments: false, allowedPathPrefixes: ["/2/tweets/search/"] }) }),
+  );
+  assert.equal(agent.status, 200, "an agent turn's token is not affected by the published-apps switch");
 });

@@ -35,9 +35,11 @@ export interface DeployInput {
   homeFiles?: DeployFile[];
   name?: string;
   env?: Record<string, string>;
+  alwaysOn?: boolean;
 }
 
-export type Reach = { status: "ok"; endpoint: DeployEndpoint } | { status: "denied" } | { status: "not_found" };
+export type Reach =
+  { status: "ok"; id: string; endpoint: DeployEndpoint } | { status: "denied" } | { status: "not_found" };
 
 export interface DeployOrUpdateInput {
   ownerScopeId: ScopeId;
@@ -51,6 +53,7 @@ export interface DeployOrUpdateInput {
   rollbackTo?: number;
   share?: Array<{ scope: ScopeId; permission: Permission }>;
   createdInScope?: ScopeId;
+  alwaysOn?: boolean;
   defaultAudience?: { contextScopeId: ScopeId; granteeScopeIds: ScopeId[]; snapshotAt: number; force?: boolean };
 }
 
@@ -60,6 +63,7 @@ export interface ReachOptions {
 
 export interface DeployService {
   readonly providerProfile: DeployProfile;
+  providerProfileFor?(deployment: Deployment): DeployProfile;
   deploy(input: DeployInput): Promise<Deployment>;
   redeploy(
     id: string,
@@ -72,7 +76,12 @@ export interface DeployService {
   restoreDeployment(id: string, actorId?: string): Promise<Deployment>;
   renameDeployment(id: string, name: string): Promise<Deployment>;
   setDeploymentDisplayName(id: string, displayName: string): Promise<Deployment>;
+  setDeploymentAlwaysOn(id: string, alwaysOn: boolean): Promise<Deployment>;
+
+  keepAlwaysOnWarm(): Promise<number>;
   reachDeployment(idOrName: string, principalId: string, opts?: ReachOptions): Promise<Reach>;
+  /** Recent app output (entrypoint stdout+stderr) for a deployment, newest last; null when the provider keeps none. */
+  deploymentLogs(idOrName: string, opts: { tailLines: number }): Promise<string | null>;
   gitRepoPath(idOrName: string): Promise<string | null>;
   pushGit<T>(id: string, runReceivePack: () => Promise<{ result: T; ok: boolean }>): Promise<T>;
   reapIdleDeployments(ttlMs: number, now?: number): Promise<number>;
@@ -100,6 +109,7 @@ export interface DeploymentGrantee {
 export interface DeployServiceDeps {
   deployStore: DeployStore;
   provider: DeployProvider;
+  providerFor?: (deployment: Deployment) => DeployProvider;
   deployDir: string;
   auditLog: AuditLog;
   acl: AclStore;
@@ -108,6 +118,7 @@ export interface DeployServiceDeps {
   canReadScope?: (principalId: string, scopeId: ScopeId) => Promise<boolean>;
   canWriteScope?: (principalId: string, scopeId: ScopeId) => Promise<boolean>;
   managesArtifactHome?: (homeScopeId: ScopeId, createdBy: string, principalId: string) => Promise<boolean>;
+  deploymentEnv?: (deployment: Deployment) => Promise<Record<string, string>>;
 }
 
 const NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
@@ -128,10 +139,22 @@ function validateDisplayName(displayName: string): void {
   if (displayName.length > DISPLAY_NAME_MAX) throw new Error(`display name too long (max ${DISPLAY_NAME_MAX} chars)`);
 }
 
+function deploymentEntrypoint(d: Deployment | null): string | undefined {
+  if (!d) return undefined;
+  return d.versions.find((v) => v.version === d.currentVersion)?.entrypoint || undefined;
+}
+
+function requiredEntrypoint(input: string | undefined, d: Deployment | null): string {
+  const entrypoint = input ?? deploymentEntrypoint(d);
+  if (!entrypoint) throw new Error('publish requires an entrypoint, e.g. "node server.js"');
+  return entrypoint;
+}
+
 export function createDeployService(deps: DeployServiceDeps): DeployService {
   const leaderLease = deps.leaderLease ?? createNoopLeaderLease();
   const advisoryLock = deps.advisoryLock ?? createNoopAdvisoryLock();
   const deployQueue = createKeyedQueue();
+  const providerFor = (deployment: Deployment): DeployProvider => deps.providerFor?.(deployment) ?? deps.provider;
   function withDeployLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
     return deployQueue(id, () => advisoryLock.withLock(`deploy:${id}`, fn));
   }
@@ -142,19 +165,29 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     fromVersion?: number,
   ): Promise<DeployEndpoint> => {
     const d = (await deps.deployStore.get(id))!;
+    const provider = providerFor(d);
+    const deploymentEnv = await deps.deploymentEnv?.(d);
+    if (deploymentEnv && Object.keys(deploymentEnv).length)
+      version = { ...version, env: { ...version.env, ...deploymentEnv } };
     let endpoint: DeployEndpoint;
-    if (deps.provider.reconcile && version.commit) {
+    if (provider.reconcile && version.commit) {
       const diff = await deps.deployStore.diffVersions(id, fromVersion, version.version);
       const allPaths = ((await deps.deployStore.treeOf(id, version.version)) ?? []).map((f) => f.path);
       const gitBundle = await deps.deployStore.bundleOf(id, version.version);
-      endpoint = await deps.provider.reconcile(d, version, {
+      endpoint = await provider.reconcile(d, version, {
         ...(gitBundle ? { gitBundle } : {}),
         changedPaths: diff ? [...diff.added, ...diff.modified].map((f) => f.path) : allPaths,
         deletedPaths: diff?.deleted.map((f) => f.path) ?? [],
         allPaths,
       });
     } else {
-      endpoint = await deps.provider.apply(d, version);
+      let materialized = version;
+      if (version.commit) {
+        const files = await deps.deployStore.filesOf(id, version.version);
+        if (files == null) throw new Error(`cannot materialize deployment ${id} version ${version.version}`);
+        materialized = { ...version, snapshotDir: await snapshotFiles(deps.deployDir, files) };
+      }
+      endpoint = await provider.apply(d, materialized);
     }
     if (endpoint.image && endpoint.image !== version.image) {
       await deps.deployStore.setVersionImage(id, version.version, endpoint.image);
@@ -169,10 +202,11 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
   };
 
   const liveEndpoint = async (d: Deployment): Promise<DeployEndpoint> => {
-    if (!deps.provider.resolveEndpoint || d.endpoint == null) return d.endpoint!;
+    const provider = providerFor(d);
+    if (!provider.resolveEndpoint || d.endpoint == null) return d.endpoint!;
     const version = d.versions.find((v) => v.version === d.currentVersion);
     if (!version) return d.endpoint;
-    const resolved = await deps.provider.resolveEndpoint(d, version);
+    const resolved = await provider.resolveEndpoint(d, version);
     if (resolved) {
       if (!endpointsEqual(resolved, d.endpoint)) await deps.deployStore.setEndpoint(d.id, resolved);
       return resolved;
@@ -180,7 +214,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     return withDeployLock(d.id, async () => {
       const cur = (await deps.deployStore.get(d.id)) ?? d;
       const v = cur.versions.find((x) => x.version === cur.currentVersion) ?? version;
-      const again = await deps.provider.resolveEndpoint!(cur, v);
+      const again = await providerFor(cur).resolveEndpoint?.(cur, v);
       if (again) {
         if (!endpointsEqual(again, cur.endpoint)) await deps.deployStore.setEndpoint(cur.id, again);
         return again;
@@ -314,6 +348,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
 
   return {
     providerProfile: deps.provider.profile,
+    providerProfileFor: (deployment) => providerFor(deployment).profile,
 
     async deploy(input) {
       if (input.name !== undefined) {
@@ -332,6 +367,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         ...(input.name !== undefined ? { name: input.name } : {}),
         ...(input.createdInScope !== undefined ? { createdInScope: input.createdInScope } : {}),
         ...(input.env ? { env: input.env } : {}),
+        ...(input.alwaysOn !== undefined ? { alwaysOn: input.alwaysOn } : {}),
       });
       const endpoint = await applyVersion(d.id, d.versions[0]!);
       await markVersionRunning(d.id, d.versions[0]!.version, endpoint);
@@ -403,7 +439,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       return withDeployLock(id, async () => {
         const d = await deps.deployStore.get(id);
         if (!d) return;
-        await deps.provider.destroy(d);
+        await providerFor(d).destroy(d);
         await deps.deployStore.setStatus(id, "archived");
         await deps.deployStore.setEndpoint(id, null);
       });
@@ -421,7 +457,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
           const endpoint = await applyVersion(id, version, d.appliedVersion);
           await markVersionRunning(id, version.version, endpoint);
         } catch (error) {
-          await deps.provider
+          await providerFor(d)
             .destroy(d)
             .catch((cleanupError) => swallow("deploy restore runtime cleanup", cleanupError));
           await deps.deployStore
@@ -479,13 +515,54 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       });
     },
 
+    async setDeploymentAlwaysOn(id, alwaysOn) {
+      return withDeployLock(id, async () => {
+        const d = await deps.deployStore.get(id);
+        if (!d) throw new Error(`unknown deployment: ${id}`);
+        await deps.deployStore.setAlwaysOn(id, alwaysOn);
+        deps.auditLog.record({
+          at: Date.now(),
+          principalId: d.createdBy,
+          action: "deploy_always_on",
+          resource: id,
+          scopeLabel: d.ownerScopeId,
+        });
+        return (await deps.deployStore.get(id))!;
+      });
+    },
+
+    async keepAlwaysOnWarm() {
+      const result = await leaderLease.hold("deployments:keep-warm", async () => {
+        let warmed = 0;
+        for (const d of await deps.deployStore.list()) {
+          if (!d.alwaysOn || d.status !== "running") continue;
+          try {
+            const cur = await deps.deployStore.get(d.id);
+            if (!cur?.alwaysOn || cur.status !== "running") continue;
+            await liveEndpoint(cur);
+            warmed++;
+          } catch (e) {
+            console.error("%s", `[deploy] keep-warm failed for ${d.name ?? d.id}:`, errMessage(e));
+          }
+        }
+        return warmed;
+      });
+      return result ?? 0;
+    },
+
     async reachDeployment(idOrName, principalId, opts = {}): Promise<Reach> {
       const d = (await deps.deployStore.get(idOrName)) ?? (await deps.deployStore.getByName(idOrName));
       if (!d || d.status !== "running" || d.endpoint == null) return { status: "not_found" };
       if (!opts.bypassAcl && !(await reachAllowed(d, principalId))) return { status: "denied" };
       const endpoint = await liveEndpoint(d);
-      await deps.deployStore.touch(d.id, Date.now());
-      return { status: "ok", endpoint };
+      await deps.deployStore.touch(d.id, Date.now()).catch((e) => swallow("deploy reach touch", e));
+      return { status: "ok", id: d.id, endpoint };
+    },
+
+    async deploymentLogs(idOrName, opts): Promise<string | null> {
+      const d = (await deps.deployStore.get(idOrName)) ?? (await deps.deployStore.getByName(idOrName));
+      if (!d || d.status !== "running") return null;
+      return (await providerFor(d).logs?.(d, opts)) ?? null;
     },
 
     async gitRepoPath(idOrName) {
@@ -516,7 +593,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
             scopeLabel: before.ownerScopeId,
           });
         } catch (e) {
-          console.error(`[deploy] failed to register pushed version for ${id}:`, errMessage(e));
+          console.error("%s", `[deploy] failed to register pushed version for ${id}:`, errMessage(e));
           deps.auditLog.record({
             at: Date.now(),
             principalId: "system",
@@ -532,16 +609,18 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
 
     async reapIdleDeployments(ttlMs, now = Date.now()) {
       const result = await leaderLease.hold("deployments:reaper", async () => {
-        if (deps.provider.profile.managedScaleToZero) return 0;
         let stopped = 0;
         for (const d of await deps.deployStore.list()) {
-          if (d.status !== "running") continue;
+          if (d.status !== "running" || providerFor(d).profile.managedScaleToZero) continue;
+          if (d.alwaysOn) continue;
           const last = d.lastAccessAt ?? d.versions[d.versions.length - 1]?.createdAt ?? 0;
           if (now - last < ttlMs) continue;
           await withDeployLock(d.id, async () => {
             const cur = await deps.deployStore.get(d.id);
-            if (!cur || cur.status !== "running") return;
-            await deps.provider.destroy(cur);
+            if (!cur || cur.status !== "running" || cur.alwaysOn) return;
+            const provider = providerFor(cur);
+            if (provider.profile.managedScaleToZero) return;
+            await provider.destroy(cur);
             await deps.deployStore.setStatus(d.id, "stopped");
             await deps.deployStore.setEndpoint(d.id, null);
             stopped++;
@@ -572,9 +651,11 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
           resource: existing.id,
           scopeLabel: existing.ownerScopeId,
         });
-        if (input.entrypoint && input.files) {
+        if (input.alwaysOn !== undefined) await deps.deployStore.setAlwaysOn(existing.id, input.alwaysOn);
+        if ((input.entrypoint !== undefined || input.files !== undefined) && input.files) {
+          const entrypoint = requiredEntrypoint(input.entrypoint, existing);
           await this.redeploy(existing.id, {
-            entrypoint: input.entrypoint,
+            entrypoint,
             files: input.files,
             ...(input.homeFiles ? { homeFiles: input.homeFiles } : {}),
             ...(input.env ? { env: input.env } : {}),
@@ -592,12 +673,12 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         if (!existing) throw new Error(`no deployment named: ${input.name}`);
         if (!(await canManage(existing, ownerScopeId, createdBy, input.createdInScope)))
           throw new Error(`not authorized to manage deployment: ${input.name}`);
+        if (input.alwaysOn !== undefined) await deps.deployStore.setAlwaysOn(existing.id, input.alwaysOn);
         await this.rollbackDeployment(existing.id, input.rollbackTo);
         if (input.share?.length) await issueShares((await deps.deployStore.get(existing.id))!, createdBy, input.share);
         return (await deps.deployStore.get(existing.id))!;
       }
 
-      if (!input.entrypoint) throw new Error("publish requires an entrypoint");
       const files = input.files ?? [];
       const existing = input.name !== undefined ? await deps.deployStore.getByName(input.name) : null;
       let d: Deployment;
@@ -609,23 +690,27 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         ) {
           throw new Error(`deployment name taken: ${input.name}`);
         }
+        if (input.alwaysOn !== undefined) await deps.deployStore.setAlwaysOn(existing.id, input.alwaysOn);
+        const entrypoint = requiredEntrypoint(input.entrypoint, existing);
         d = await this.redeploy(existing.id, {
-          entrypoint: input.entrypoint,
+          entrypoint,
           files,
           ...(input.homeFiles ? { homeFiles: input.homeFiles } : {}),
           ...(input.env ? { env: input.env } : {}),
         });
         isCreate = false;
       } else {
+        const entrypoint = requiredEntrypoint(input.entrypoint, existing);
         d = await this.deploy({
           ownerScopeId,
           createdBy,
-          entrypoint: input.entrypoint,
+          entrypoint,
           files,
           ...(input.homeFiles ? { homeFiles: input.homeFiles } : {}),
           ...(input.name !== undefined ? { name: input.name } : {}),
           ...(input.createdInScope !== undefined ? { createdInScope: input.createdInScope } : {}),
           ...(input.env ? { env: input.env } : {}),
+          ...(input.alwaysOn !== undefined ? { alwaysOn: input.alwaysOn } : {}),
         });
         isCreate = true;
       }

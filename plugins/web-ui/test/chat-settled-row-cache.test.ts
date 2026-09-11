@@ -5,7 +5,7 @@ import test from "node:test";
 const chat = readFileSync(new URL("../src/chat.ts", import.meta.url), "utf8");
 
 test("the transcript renders rows through the settled-row cache", () => {
-  assert.match(chat, /messages\.map\(\(m, i\) =>\s*settledChatMessage\(m, i,/);
+  assert.match(chat, /messages\.map\(\(m, i\) =>\s*settledChatMessage\(m, i - inheritedOffset,/);
 });
 
 test("live or approval-paused rows bypass the cache (their render reads mutable state)", () => {
@@ -26,8 +26,16 @@ test("the cache key covers every mutable render input of a settled row", () => {
     "hit.stopReason === msg.stopReason",
     "hit.errorMessage === msg.errorMessage",
     "hit.approvalDecision === msg.approvalDecision",
+    "hit.sendFailure === msg.sendFailure",
     "hit.forkable === forkable",
+    "hit.speakerLabel === speakerLabel",
+    "hit.edited === edited",
+    "hit.deleted === deleted",
   ]) {
     assert.ok(chat.includes(field), `cache key must compare: ${field}`);
   }
+});
+
+test("prompt expansion is managed by the viewport without invalidating cached templates", () => {
+  assert.doesNotMatch(chat, /expandedPrompt|togglePromptExpanded/);
 });
