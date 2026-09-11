@@ -13,8 +13,8 @@ import {
   residentAuthProbeIsStale,
   type ResidentAuthConnector,
 } from "../../credentials/resident-auth.ts";
+import { expandServiceAliases } from "../../credentials/resident-paths.ts";
 import { shq } from "../../util/shell.ts";
-import type { BrokeredLayerTool } from "../../deployment/load-layer.ts";
 import { createSkillMaterializer, safeSkillDirName } from "../../skills/materialize.ts";
 import type { SkillResolution } from "../../skills/skill-store.ts";
 import { TURN_FILES_DIR } from "../attachments.ts";
@@ -36,21 +36,19 @@ export interface TurnSandboxContext {
   transferId: string;
   turnSessionDir: string;
   turnFilesDir: string;
-  turnOutboxDir: string;
   connectorEnv: Record<string, string>;
   egressTokenForTurn: string | undefined;
   isolateOwnerKeychain: boolean;
   ownerAuthAvailable: boolean;
   ownerAuthEnv: Record<string, string>;
   ownerEnvCredentialIds: string[];
-  brokerVended: Map<string, { tool: BrokeredLayerTool; env: Record<string, string> }>;
-  brokeredTools: readonly BrokeredLayerTool[];
+  credentialTools: readonly import("../../deployment/load-layer.ts").LayerCredentialTool[];
+  credentialServices: string[];
+  credentialCutoverServices: string[];
   quarantinedServices: string[];
-  brokerCutoverServices: string[];
   cutoverModeOf: (service: string) => DeviceFlowCutoverMode;
   visibleSkills: SkillResolution[];
   visibleSkillsForTurn: () => Promise<SkillResolution[]>;
-  skillScopes: ScopeId[];
   skillMaterializer: ReturnType<typeof createSkillMaterializer>;
   residentAuthConnectors: () => ResidentAuthConnector[];
   emitGapWork: (phase: GapPhase, start: number, end: number) => void;
@@ -69,21 +67,19 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
     transferId,
     turnSessionDir,
     turnFilesDir,
-    turnOutboxDir,
     connectorEnv,
     egressTokenForTurn,
     isolateOwnerKeychain,
     ownerAuthAvailable,
     ownerAuthEnv,
     ownerEnvCredentialIds,
-    brokerVended,
-    brokeredTools,
+    credentialTools,
+    credentialServices,
+    credentialCutoverServices,
     quarantinedServices,
-    brokerCutoverServices,
     cutoverModeOf,
     visibleSkills,
     visibleSkillsForTurn,
-    skillScopes,
     skillMaterializer,
     residentAuthConnectors,
     emitGapWork,
@@ -91,6 +87,20 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
   } = ctx;
 
   let ownerAuthCommand: ((command: string) => string) | undefined;
+  const brokerEnvKeys = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+  ];
+  const unsetBrokerEnv = (env: Record<string, string>): string => {
+    const keys = brokerEnvKeys.filter((key) => !(key in env));
+    return keys.length ? `unset ${keys.join(" ")}; ` : "";
+  };
+  const scopedCommand = credentialCutoverServices.length
+    ? (command: string): string => `${unsetBrokerEnv(connectorEnv)}${command}`
+    : undefined;
   if (ownerAuthAvailable) {
     ownerAuthCommand = (command) => {
       for (const credentialId of ownerEnvCredentialIds) {
@@ -102,30 +112,10 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
           scopeLabel: scopeId,
         });
       }
-      const invoked = [...brokerVended.values()].filter(({ tool }) =>
-        new RegExp(`(^|[\\s;&|()])${tool.binary}(?=$|[\\s;&|()])`).test(command),
-      );
-      for (const { tool } of invoked) {
-        deps.auditLog.record({
-          at: Date.now(),
-          principalId: actor.id,
-          action: "credential.materialize",
-          resource: `${tool.service} (ephemeral broker)`,
-          scopeLabel: scopeId,
-        });
-      }
       const exports = Object.entries(ownerAuthEnv)
         .map(([key, value]) => `${key}=${shq(value)}`)
         .join(" ");
-      const wrappers = invoked
-        .map(({ tool, env }) => {
-          const brokerExports = Object.entries(env)
-            .map(([key, value]) => `${key}=${shq(value)}`)
-            .join(" ");
-          return `${tool.binary}() { ${brokerExports} command ${tool.binary} "$@"; }; `;
-        })
-        .join("");
-      return `${exports ? `export ${exports}; ` : ""}${wrappers}${command}`;
+      return `unset AGENT_API_TOKEN AGENT_OAUTH_CONSENT_TOKEN AGENT_CREDENTIAL_TOKEN; ${unsetBrokerEnv(ownerAuthEnv)}${exports ? `export ${exports}; ` : ""}${command}`;
     };
   }
   const box: {
@@ -168,7 +158,7 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       ownerId: actor.id,
       services,
       allOrigins: true,
-      canonicalRoots: brokeredTools.filter((tool) => services.includes(tool.service)).flatMap((tool) => tool.roots),
+      canonicalRoots: credentialTools.filter((tool) => services.includes(tool.service)).flatMap((tool) => tool.roots),
     });
   };
   let sandboxStatusSeq = 2_000_000;
@@ -186,6 +176,9 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
             .catch(swallowAs("orchestrator: sandbox status append", undefined));
         }
       : undefined;
+  const resourceHandles = new Map<string, SandboxHandle>();
+  const resourcePendingHandles = new Map<string, SandboxHandle>();
+  const resourcePending = new Map<string, Promise<SandboxHandle>>();
   let provisionInFlight: Promise<SandboxHandle> | null = null;
   const provision = (eager = false): Promise<SandboxHandle> => {
     if (!eager) box.used = true;
@@ -195,18 +188,7 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
     });
     return provisionInFlight;
   };
-  const doProvision = async (emit: typeof emitGapWork): Promise<SandboxHandle> => {
-    const provisionStart = Date.now();
-    const handle = await deps.sandbox.provision(resolution.layers, {
-      env: connectorEnv,
-      egress: resolution.egress,
-      ...(egressTokenForTurn ? { egressToken: egressTokenForTurn } : {}),
-      ...(onSandboxStatus ? { onStatus: onSandboxStatus } : {}),
-    });
-    box.pending = handle;
-    emit("provision", provisionStart, Date.now());
-    box.provisionMs = Date.now() - provisionStart;
-    handle.env = { ...handle.env, AGENT_OUTBOX: `${handle.rootDir}/${turnOutboxDir}` };
+  const prepareCredentials = async (handle: SandboxHandle, emit: typeof emitGapWork): Promise<void> => {
     if (deps.keychain) {
       const deviceFlowStart = Date.now();
       const restoreOwnerId =
@@ -214,14 +196,18 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
           ? actor.id
           : deviceFlowCredOwner(memoryScopeId, actor.id);
       const resetGenerations = new Map<string, string>();
-      for (const tool of brokeredTools) {
-        if (cutoverModeOf(tool.service) !== "legacy") continue;
-        const generation = await deps.deviceFlowCutover?.residentResetGeneration(memoryScopeId, tool.service);
-        if (generation) resetGenerations.set(tool.service, generation);
+      for (const service of credentialServices) {
+        if (cutoverModeOf(service) !== "legacy") continue;
+        const generation = await deps.deviceFlowCutover?.residentResetGeneration(
+          memoryScopeId,
+          service,
+          handle.resourceId,
+        );
+        if (generation) resetGenerations.set(service, generation);
       }
       const owned = resetGenerations.size ? await deps.keychain.listByOwner(restoreOwnerId) : [];
       const resetServices = [...resetGenerations.keys()].filter((service) =>
-        owned.some((record) => record.service === service),
+        owned.some((record) => expandServiceAliases([service]).includes(record.service)),
       );
       const removeServices = [...new Set([...quarantinedServices, ...resetServices])];
       if (removeServices.length) {
@@ -231,7 +217,7 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
           keychain: deps.keychain,
           ownerId: restoreOwnerId,
           services: removeServices,
-          canonicalRoots: brokeredTools
+          canonicalRoots: credentialTools
             .filter((tool) => removeServices.includes(tool.service))
             .flatMap((tool) => tool.roots),
         });
@@ -243,6 +229,14 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
           keychain: deps.keychain,
           ownerId: restoreOwnerId,
           ...(quarantinedServices.length ? { excludeServices: quarantinedServices } : {}),
+          onAnomaly: (service, detail) =>
+            deps.errors?.record({
+              category: "keychain",
+              code: "device_flow_restore_failed",
+              message: `${service}: ${detail}`,
+              scopeLabel: scopeId,
+              sessionId: session.id,
+            }),
         });
         for (const service of restoredServices) {
           deps.credentialUsage?.record({
@@ -254,7 +248,7 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
           });
         }
         for (const [service, generation] of resetGenerations) {
-          await deps.deviceFlowCutover?.markResidentReset(memoryScopeId, service, generation);
+          await deps.deviceFlowCutover?.markResidentReset(memoryScopeId, service, generation, handle.resourceId);
         }
       } catch (err) {
         deps.errors?.record({
@@ -268,6 +262,19 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       emit("creds", deviceFlowStart, Date.now());
       perf.credsMs += Date.now() - deviceFlowStart;
     }
+  };
+  const doProvision = async (emit: typeof emitGapWork): Promise<SandboxHandle> => {
+    const provisionStart = Date.now();
+    const handle = await deps.sandbox.provision(resolution.layers, {
+      env: connectorEnv,
+      egress: resolution.egress,
+      ...(egressTokenForTurn ? { egressToken: egressTokenForTurn } : {}),
+      ...(onSandboxStatus ? { onStatus: onSandboxStatus } : {}),
+    });
+    box.pending = handle;
+    emit("provision", provisionStart, Date.now());
+    box.provisionMs = Date.now() - provisionStart;
+    await prepareCredentials(handle, emit);
     const dirCleanupStart = Date.now();
     await deps.sandbox.removeDir(handle, turnSessionDir);
     await sweepStaleTurnFiles(handle);
@@ -331,22 +338,24 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
   for (const r of visibleSkills) {
     if (r.skill) visibleSkillByDir.set(safeSkillDirName(r.skill.manifest.name), r);
   }
-  const ensureSkillTree = async (skillDir: string): Promise<void> => {
-    if (laidTrees.has(skillDir)) return;
+  const ensureSkillTree = async (skillDir: string, sandboxId?: string): Promise<void> => {
+    const treeKey = `${sandboxId ?? "default"}:${skillDir}`;
+    if (laidTrees.has(treeKey)) return;
     const r = visibleSkillByDir.get(skillDir);
     if (!r) return;
     const start = Date.now();
     try {
-      const handle = await provision();
+      const handle = sandboxId ? await provisionResource(sandboxId) : await provision();
       await skillMaterializer.materializeTree(deps.sandbox, handle, r, [], async () => {
-        const latest = (await deps.skills!.visibleFor(skillScopes)).find(
+        const latest = (await visibleSkillsForTurn()).find(
           (candidate) => candidate.skill && safeSkillDirName(candidate.skill.manifest.name) === skillDir,
         );
         if (!latest) return null;
-        const bundles = deps.skillBundles ? await loadActiveBundles(deps.skillBundles, [latest]) : [];
+        const bundles =
+          latest.screenedBundles ?? (deps.skillBundles ? await loadActiveBundles(deps.skillBundles, [latest]) : []);
         return { resolution: latest, bundles };
       });
-      laidTrees.add(skillDir);
+      laidTrees.add(treeKey);
       if (r.skill && deps.skills)
         void deps.skills.recordUse(r.skill.id).catch((e) => swallow("orchestrator: skill recordUse", e));
     } catch (err) {
@@ -361,6 +370,38 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       emitGapWork("skills_materialize", start, Date.now());
     }
   };
+  const provisionResource = (id: string): Promise<SandboxHandle> => {
+    const existing = resourceHandles.get(id);
+    if (existing) return Promise.resolve(existing);
+    const pending = resourcePending.get(id);
+    if (pending) return pending;
+    const provisioned = (async () => {
+      const resource = await deps.sandboxResources?.get(id);
+      const ownerScope = resolution.layers.find((layer) => layer.mode === "rw")?.scopeId;
+      if (!resource || resource.ownerScopeId !== ownerScope)
+        throw new Error("sandbox does not belong to this conversation's writable scope");
+      const handle = await deps.sandbox.provision(resolution.layers, {
+        sandboxId: id,
+        env: connectorEnv,
+        egress: resolution.egress,
+        ...(egressTokenForTurn ? { egressToken: egressTokenForTurn } : {}),
+      });
+      resourcePendingHandles.set(id, handle);
+      await prepareCredentials(handle, emitGapWork);
+      await deps.sandbox.removeDir(handle, turnSessionDir);
+      await sweepStaleTurnFiles(handle);
+      if (deps.skills)
+        await skillMaterializer.materializeIndex(deps.sandbox, handle, visibleSkills, visibleSkillsForTurn);
+      resourceHandles.set(id, handle);
+      resourcePendingHandles.delete(id);
+      return handle;
+    })().finally(() => {
+      resourcePending.delete(id);
+    });
+    resourcePending.set(id, provisioned);
+    return provisioned;
+  };
+
   const provisionScratch = async (): Promise<SandboxHandle> => {
     if (scratchBox.handle) return scratchBox.handle;
     const provisionStart = Date.now();
@@ -375,7 +416,6 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       },
     );
     scratchBox.provisionMs = Date.now() - provisionStart;
-    handle.env = { ...handle.env, AGENT_OUTBOX: `${handle.rootDir}/${turnOutboxDir}` };
     scratchBox.handle = handle;
     return handle;
   };
@@ -405,7 +445,15 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
               handle,
               keychain: deps.keychain,
               ownerId: actor.id,
-              ...(brokerCutoverServices.length ? { excludeServices: brokerCutoverServices } : {}),
+              ...(credentialCutoverServices.length ? { excludeServices: credentialCutoverServices } : {}),
+              onAnomaly: (service, detail) =>
+                deps.errors?.record({
+                  category: "keychain",
+                  code: "device_flow_restore_failed",
+                  message: `${service} (owner-auth box): ${detail}`,
+                  scopeLabel: scopeId,
+                  sessionId: session.id,
+                }),
             });
             for (const service of restoredServices) {
               deps.auditLog.record({
@@ -554,6 +602,32 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       await clearTurnFiles(scratchHandle);
       await deps.sandbox.teardown(scratchHandle).catch(() => {});
     }
+    await Promise.allSettled(resourcePending.values());
+    const released = new Set<string>();
+    const current = box.handle ?? box.pending;
+    const releases: Promise<void>[] = [];
+    for (const handle of [...resourceHandles.values(), ...resourcePendingHandles.values()]) {
+      const key = `${handle.backend}:${handle.id}`;
+      if (released.has(key) || (current?.id === handle.id && current.backend === handle.backend)) continue;
+      released.add(key);
+      releases.push(
+        (async () => {
+          try {
+            await clearTurnFiles(handle);
+          } finally {
+            const live = await deps.processes?.liveByScope(memoryScopeId).catch(() => []);
+            await deps.sandbox.teardown(handle, {
+              keepWarm: live?.some((process) => process.sandboxId === handle.resourceId) ?? false,
+            });
+          }
+        })(),
+      );
+    }
+    const releasedResults = await Promise.allSettled(releases);
+    for (const result of releasedResults)
+      if (result.status === "rejected") swallow("resource sandbox release", result.reason);
+    resourceHandles.clear();
+    resourcePendingHandles.clear();
     if (provisionInFlight) await provisionInFlight.catch(() => {});
     provisionInFlight = null;
     const handle = box.handle ?? box.pending;
@@ -574,7 +648,10 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
         keepWarm = false;
       }
     }
-    await deps.sandbox.teardown(handle, keepWarm ? { keepWarm: true } : undefined);
+    await deps.sandbox.teardown(handle, {
+      ...(keepWarm ? { keepWarm: true } : {}),
+      ...(box.used ? {} : { homeUnchanged: true }),
+    });
     if (ownerCleanupError) throw ownerCleanupError;
   };
 
@@ -583,12 +660,23 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
     scratchBox,
     ownerAuthBox,
     ownerAuthCommand,
+    scopedCommand,
     provision,
     provisionScratch,
+    provisionResource,
     provisionOwnerAuth,
     ensureSkillTree,
     provisionForReach,
     reclaimBox,
     provisionPending: () => provisionInFlight !== null,
+    invalidateProvision: () => {
+      const previous = box.handle ?? box.pending;
+      if (previous)
+        (box.handle ? resourceHandles : resourcePendingHandles).set(previous.resourceId ?? previous.id, previous);
+      box.handle = null;
+      box.pending = null;
+      provisionInFlight = null;
+      laidTrees.clear();
+    },
   };
 }

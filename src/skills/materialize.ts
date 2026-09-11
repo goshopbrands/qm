@@ -1,4 +1,4 @@
-import type { Sandbox, SandboxHandle } from "../sandbox/sandbox.ts";
+import { CapabilityUnsupportedError, type Sandbox, type SandboxHandle } from "../sandbox/sandbox.ts";
 import { createHash } from "node:crypto";
 import { safeSkillFilePath, type SkillFile, type SkillResolution } from "./skill-store.ts";
 import type { SkillBundle } from "./skill-bundle-store.ts";
@@ -6,6 +6,7 @@ import { swallow } from "../util/errors.ts";
 import { assertSafeSkillName, isSafeSkillName } from "./skill-name.ts";
 import { createKeyedQueue } from "../util/async.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
+import type { ScopeId } from "../types.ts";
 import {
   isSkillMaterializationControlPath,
   SKILLS_DIR,
@@ -45,7 +46,7 @@ function indexHash(resolved: SkillResolution[]): string {
   const h = createHash("sha256");
   const entries = resolved
     .filter((r) => r.skill)
-    .map((r) => `${r.skill!.manifest.name}\0${renderedBody(r)}`)
+    .map((r) => `${r.skill!.manifest.name}\0${r.skill!.scopeId}\0${r.skill!.id}\0${renderedBody(r)}`)
     .sort();
   for (const e of entries) {
     h.update(e);
@@ -94,6 +95,7 @@ interface IndexMarkerState {
   version: 2;
   hash: string;
   names: string[];
+  identities?: Record<string, string>;
   legacyExternalPathsPreserved?: true;
 }
 
@@ -197,12 +199,16 @@ function guardedBundlePaths(bundles: SkillBundle[]): string[] {
 
 async function layFiles(sandbox: Sandbox, handle: SandboxHandle, entries: LayEntry[]): Promise<void> {
   if (!entries.length) return;
-  if (sandbox.extractFiles) {
-    await sandbox.extractFiles(
-      handle,
-      entries.map((e) => ({ path: e.path, data: Buffer.from(e.content, "utf8") })),
-    );
-    return;
+  if (sandbox.importFiles) {
+    try {
+      await sandbox.importFiles(
+        handle,
+        entries.map((e) => ({ path: e.path, data: Buffer.from(e.content, "utf8") })),
+      );
+      return;
+    } catch (err) {
+      if (!(err instanceof CapabilityUnsupportedError)) throw err;
+    }
   }
   for (const e of entries) await sandbox.writeFile(handle, e.path, e.content);
 }
@@ -214,6 +220,11 @@ async function materializeSkillIndexUnlocked(
 ): Promise<void> {
   const want = indexHash(resolved);
   const names = resolved.flatMap((r) => (r.skill ? [safeSkillDirName(r.skill.manifest.name)] : [])).sort();
+  const identities = Object.fromEntries(
+    resolved.flatMap((r) =>
+      r.skill ? [[safeSkillDirName(r.skill.manifest.name), JSON.stringify([r.skill.scopeId, r.skill.id])]] : [],
+    ),
+  );
   const raw = await readMarker(sandbox, handle, INDEX_MARKER, "skills: index probe");
   const prev = indexMarkerState(raw);
   if (prev?.hash === want && samePaths(prev.names, names)) return;
@@ -222,8 +233,9 @@ async function materializeSkillIndexUnlocked(
   if (raw && !prev) {
     await sandbox.removeDir(handle, SKILLS_DIR);
   } else if (prev) {
+    const unchangedNames = new Set(names.filter((name) => prev.identities?.[name] === identities[name]));
     const activeBundlePaths = new Set<string>();
-    for (const name of names) {
+    for (const name of unchangedNames) {
       const currentRaw = await readMarker(
         sandbox,
         handle,
@@ -233,9 +245,8 @@ async function materializeSkillIndexUnlocked(
       const current = treeMarkerState(currentRaw, `${SKILLS_DIR}/${name}`);
       for (const path of current?.bundlePaths ?? []) activeBundlePaths.add(path);
     }
-    const activeNames = new Set(names);
     for (const name of prev.names) {
-      if (activeNames.has(name)) continue;
+      if (unchangedNames.has(name)) continue;
       const dir = `${SKILLS_DIR}/${name}`;
       const staleRaw = await readMarker(sandbox, handle, `${dir}/${TREE_MARKER}`, `skills: tree probe ${name}`);
       const stale = treeMarkerState(staleRaw, dir);
@@ -263,6 +274,7 @@ async function materializeSkillIndexUnlocked(
       version: 2,
       hash: want,
       names,
+      identities,
       ...(legacyExternalPathsPreserved ? { legacyExternalPathsPreserved: true as const } : {}),
     } satisfies IndexMarkerState),
   });
@@ -399,7 +411,8 @@ export function materializeSkillTree(
   return localMaterializer.materializeTree(sandbox, handle, resolution, bundles);
 }
 
-export function skillsIndex(resolved: SkillResolution[]): string {
+export function skillsIndex(resolved: SkillResolution[], provenanceScopes: readonly ScopeId[] = []): string {
+  const provenance = new Set(provenanceScopes);
   const items = resolved
     .filter((r) => r.skill)
     .sort((a, b) => {
@@ -412,7 +425,8 @@ export function skillsIndex(resolved: SkillResolution[]): string {
   const lines = items.map((r) => {
     const m = r.skill!.manifest;
     const shadow = r.shadowed.length ? " (shadows a broader-scope skill of the same name)" : "";
-    return `- **${m.name}** — ${m.description}${shadow}  → read \`${SKILLS_DIR}/${safeSkillDirName(m.name)}/SKILL.md\``;
+    const source = provenance.has(r.skill!.scopeId) ? ` [from ${r.skill!.scopeId}]` : "";
+    return `- **${m.name}**${source} — ${m.description}${shadow}  → read \`${SKILLS_DIR}/${safeSkillDirName(m.name)}/SKILL.md\``;
   });
   return [
     "## Skills",

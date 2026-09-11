@@ -22,9 +22,9 @@ describe("agent conversations self-API", async () => {
   let mineId: string;
   let theirsId: string;
 
-  const capFor = (actorId: string, scope = scopeId("personal", actorId)) =>
+  const capFor = (actorId: string, scope = scopeId("personal", actorId), live = true) =>
     mintCapabilityToken(
-      { actorId, scopeId: scope, aud: CONTROL_PLANE_AUD, exp: Date.now() + CAPABILITY_TTL_MS },
+      { actorId, scopeId: scope, aud: CONTROL_PLANE_AUD, exp: Date.now() + CAPABILITY_TTL_MS, liveActor: live },
       SECRET,
     );
 
@@ -48,6 +48,117 @@ describe("agent conversations self-API", async () => {
 
   after(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it("spawns a fresh conversation with only the seed text", async () => {
+    const token = await capFor("U1");
+    const res = await post(
+      "/v1/conversations",
+      { text: "investigate the flaky test", title: "Flaky test hunt" },
+      token,
+    );
+    assert.equal(res.status, 202);
+    const body = (await res.json()) as {
+      session: { id: string; scopeId: string; threadRef: string; title?: string | null };
+      turn: { status: string; runId?: string };
+    };
+    assert.notEqual(body.session.id, mineId);
+    assert.equal(body.session.scopeId, scopeId("personal", "U1"));
+    assert.equal(body.session.title, "Flaky test hunt");
+    const list = await get("/v1/conversations", token);
+    const { conversations } = (await list.json()) as { conversations: Array<{ id: string }> };
+    assert.ok(
+      conversations.some((c) => c.id === body.session.id),
+      "the spawned session appears in the actor's list",
+    );
+    assert.equal(body.turn.status, "queued");
+    assert.ok(body.turn.runId, "the seed turn is queued as a run");
+    const run = await built.runs.get(body.turn.runId!);
+    assert.equal(run?.request.text, "investigate the flaky test");
+    assert.equal(run?.request.conversation.threadRef, body.session.threadRef, "the seed runs in the new session");
+    const read = await get(`/v1/conversations/${body.session.id}`, token);
+    assert.equal(read.status, 200);
+    const readBody = (await read.json()) as { entries: Array<{ payload: { text?: string } }> };
+    assert.ok(
+      !readBody.entries.some((e) => (e.payload.text ?? "").includes("plan the launch")),
+      "nothing from the spawning conversation leaks in",
+    );
+  });
+
+  it("spawns a fresh channel conversation for a current member", async () => {
+    await built.app.upsertDirectory([{ principalId: "U1", displayName: "User One", type: "internal" }]);
+    await built.app.upsertChannels(
+      [{ channelId: "C1", name: "engineering", isPrivate: true }],
+      [{ channelId: "C1", principalId: "U1" }],
+    );
+    const res = await post(
+      "/v1/conversations",
+      { text: "investigate the channel deployment" },
+      await capFor("U1", scopeId("channel", "C1")),
+    );
+    assert.equal(res.status, 202);
+    const body = (await res.json()) as {
+      session: { scopeId: string };
+      turn: { status: string; runId?: string };
+    };
+    assert.equal(body.session.scopeId, scopeId("channel", "C1"));
+    assert.equal(body.turn.status, "queued");
+    assert.ok(body.turn.runId);
+    const run = await built.runs.get(body.turn.runId);
+    assert.equal(run?.request.conversation.channelRef, "C1");
+  });
+
+  it("discards the spawned session when the seed turn is refused (roster race)", async () => {
+    const racedApp: typeof built.app = {
+      ...built.app,
+      turn: async (req) =>
+        (req as { spawned?: boolean }).spawned
+          ? { status: "refused", reason: "project membership changed; retry from the current project" }
+          : built.app.turn(req),
+    };
+    const racedServer = createServer(racedApp, { signingSecret: SECRET });
+    await new Promise<void>((resolve) => racedServer.listen(0, resolve));
+    const racedBase = `http://localhost:${(racedServer.address() as AddressInfo).port}`;
+    try {
+      const token = await capFor("U1");
+      const listIds = async () => {
+        const listed = await get("/v1/conversations", token);
+        const { conversations } = (await listed.json()) as { conversations: Array<{ id: string }> };
+        return conversations.map((c) => c.id).sort();
+      };
+      const before = await listIds();
+
+      const res = await fetch(`${racedBase}/v1/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-agent-capability": token },
+        body: JSON.stringify({ text: "seed that will be refused" }),
+      });
+      assert.equal(res.status, 409);
+      const body = (await res.json()) as { error: string; message: string };
+      assert.equal(body.error, "seed_turn_refused");
+      assert.match(body.message, /membership changed/);
+
+      assert.deepEqual(await listIds(), before, "no orphaned empty session survives the refused seed");
+    } finally {
+      await new Promise<void>((resolve) => racedServer.close(() => resolve()));
+    }
+  });
+
+  it("spawn requires text and a capability", async () => {
+    assert.equal((await post("/v1/conversations", { text: "hi" })).status, 401);
+    assert.equal((await post("/v1/conversations", {}, await capFor("U1"))).status, 400);
+    assert.equal((await post("/v1/conversations", { text: "  " }, await capFor("U1"))).status, 400);
+  });
+
+  it("spawn refuses an unattended (automation) turn", async () => {
+    const token = await capFor("U1", scopeId("personal", "U1"), false);
+    const res = await post("/v1/conversations", { text: "cron trying to spawn" }, token);
+    assert.equal(res.status, 403);
+  });
+
+  it("spawn refuses a scope the actor doesn't own", async () => {
+    const token = await capFor("U1", scopeId("personal", "U2"));
+    assert.equal((await post("/v1/conversations", { text: "peek" }, token)).status, 404);
   });
 
   it("requires a capability token", async () => {

@@ -1,10 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assistantFailure, createOpenCodeHarness, latestAssistantParts } from "../src/harness/opencode-harness.ts";
+import {
+  assistantFailure,
+  createOpenCodeHarness,
+  latestAssistantParts,
+  openCodeHarnessConfigOptions,
+} from "../src/harness/opencode-harness.ts";
 import type { OpencodeClient } from "@opencode-ai/sdk";
+import type { Config } from "../src/config.ts";
 import type { HarnessLlmRequestRecord, HarnessTurnInput } from "../src/harness/harness.ts";
 import type { ScopeId, Session, SessionEntry } from "../src/types.ts";
 
@@ -78,7 +84,7 @@ function turnInput(entries: SessionEntry[], llmRows: HarnessLlmRequestRecord[]):
   return {
     session,
     input: "hi",
-    model: "openai/gpt-5",
+    runtime: { modelId: "openai/gpt-5" },
     systemPrompt: "be concise",
     history: [],
     tools: {} as HarnessTurnInput["tools"],
@@ -139,7 +145,7 @@ test("OpenCode records real usage, cost, and timings for each captured model cal
   assert.equal(row.step, 0);
   assert.equal(row.model, "openai/gpt-5");
   assert.equal(row.truncated, false);
-  assert.deepEqual(row.request, { system: "s", messages: [{ role: "user" }] });
+  assert.deepEqual(row.promptEnvelope, { system: "s" }, "messages stay on the tape, not in the envelope");
   assert.deepEqual(row.transport, { modelId: "openai/gpt-5" });
   assert.equal(row.durationMs, 1929);
   assert.deepEqual(row.usage, {
@@ -293,4 +299,125 @@ test("assistantFailure classifies provider errors and exempts aborts and output-
   assert.equal(assistantFailure({ role: "assistant", error: { name: "MessageOutputLengthError" } }), null);
   assert.equal(assistantFailure({ role: "assistant" }), null);
   assert.equal(assistantFailure(undefined), null);
+});
+
+test("OpenCode judge honors the configured judge model while oneShot keeps the default", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-opencode-test-"));
+  const echoModelHandlers = `
+  if (req.method === "POST" && message) {
+    const posted = JSON.parse(await readBody(req));
+    const text = posted.model.providerID + "/" + posted.model.modelID;
+    return json(res, {
+      info: {
+        id: "msg_1", sessionID: "ses_main", role: "assistant", time: { created: 1000, completed: 2000 },
+        parentID: "", modelID: posted.model.modelID, providerID: posted.model.providerID, mode: "qm",
+        path: { cwd: "/", root: "/" },
+        cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        finish: "stop",
+      },
+      parts: [{ id: "prt_1", sessionID: "ses_main", messageID: "msg_1", type: "text", text }],
+    });
+  }
+  if (req.method === "GET" && message) return json(res, []);
+`;
+  const harness = createOpenCodeHarness({
+    binaryPath: fakeSidecar(dir, "judge-model", echoModelHandlers),
+    defaultModelId: "openai/gpt-5",
+    judgeModelId: "anthropic/claude-haiku-4-5",
+  });
+  t.after(async () => {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  assert.equal(await harness.models.oneShot?.("system", "prompt"), "openai/gpt-5");
+  assert.equal(await harness.models.judge?.("system", "prompt"), "anthropic/claude-haiku-4-5");
+});
+
+test("OpenCode config options forward a judge model only when its provider has a key", () => {
+  assert.equal(
+    openCodeHarnessConfigOptions({ judgeModelId: "claude-haiku-4-5", anthropicApiKey: "sk-ant" } as Config)
+      .judgeModelId,
+    "claude-haiku-4-5",
+  );
+  assert.equal(
+    openCodeHarnessConfigOptions({ judgeModelId: "claude-haiku-4-5", openaiApiKey: "sk-oai" } as Config).judgeModelId,
+    undefined,
+    "a judge model on a keyless provider must not park every judge call on a provider error",
+  );
+  assert.equal(
+    openCodeHarnessConfigOptions({ judgeModelId: "not-a-model", anthropicApiKey: "sk-ant" } as Config).judgeModelId,
+    undefined,
+  );
+  assert.equal(openCodeHarnessConfigOptions({} as Config).judgeModelId, undefined);
+});
+
+test("custom providers materialize into the opencode config (enabled + provider map, key included)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "opencode-custom-"));
+  const dump = join(dir, "config.json");
+  const bin = fakeSidecar(dir, "custom", promptHandlers(okAssistant));
+  // wrap the binary so it writes the config it received before exec
+  const wrapped = join(dir, "custom-wrapped");
+  writeFileSync(
+    wrapped,
+    `#!/bin/sh\nprintf '%s' "$OPENCODE_CONFIG_CONTENT" > ${JSON.stringify(dump)}\nexec ${JSON.stringify(bin)} "$@"\n`,
+  );
+  chmodSync(wrapped, 0o755);
+  const harness = createOpenCodeHarness({
+    binaryPath: wrapped,
+    resolveCustomProviders: async () => [
+      {
+        spec: {
+          id: "litellm",
+          name: "LiteLLM",
+          protocol: "openai" as const,
+          baseUrl: "http://litellm.internal:4000/v1",
+          models: [{ id: "deepseek-chat", name: "DeepSeek", contextWindow: 128000, maxTokens: 8192 }],
+        },
+        apiKey: "sk-lite",
+      },
+    ],
+  });
+  const entries: SessionEntry[] = [];
+  const llmRows: HarnessLlmRequestRecord[] = [];
+  try {
+    await harness.turns.runTurn(turnInput(entries, llmRows));
+    const config = JSON.parse(readFileSync(dump, "utf8"));
+    assert.ok(config.enabled_providers.includes("litellm"));
+    const litellm = config.provider.litellm;
+    assert.equal(litellm.npm, "@ai-sdk/openai-compatible");
+    assert.equal(litellm.options.baseURL, "http://litellm.internal:4000/v1");
+    assert.equal(litellm.options.apiKey, "sk-lite");
+    assert.deepEqual(litellm.models["deepseek-chat"], { name: "DeepSeek", limit: { context: 128000, output: 8192 } });
+  } finally {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode advertises aliases only for tools available on the turn", async (t) => {
+  for (const sandboxResources of [false, true]) {
+    const dir = mkdtempSync(join(tmpdir(), "qm-opencode-aliases-"));
+    const captured = join(dir, "context.json");
+    const handlers = `
+      if (req.method === "POST" && message) {
+        await readBody(req);
+        const context = await fetch(process.env.OPENCODE_BRIDGE_URL + "/session/" + message[1] + "/context", {
+          headers: { authorization: "Bearer " + process.env.OPENCODE_BRIDGE_SECRET },
+        }).then((r) => r.json());
+        require("node:fs").writeFileSync(${JSON.stringify(captured)}, JSON.stringify(context));
+        return json(res, ${okAssistant});
+      }
+      if (req.method === "GET" && message) return json(res, [${okAssistant}]);
+    `;
+    const harness = createOpenCodeHarness({ binaryPath: fakeSidecar(dir, "aliases", handlers), sandboxResources });
+    t.after(async () => {
+      await harness.turns.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    await harness.turns.runTurn(turnInput([], []));
+    const { systemPrompt } = JSON.parse(readFileSync(captured, "utf8")) as { systemPrompt: string };
+    assert.match(systemPrompt, /workspace_read is read/);
+    if (sandboxResources) assert.doesNotMatch(systemPrompt, /workspace_execute/);
+    else assert.match(systemPrompt, /workspace_execute is execute/);
+  }
 });

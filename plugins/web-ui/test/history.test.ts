@@ -1,13 +1,342 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { JSDOM } from "jsdom";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   attachPendingApprovals,
+  currentEarlierCount,
   entriesToMessages,
+  forkOriginDetails,
+  inheritedRefreshEntries,
+  inheritedTranscript,
+  loadInheritedTranscript,
   type AssistantWork,
   type PendingApproval,
   type SessionEntry,
 } from "../src/core-bridge.ts";
+
+test("fork provenance separates inherited entries at the boundary", () => {
+  const entries: SessionEntry[] = [
+    { type: "user", payload: { text: "old" }, createdAt: 1, seq: 1 },
+    { type: "assistant", payload: { text: "copied" }, createdAt: 2, seq: 2 },
+    { type: "user", payload: { text: "new" }, createdAt: 3, seq: 3 },
+  ];
+  const collapsed = inheritedTranscript(
+    { forkedFrom: { sessionId: "source", title: "Original" }, forkBoundarySeq: 2 },
+    entries,
+  );
+  assert.deepEqual(
+    collapsed.inherited.map((entry) => entry.seq),
+    [1, 2],
+  );
+  assert.deepEqual(
+    collapsed.current.map((entry) => entry.seq),
+    [3],
+  );
+  assert.deepEqual(inheritedTranscript({}, entries), { inherited: [], current: entries });
+});
+
+test("inherited transcript requires complete provenance and a defined entry sequence", () => {
+  const sequenced = { type: "user", payload: { text: "old" }, createdAt: 1, seq: 2 } as SessionEntry;
+  const unsequenced = { type: "assistant", payload: { text: "unknown" }, createdAt: 2 } as SessionEntry;
+  assert.deepEqual(inheritedTranscript({ forkedFrom: { sessionId: "source" } }, [sequenced]), {
+    inherited: [],
+    current: [sequenced],
+  });
+  assert.deepEqual(inheritedTranscript({ forkBoundarySeq: 2 }, [sequenced]), {
+    inherited: [],
+    current: [sequenced],
+  });
+  assert.deepEqual(inheritedTranscript({ forkedFrom: { sessionId: "source" }, forkBoundarySeq: 2 }, [unsequenced]), {
+    inherited: [],
+    current: [unsequenced],
+  });
+});
+
+test("inherited expansion pages backward to the start and preserves transcript order", async () => {
+  const session = { id: "fork", forkedFrom: { sessionId: "source" }, forkBoundarySeq: 50 };
+  const first = { type: "user", payload: { text: "first" }, createdAt: 1, seq: 1 } as SessionEntry;
+  const middle = { type: "assistant", payload: { text: "middle" }, createdAt: 2, seq: 25 } as SessionEntry;
+  const last = { type: "user", payload: { text: "last" }, createdAt: 3, seq: 50 } as SessionEntry;
+  const calls: unknown[] = [];
+  const fetcher = async (id: string, window?: { tailTurns?: number; beforeSeq?: number }) => {
+    calls.push({ id, window });
+    return window?.beforeSeq === 51
+      ? { entries: [middle, last], earlierEntries: 1 }
+      : { entries: [first], earlierEntries: 0 };
+  };
+  assert.deepEqual(await loadInheritedTranscript(session, [], fetcher), [first, middle, last]);
+  assert.deepEqual(calls, [
+    { id: "fork", window: { beforeSeq: 51, tailTurns: 25 } },
+    { id: "fork", window: { beforeSeq: 25, tailTurns: 25 } },
+  ]);
+  calls.length = 0;
+  assert.deepEqual(await loadInheritedTranscript(session, [last], fetcher), [last]);
+  assert.deepEqual(calls, []);
+});
+
+test("inherited expansion reaches entry seq 0 (0-based sequences)", async () => {
+  const session = { id: "fork", forkedFrom: { sessionId: "source" }, forkBoundarySeq: 2 };
+  const pages: Record<number, { entries: SessionEntry[]; earlierEntries: number }> = {
+    3: {
+      entries: [{ type: "assistant", payload: { text: "two" }, createdAt: 3, seq: 2 } as SessionEntry],
+      earlierEntries: 2,
+    },
+    2: {
+      entries: [{ type: "user", payload: { text: "one" }, createdAt: 2, seq: 1 } as SessionEntry],
+      earlierEntries: 1,
+    },
+    1: {
+      entries: [{ type: "user", payload: { text: "zero" }, createdAt: 1, seq: 0 } as SessionEntry],
+      earlierEntries: 0,
+    },
+  };
+  const calls: number[] = [];
+  const fetcher = async (_id: string, window?: { beforeSeq?: number }) => {
+    calls.push(window?.beforeSeq ?? -1);
+    return pages[window?.beforeSeq ?? -1]!;
+  };
+  const inherited = await loadInheritedTranscript(session, [], fetcher as never);
+  assert.deepEqual(calls, [3, 2, 1]);
+  assert.deepEqual(
+    inherited.map((entry) => entry.seq),
+    [0, 1, 2],
+  );
+});
+
+test("currentEarlierCount hides inherited entries from the earlier-messages count", () => {
+  const fork = { forkedFrom: { sessionId: "source" }, forkBoundarySeq: 4 };
+  assert.equal(currentEarlierCount(fork, 12), 7);
+  assert.equal(currentEarlierCount(fork, 5), 0);
+  assert.equal(currentEarlierCount(fork, 3), 0);
+  assert.equal(currentEarlierCount({}, 12), 12);
+  assert.equal(currentEarlierCount({ forkedFrom: { sessionId: "source" } }, 12), 12);
+});
+
+test("a stale show load never lands on the next fork; reset revives the control", async () => {
+  const dom = new JSDOM("<!doctype html><main></main>");
+  Object.defineProperty(globalThis, "document", { configurable: true, value: dom.window.document });
+  Object.defineProperty(globalThis, "HTMLElement", { configurable: true, value: dom.window.HTMLElement });
+  Object.defineProperty(globalThis, "Event", { configurable: true, value: dom.window.Event });
+  const { createForkOriginController } = await import("../src/fork-origin.ts");
+  const state = { inheritedMessages: [] as SessionEntry[], inheritedLoaded: false, inheritedExpanded: false };
+  const pending: Array<(entries: SessionEntry[]) => void> = [];
+  const controller = createForkOriginController<SessionEntry>({
+    state,
+    load: () => new Promise((resolve) => pending.push(resolve)),
+    navigate: async () => {},
+    current: () => true,
+    redraw: () => {},
+    setError: () => {},
+  });
+  const firstToggle = controller.toggle();
+  assert.equal(pending.length, 1);
+  controller.reset(); // switched to another fork mid-load
+  const secondToggle = controller.toggle(); // new fork's control is live immediately
+  assert.equal(pending.length, 2, "reset frees the in-flight guard");
+  pending[0]!([{ type: "user", payload: { text: "fork A history" }, createdAt: 1, seq: 0 } as SessionEntry]);
+  await firstToggle;
+  assert.equal(state.inheritedLoaded, false, "stale load is discarded");
+  assert.equal(state.inheritedMessages.length, 0, "stale load is discarded");
+  pending[1]!([{ type: "user", payload: { text: "fork B history" }, createdAt: 2, seq: 0 } as SessionEntry]);
+  await secondToggle;
+  assert.equal(state.inheritedLoaded, true);
+  assert.equal(state.inheritedExpanded, true);
+  assert.equal((state.inheritedMessages[0]!.payload as { text: string }).text, "fork B history");
+});
+
+test("a failed show load surfaces an error instead of dying silently", async () => {
+  const { createForkOriginController } = await import("../src/fork-origin.ts");
+  const state = { inheritedMessages: [] as SessionEntry[], inheritedLoaded: false, inheritedExpanded: false };
+  let error = "";
+  let redraws = 0;
+  const controller = createForkOriginController<SessionEntry>({
+    state,
+    load: () => Promise.reject(new Error("boom")),
+    navigate: async () => {},
+    current: () => true,
+    redraw: () => {
+      redraws++;
+    },
+    setError: (value) => {
+      error = value;
+    },
+  });
+  await controller.toggle();
+  assert.equal(error, "Couldn't load the original conversation's history.");
+  assert.ok(redraws >= 1);
+  assert.equal(state.inheritedExpanded, false, "a failed load never expands");
+  assert.equal(state.inheritedLoaded, false);
+  // the control recovers: a later successful load works
+  const ok = createForkOriginController<SessionEntry>({
+    state,
+    load: async () => [{ type: "user", payload: { text: "old" }, createdAt: 1, seq: 0 } as SessionEntry],
+    navigate: async () => {},
+    current: () => true,
+    redraw: () => {},
+    setError: () => {},
+  });
+  await ok.toggle();
+  assert.equal(state.inheritedLoaded, true);
+  assert.equal(state.inheritedExpanded, true);
+});
+
+test("a successful show clears a prior error; an in-flight load survives non-reset redraws", async () => {
+  const { createForkOriginController } = await import("../src/fork-origin.ts");
+  const state = { inheritedMessages: [] as SessionEntry[], inheritedLoaded: false, inheritedExpanded: false };
+  let error = "sticky old failure";
+  let resolveLoad: ((entries: SessionEntry[]) => void) | null = null;
+  const controller = createForkOriginController<SessionEntry>({
+    state,
+    load: () => new Promise((resolve) => (resolveLoad = resolve)),
+    navigate: async () => {},
+    current: () => true,
+    redraw: () => {},
+    setError: (value) => {
+      error = value;
+    },
+  });
+  const toggling = controller.toggle();
+  assert.equal(error, "", "starting a new attempt clears the stale error");
+  // a same-session remount does NOT reset the controller, so the load lands
+  resolveLoad!([{ type: "user", payload: { text: "old" }, createdAt: 1, seq: 0 } as SessionEntry]);
+  await toggling;
+  assert.equal(state.inheritedLoaded, true);
+  assert.equal(state.inheritedExpanded, true);
+  assert.equal(error, "", "no error after a successful show");
+});
+
+test("fork origin remains visible when a deep-link tail contains only post-fork entries", () => {
+  const session = { forkedFrom: { sessionId: "source", title: "Original" }, forkBoundarySeq: 10 };
+  const postForkTail = Array.from({ length: 25 }, (_, index) => ({
+    type: "user" as const,
+    payload: { text: String(index) },
+    createdAt: index,
+    seq: 11 + index,
+  }));
+  assert.equal(inheritedTranscript(session, postForkTail).inherited.length, 0);
+  assert.deepEqual(forkOriginDetails(session, 0), { sessionId: "source", title: "Original" });
+  assert.deepEqual(forkOriginDetails(session, 3), {
+    sessionId: "source",
+    title: "Original",
+    messageCount: 3,
+  });
+});
+
+test("fork origin DOM navigates, reports access failure once, pages, toggles, survives refresh, and resets", async () => {
+  const dom = new JSDOM('<!doctype html><main id="chat"></main>');
+  Object.defineProperty(globalThis, "document", { configurable: true, value: dom.window.document });
+  Object.defineProperty(globalThis, "HTMLElement", { configurable: true, value: dom.window.HTMLElement });
+  Object.defineProperty(globalThis, "Event", { configurable: true, value: dom.window.Event });
+  const [{ render }, { createForkOriginController, forkOriginView }] = await Promise.all([
+    import("lit"),
+    import("../src/fork-origin.ts"),
+  ]);
+  const host = dom.window.document.querySelector<HTMLElement>("#chat")!;
+  const session = {
+    id: "fork",
+    forkedFrom: { sessionId: "source", title: "Original" },
+    forkBoundarySeq: 2,
+  };
+  const state = { inheritedMessages: [] as SessionEntry[], inheritedLoaded: false, inheritedExpanded: false };
+  let error = "";
+  let navigationFails = false;
+  let navigations = 0;
+  const calls: number[] = [];
+  const fetcher = async (_id: string, window?: { beforeSeq?: number }) => {
+    calls.push(window?.beforeSeq ?? 0);
+    return window?.beforeSeq === 3
+      ? {
+          entries: [{ type: "assistant" as const, payload: { text: "old two" }, createdAt: 2, seq: 2 }],
+          earlierEntries: 1,
+        }
+      : {
+          entries: [{ type: "user" as const, payload: { text: "old one" }, createdAt: 1, seq: 1 }],
+          earlierEntries: 0,
+        };
+  };
+  const controller = createForkOriginController({
+    state,
+    load: () => loadInheritedTranscript(session, [], fetcher as never),
+    navigate: async () => {
+      navigations++;
+      if (navigationFails) throw new Error("denied");
+    },
+    current: () => true,
+    redraw: () => draw(),
+    setError: (value) => {
+      error = value;
+    },
+  });
+  const draw = () => {
+    for (const node of host.querySelectorAll("article")) node.remove();
+    const origin = forkOriginDetails(session, state.inheritedLoaded ? state.inheritedMessages.length : 0);
+    render(
+      origin
+        ? forkOriginView({
+            ...origin,
+            expanded: state.inheritedExpanded,
+            navigate: () => void controller.navigate(),
+            toggle: () => void controller.toggle(),
+          })
+        : null,
+      host,
+    );
+    const existing = host.querySelector(".composer-error");
+    existing?.remove();
+    if (error) {
+      const node = dom.window.document.createElement("div");
+      node.className = "composer-error";
+      node.textContent = error;
+      host.append(node);
+    }
+    if (state.inheritedExpanded)
+      for (const entry of state.inheritedMessages) {
+        const node = dom.window.document.createElement("article");
+        node.textContent = (entry.payload as { text: string }).text;
+        host.append(node);
+      }
+  };
+  draw();
+  assert.match(host.textContent ?? "", /Forked from Original/);
+  assert.doesNotMatch(host.textContent ?? "", /messages/);
+  host.querySelector<HTMLButtonElement>(".fork-origin-badge")!.click();
+  assert.equal(navigations, 1);
+  navigationFails = true;
+  host.querySelector<HTMLButtonElement>(".fork-origin-badge")!.click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(host.textContent?.match(/You no longer have access to the original conversation\./g)?.length, 1);
+  controller.reset();
+  draw();
+  assert.doesNotMatch(host.textContent ?? "", /no longer have access/);
+  host.querySelector<HTMLButtonElement>(".fork-origin-toggle")!.click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls, [3, 2]);
+  assert.match(host.textContent ?? "", /old one/);
+  assert.match(host.textContent ?? "", /old two/);
+  assert.match(host.textContent ?? "", /2 messages/);
+  host.querySelector<HTMLButtonElement>(".fork-origin-toggle")!.click();
+  assert.doesNotMatch(host.textContent ?? "", /old one/);
+  const staleGeneration = controller.beginRefresh();
+  const generation = controller.beginRefresh();
+  const refresh = inheritedRefreshEntries(
+    session,
+    [{ type: "assistant", payload: { text: "new reply" }, createdAt: 3, seq: 3 }],
+    state.inheritedLoaded,
+  );
+  assert.equal(controller.applyRefresh(generation, refresh), true);
+  assert.equal(
+    controller.applyRefresh(staleGeneration, [{ type: "user", payload: { text: "stale" }, createdAt: 0, seq: 1 }]),
+    false,
+  );
+  host.querySelector<HTMLButtonElement>(".fork-origin-toggle")!.click();
+  assert.match(host.textContent ?? "", /old one/);
+  assert.equal(host.textContent?.match(/old one/g)?.length, 1);
+  const noOrigin = forkOriginDetails({}, 0);
+  render(noOrigin ? forkOriginView({ ...noOrigin, expanded: false, navigate() {}, toggle() {} }) : null, host);
+  assert.equal(host.querySelector(".fork-origin-badge"), null);
+  dom.window.close();
+});
 
 const MODEL = { id: "m", api: "anthropic", provider: "anthropic" } as unknown as Parameters<
   typeof entriesToMessages
@@ -49,6 +378,28 @@ test("a hidden proactive-opener user entry never renders, but its assistant gree
   assert.equal((msgs[0] as { role?: string }).role, "assistant");
 });
 
+test("a materialized delivery entry (cron reply written into the thread) renders as an assistant reply", () => {
+  const entries: SessionEntry[] = [
+    { type: "user", payload: { text: "remind me later" }, createdAt: 100 },
+    { type: "assistant", payload: { text: "will do" }, createdAt: 110 },
+    {
+      type: "assistant",
+      payload: {
+        text: "Reminder: standup in 10 minutes",
+        deliveryKey: "agent:main:cron:c1:100",
+        via: "cron",
+      },
+      createdAt: 200,
+      seq: 2,
+    },
+  ];
+  const msgs = entriesToMessages(entries, MODEL);
+  assert.equal(msgs.length, 3, "user + reply + delivered reminder");
+  const delivered = msgs[2] as { role?: string; content?: Array<{ text?: string }> };
+  assert.equal(delivered.role, "assistant");
+  assert.equal(delivered.content?.[0]?.text, "Reminder: standup in 10 minutes");
+});
+
 test("a durable turn_failure entry renders like the live inline error (survives reload)", () => {
   const entries: SessionEntry[] = [
     { type: "user", payload: { text: "how did it go?" }, createdAt: 100 },
@@ -64,6 +415,63 @@ test("a durable turn_failure entry renders like the live inline error (survives 
   assert.equal(err.role, "assistant");
   assert.equal(err.stopReason, "error");
   assert.equal(err.errorMessage, "API integrators: you can reduce refusals…");
+});
+
+test("user entries carry the stored speaker name and slack ts onto the rebuilt message", () => {
+  const entries: SessionEntry[] = [
+    { type: "user", payload: { text: "hi", name: "Alice Example", ts: "100.1" }, createdAt: 100 },
+    { type: "user", payload: { text: "anonymous web message" }, createdAt: 110 },
+  ];
+  const msgs = entriesToMessages(entries, MODEL);
+  const [slack, web] = msgs as Array<{ speaker?: string; ts?: string }>;
+  assert.equal(slack?.speaker, "Alice Example");
+  assert.equal(slack?.ts, "100.1");
+  assert.equal(web?.speaker, undefined);
+  assert.equal(web?.ts, undefined);
+});
+
+test("a message_revision marker renders as a system note and badges the original bubble", () => {
+  const entries: SessionEntry[] = [
+    { type: "user", payload: { text: "original", name: "Alice Example", ts: "100.1" }, createdAt: 100 },
+    { type: "assistant", payload: { text: "reply" }, createdAt: 110 },
+    {
+      type: "system",
+      payload: { kind: "message_revision", action: "edited", ts: "100.1", text: "fixed", name: "Alice Example" },
+      createdAt: 120,
+    },
+    {
+      type: "system",
+      payload: { kind: "message_revision", action: "deleted", ts: "100.1", name: "Alice Example" },
+      createdAt: 130,
+    },
+  ];
+  const msgs = entriesToMessages(entries, MODEL);
+  assert.equal(msgs.length, 4, "user + reply + edit note + delete note");
+  const original = msgs[0] as { edited?: boolean; deleted?: boolean };
+  assert.equal(original.edited, true);
+  assert.equal(original.deleted, true);
+  const note = msgs[2] as { role?: string; action?: string; content?: string; speaker?: string; timestamp?: number };
+  assert.equal(note.role, "system-note");
+  assert.equal(note.action, "edited");
+  assert.equal(note.content, "fixed");
+  assert.equal(note.speaker, "Alice Example");
+  assert.equal(note.timestamp, 120);
+  assert.equal((msgs[3] as { action?: string }).action, "deleted");
+});
+
+test("a revision marker whose original message is outside the window still renders as a note", () => {
+  const entries: SessionEntry[] = [
+    { type: "user", payload: { text: "later message", ts: "200.0" }, createdAt: 200 },
+    {
+      type: "system",
+      payload: { kind: "message_revision", action: "deleted", ts: "100.1" },
+      createdAt: 210,
+    },
+  ];
+  const msgs = entriesToMessages(entries, MODEL);
+  assert.equal(msgs.length, 2);
+  assert.equal((msgs[0] as { deleted?: boolean }).deleted, undefined, "the wrong bubble is never badged");
+  assert.equal((msgs[1] as { role?: string }).role, "system-note");
 });
 
 test("other system entries (file events, context summaries) still never render", () => {
@@ -166,6 +574,71 @@ test("delivery entries attach openable files to the preceding assistant message"
   assert.deepEqual((msgs[1] as AssistantWork).deliveredFiles, [
     { name: "rsi.gif", mimetype: "image/gif", sizeBytes: 42, artifactId: "art-1" },
   ]);
+});
+
+test("an attach tool result attaches openable files to the turn's assistant message", () => {
+  const entries: SessionEntry[] = [
+    { type: "user", payload: { text: "make a report" }, createdAt: 100 },
+    { type: "tool_call", payload: { tool: "attach", files: ["report.md"], callId: "c1" }, createdAt: 110, seq: 2 },
+    {
+      type: "tool_result",
+      payload: {
+        tool: "attach",
+        ok: true,
+        callId: "c1",
+        files: [{ name: "report.md", mimetype: "text/markdown", sizeBytes: 12, artifactId: "art-9" }],
+      },
+      createdAt: 111,
+      seq: 3,
+      parentSeq: 2,
+    },
+    { type: "assistant", payload: { text: "Here it is." }, createdAt: 120 },
+  ];
+  const msgs = entriesToMessages(entries, MODEL);
+  assert.deepEqual((msgs[1] as AssistantWork).deliveredFiles, [
+    { name: "report.md", mimetype: "text/markdown", sizeBytes: 12, artifactId: "art-9" },
+  ]);
+});
+
+test("re-attaching a path renders one chip, not two", () => {
+  const attachResult = (callId: string, artifactId: string, seq: number): SessionEntry => ({
+    type: "tool_result",
+    payload: {
+      tool: "attach",
+      ok: true,
+      callId,
+      files: [{ name: "report.md", mimetype: "text/markdown", sizeBytes: 12, artifactId }],
+    },
+    createdAt: 110 + seq,
+    seq,
+    parentSeq: seq - 1,
+  });
+  const entries: SessionEntry[] = [
+    { type: "user", payload: { text: "make a report" }, createdAt: 100 },
+    attachResult("c1", "art-draft", 3),
+    attachResult("c2", "art-fixed", 5),
+    { type: "assistant", payload: { text: "Here it is." }, createdAt: 120 },
+  ];
+  const msgs = entriesToMessages(entries, MODEL);
+  assert.deepEqual((msgs[1] as AssistantWork).deliveredFiles, [
+    { name: "report.md", mimetype: "text/markdown", sizeBytes: 12, artifactId: "art-fixed" },
+  ]);
+});
+
+test("a failed attach tool result attaches no files", () => {
+  const entries: SessionEntry[] = [
+    { type: "user", payload: { text: "make a report" }, createdAt: 100 },
+    {
+      type: "tool_result",
+      payload: { tool: "attach", ok: false, callId: "c1" },
+      createdAt: 111,
+      seq: 3,
+      parentSeq: 2,
+    },
+    { type: "assistant", payload: { text: "I could not find it." }, createdAt: 120 },
+  ];
+  const msgs = entriesToMessages(entries, MODEL);
+  assert.equal((msgs[1] as AssistantWork).deliveredFiles, undefined);
 });
 
 test("delivery-only turns still rebuild an assistant message for the file chips", () => {
@@ -556,7 +1029,15 @@ test("a posted turn that closes empty is NOT promoted — the post bubble is alr
 
 test("a turn that closed empty after narrating surfaces the last narration as the reply", () => {
   const entries: SessionEntry[] = [
-    { type: "user", payload: { text: "[background job update] fetch done", hidden: true }, createdAt: 100, seq: 1 },
+    {
+      type: "user",
+      payload: {
+        text: '<wake reason="monitor" surface="monitor" at="1970-01-01T00:00:00.000Z"><why>fetch done</why></wake>',
+        hidden: true,
+      },
+      createdAt: 100,
+      seq: 1,
+    },
     {
       type: "text",
       payload: { text: "All benign — building the replay harness." },
@@ -598,7 +1079,15 @@ test("a turn that closed empty after narrating surfaces the last narration as th
 
 test("a delivered-silence turn (finish_silently → silent:true) stays collapsed — no promotion", () => {
   const entries: SessionEntry[] = [
-    { type: "user", payload: { text: "[background job update] still running", hidden: true }, createdAt: 100, seq: 1 },
+    {
+      type: "user",
+      payload: {
+        text: '<wake reason="monitor" surface="monitor" at="1970-01-01T00:00:00.000Z"><why>still running</why></wake>',
+        hidden: true,
+      },
+      createdAt: 100,
+      seq: 1,
+    },
     { type: "text", payload: { text: "Heartbeat check." }, createdAt: 110, seq: 2, parentSeq: 1 },
     {
       type: "tool_call",
@@ -725,7 +1214,15 @@ test("a still-running turn (no closing entry yet) is not promoted", () => {
 
 test("a closed empty turn with no narration stays a bare work row", () => {
   const entries: SessionEntry[] = [
-    { type: "user", payload: { text: "[background job update] tick", hidden: true }, createdAt: 100, seq: 1 },
+    {
+      type: "user",
+      payload: {
+        text: '<wake reason="monitor" surface="monitor" at="1970-01-01T00:00:00.000Z"><why>tick</why></wake>',
+        hidden: true,
+      },
+      createdAt: 100,
+      seq: 1,
+    },
     { type: "tool_call", payload: { tool: "execute", command: "tail log" }, createdAt: 110, seq: 2, parentSeq: 1 },
     { type: "tool_result", payload: { tool: "execute", code: 0 }, createdAt: 120, seq: 3, parentSeq: 2 },
     { type: "assistant", payload: { text: "" }, createdAt: 130, seq: 4 },
@@ -740,7 +1237,15 @@ test("a closed empty turn with no narration stays a bare work row", () => {
 
 test("a mid-turn hidden entry (resume/wake note) does not split the turn; promotion still fires", () => {
   const entries: SessionEntry[] = [
-    { type: "user", payload: { text: "[background job update] fetch done", hidden: true }, createdAt: 100, seq: 1 },
+    {
+      type: "user",
+      payload: {
+        text: '<wake reason="monitor" surface="monitor" at="1970-01-01T00:00:00.000Z"><why>fetch done</why></wake>',
+        hidden: true,
+      },
+      createdAt: 100,
+      seq: 1,
+    },
     { type: "text", payload: { text: "Applying the fixes." }, createdAt: 110, seq: 2, parentSeq: 1 },
     { type: "tool_call", payload: { tool: "execute", command: "node apply.js" }, createdAt: 120, seq: 3, parentSeq: 2 },
     { type: "tool_result", payload: { tool: "execute", code: 0 }, createdAt: 130, seq: 4, parentSeq: 3 },
@@ -764,7 +1269,15 @@ test("a mid-turn hidden entry (resume/wake note) does not split the turn; promot
 
 test("a turn resumed past a hidden note renders as one block with the real reply", () => {
   const entries: SessionEntry[] = [
-    { type: "user", payload: { text: "[background job update] fetch done", hidden: true }, createdAt: 100, seq: 1 },
+    {
+      type: "user",
+      payload: {
+        text: '<wake reason="monitor" surface="monitor" at="1970-01-01T00:00:00.000Z"><why>fetch done</why></wake>',
+        hidden: true,
+      },
+      createdAt: 100,
+      seq: 1,
+    },
     {
       type: "tool_call",
       payload: { tool: "execute", command: "node rebuild.js" },
@@ -794,5 +1307,91 @@ test("a turn resumed past a hidden note renders as one block with the real reply
     msg.work?.activity.map((a) => a.type),
     ["tool_call", "tool_result"],
     "the work block is not split at the hidden note",
+  );
+});
+
+test("a file-only post (empty text) still renders its delivered files", () => {
+  const entries: SessionEntry[] = [
+    { type: "user", payload: { text: "just send the file" }, createdAt: 100, seq: 0 },
+    {
+      type: "tool_call",
+      payload: { tool: "web", action: "post", text: "", files: ["out/report.pdf"], callId: "c2" },
+      createdAt: 110,
+      seq: 1,
+      parentSeq: 0,
+    },
+    {
+      type: "tool_result",
+      payload: {
+        tool: "web",
+        action: "post",
+        ok: true,
+        callId: "c2",
+        isError: false,
+        result: "[sent]",
+        files: [{ name: "report.pdf", mimetype: "application/pdf", sizeBytes: 512, artifactId: "art-7" }],
+      },
+      createdAt: 120,
+      seq: 2,
+      parentSeq: 1,
+    },
+  ];
+  const msgs = entriesToMessages(entries, MODEL);
+  const reply = msgs[1] as AssistantWork & { content: Array<{ text?: string }> };
+  assert.equal(reply.role, "assistant");
+  assert.equal(reply.content[0]?.text, "");
+  assert.deepEqual(
+    reply.deliveredFiles?.map((f) => ({ name: f.name, artifactId: f.artifactId })),
+    [{ name: "report.pdf", artifactId: "art-7" }],
+    "the file-only post's attachment still surfaces on the message",
+  );
+});
+
+test("a surface post's sent files render as delivered files on the reply bubble", () => {
+  const entries: SessionEntry[] = [
+    { type: "user", payload: { text: "send the drafts" }, createdAt: 100, seq: 0 },
+    {
+      type: "tool_call",
+      payload: {
+        tool: "web",
+        action: "post",
+        text: "Here they are — profiles A/B/C.",
+        files: ["qm-brand/profile_A.png", "qm-brand/profile_B.png"],
+        callId: "c1",
+      },
+      createdAt: 110,
+      seq: 1,
+      parentSeq: 0,
+    },
+    {
+      type: "tool_result",
+      payload: {
+        tool: "web",
+        action: "post",
+        ok: true,
+        callId: "c1",
+        isError: false,
+        result: "[sent]",
+        files: [
+          { name: "profile_A.png", mimetype: "image/png", sizeBytes: 28720, artifactId: "art-1" },
+          { name: "profile_B.png", mimetype: "image/png", sizeBytes: 21922, artifactId: "art-2" },
+        ],
+      },
+      createdAt: 120,
+      seq: 2,
+      parentSeq: 1,
+    },
+  ];
+  const msgs = entriesToMessages(entries, MODEL);
+  const reply = msgs[1] as AssistantWork & { content: Array<{ text?: string }> };
+  assert.equal(reply.role, "assistant");
+  assert.equal(reply.content[0]?.text, "Here they are — profiles A/B/C.");
+  assert.deepEqual(
+    reply.deliveredFiles?.map((f) => ({ name: f.name, artifactId: f.artifactId })),
+    [
+      { name: "profile_A.png", artifactId: "art-1" },
+      { name: "profile_B.png", artifactId: "art-2" },
+    ],
+    "the attachments the post actually sent are surfaced on the message",
   );
 });

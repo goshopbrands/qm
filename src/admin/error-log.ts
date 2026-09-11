@@ -12,7 +12,8 @@ export interface ErrorEvent {
 
 export interface ErrorLog {
   record(e: Omit<ErrorEvent, "ts">): void;
-  list(opts?: { scopeId?: string; sessionId?: string; limit?: number }): Promise<ErrorEvent[]>;
+  flush(): Promise<void>;
+  list(opts?: { scopeId?: string; sessionId?: string; limit?: number; offset?: number }): Promise<ErrorEvent[]>;
   count(opts?: { scopeId?: string; sessionId?: string }): Promise<number>;
 }
 
@@ -22,7 +23,18 @@ export function createErrorLog(): ErrorLog {
   const sink = createTimestampedEventSink<ErrorEvent>({ max: MAX, defaultLimit: 200, equalityFields: ["sessionId"] });
   return {
     record: sink.record,
+    flush: async () => {},
     list: (opts = {}) => sink.list(opts),
     count: async (opts = {}) => (await sink.list({ ...opts, limit: MAX })).length,
   };
+}
+
+const recordedErrors = new WeakSet<object>();
+
+export function markErrorRecorded(err: unknown): void {
+  if (typeof err === "object" && err !== null) recordedErrors.add(err);
+}
+
+export function errorAlreadyRecorded(err: unknown): boolean {
+  return typeof err === "object" && err !== null && recordedErrors.has(err);
 }

@@ -7,7 +7,7 @@ export interface SpecInputs {
   baseEnv: Record<string, string>;
   watch: boolean;
   webUiBasePath: string;
-  slack: { botToken: string; appToken: string };
+  slack?: { botToken: string; appToken: string };
   sessionStore: string;
   runStore: string;
   databaseUrl: string;
@@ -21,6 +21,10 @@ export interface SpecInputs {
 export function buildChildSpecs(i: SpecInputs): ChildSpec[] {
   const watchArgs = i.watch ? ["--watch"] : [];
   const base = { ...i.baseEnv, ...i.sandboxEnv };
+  const siblingBase = Object.fromEntries(
+    Object.entries(base).filter(([key]) => key !== "HOME" && key !== "CODEX_HOME"),
+  );
+  siblingBase.CODEX_AUTH_FILE = "";
   const orgId = i.baseEnv.DEV_INSTANCE_ORG_ID || "acme";
   const signing: Record<string, string> = i.coreSigningSecret ? { CORE_SIGNING_SECRET: i.coreSigningSecret } : {};
   return [
@@ -37,11 +41,15 @@ export function buildChildSpecs(i: SpecInputs): ChildSpec[] {
         ...(i.databaseUrl ? { DATABASE_URL: i.databaseUrl } : {}),
         ...(i.adminGrantsSeed ? { ADMIN_GRANTS: i.adminGrantsSeed } : {}),
         PUBLIC_WEB_URL: `http://localhost:${i.ports.portal}`,
-        SLACK_BOT_TOKEN: i.slack.botToken,
-        SLACK_APP_TOKEN: i.slack.appToken,
+        ...(i.slack
+          ? {
+              SLACK_BOT_TOKEN: i.slack.botToken,
+              SLACK_APP_TOKEN: i.slack.appToken,
+              DEV_INTROSPECTION: "1",
+              DEV_HEALTH_PORT: String(i.ports.slackHealth),
+            }
+          : {}),
         CORE_ORG_ID: orgId,
-        DEV_INTROSPECTION: "1",
-        DEV_HEALTH_PORT: String(i.ports.slackHealth),
         SHUTDOWN_DRAIN_MS: "2000",
       },
       port: i.ports.core,
@@ -54,7 +62,7 @@ export function buildChildSpecs(i: SpecInputs): ChildSpec[] {
       cwd: join(i.worktree, "plugins/web-ui"),
       argv: ["node", "--env-file-if-exists=.env", "server/index.ts"],
       env: {
-        ...base,
+        ...siblingBase,
         ...signing,
         PORT: String(i.ports.web),
         CORE_API_URL: `http://localhost:${i.ports.core}`,
@@ -70,35 +78,18 @@ export function buildChildSpecs(i: SpecInputs): ChildSpec[] {
       stopGraceMs: 5_000,
     },
     {
-      name: "admin",
-      cwd: join(i.worktree, "plugins/admin"),
-      argv: ["node", `--env-file-if-exists=${join(i.worktree, ".env")}`, ...watchArgs, "src/index.ts"],
-      env: {
-        ...base,
-        ...signing,
-        PORT: String(i.ports.admin),
-        CORE_API_URL: `http://localhost:${i.ports.core}`,
-        CORE_ORG_ID: orgId,
-        ADMIN_BASE_PATH: "/admin",
-      },
-      port: i.ports.admin,
-      readiness: { kind: "log", pattern: `http://localhost:${i.ports.admin}` },
-      health: { kind: "tcp", port: i.ports.admin },
-      stopGraceMs: 5_000,
-    },
-    {
       name: "portal",
       cwd: join(i.worktree, "plugins/portal"),
       argv: ["node", ...watchArgs, "src/index.ts"],
       env: {
-        ...base,
+        ...siblingBase,
         ...signing,
         PORT: String(i.ports.portal),
         PORTAL_PUBLIC_URL: `http://localhost:${i.ports.portal}`,
         CORE_API_URL: `http://localhost:${i.ports.core}`,
         CORE_ORG_ID: orgId,
         WEB_UI_UPSTREAM: `http://localhost:${i.ports.web}`,
-        ADMIN_UPSTREAM: `http://localhost:${i.ports.admin}`,
+        ADMIN_UPSTREAM: `http://localhost:${i.ports.web}/admin`,
         PORTAL_SESSION_SECRET: i.portalSessionSecret,
         NODE_ENV: "development",
         PORTAL_LOCAL_AUTH_BYPASS: "1",

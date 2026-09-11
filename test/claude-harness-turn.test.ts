@@ -8,6 +8,8 @@ import type { ScopeId, SessionEntry } from "../src/types.ts";
 type FakeSdkMessage = Record<string, unknown>;
 type Script = (prompts: AsyncIterable<{ message: { content: unknown } }>) => AsyncGenerator<FakeSdkMessage>;
 
+const toolHandlers = new Map<string, (args: unknown) => Promise<unknown>>();
+
 let currentScript: Script = async function* () {};
 
 mock.module("@anthropic-ai/claude-agent-sdk", {
@@ -29,12 +31,10 @@ mock.module("@anthropic-ai/claude-agent-sdk", {
         },
       };
     },
-    tool: (name: string, description: string, schema: unknown, handler: unknown) => ({
-      name,
-      description,
-      schema,
-      handler,
-    }),
+    tool: (name: string, description: string, schema: unknown, handler: (args: unknown) => Promise<unknown>) => {
+      toolHandlers.set(name, handler);
+      return { name, description, schema, handler };
+    },
     createSdkMcpServer: (config: unknown) => config,
   },
 });
@@ -80,7 +80,7 @@ function harnessTurn(overrides: Partial<HarnessTurnInput> = {}): {
     input: "what is the capital of france?",
     systemPrompt: "be brief",
     history: [],
-    tools: {} as HarnessTurnInput["tools"],
+    tools: {} as unknown as HarnessTurnInput["tools"],
     scopeLabel: scope,
     orgScopeId: scope,
     readOnly: true,
@@ -142,6 +142,29 @@ test("a steered turn persists every reply, not only the last result's", async ()
     .filter((entry) => entry.type === "user")
     .map((entry) => (entry.payload as { text: string }).text);
   assert.deepEqual(userTexts, ["what is the capital of france?", "now do the other three"]);
+});
+
+test("a user stop that surfaces as a non-success SDK result is a clean stop, and the stop stays pending", async () => {
+  const signals = createMemoryRunSignalStore();
+  const runId = "run-stop-error";
+  currentScript = async function* (prompts) {
+    await prompts[Symbol.asyncIterator]().next();
+    await signals.send(runId, { kind: "abort" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    yield resultMessage("", { subtype: "error_during_execution", errors: ["turn interrupted"], is_error: true });
+  };
+
+  const harness = createClaudeHarness({ signals });
+  const { turn } = harnessTurn({ runId });
+  const result = await harness.turns.runTurn(turn);
+
+  assert.equal(result.stopped, true, "an interrupted turn the SDK calls an error is still a user stop");
+  assert.equal(result.reply, "");
+  assert.deepEqual(
+    (await signals.takePending(runId)).map((s) => s.kind),
+    ["abort"],
+    "the stop stays pending for the terminal drain",
+  );
 });
 
 test("model calls are counted per API response and charged their real input tokens", async () => {
@@ -244,7 +267,11 @@ test("each steered prompt gets its own LLM request record", async () => {
     [0, 1],
   );
   assert.equal(llmRequests[1]!.truncated, false);
-  assert.deepEqual(llmRequests[1]!.request, { prompt: "and another thing" });
+  assert.equal(
+    (llmRequests[1]!.promptEnvelope as { system: string }).system,
+    "be brief",
+    "steer steps reuse the turn's envelope — the steer text itself lives on the tape",
+  );
   assert.equal(llmRequests[0]!.usage?.costUsd, 0.1);
   assert.ok(Math.abs((llmRequests[1]!.usage?.costUsd ?? 0) - 0.2) < 1e-9);
 });
@@ -268,7 +295,7 @@ test("a turn that dies before its first result still records exactly one request
   assert.equal(llmRequests.length, 1);
   assert.equal(llmRequests[0]!.step, 0);
   assert.equal(llmRequests[0]!.truncated, false);
-  assert.equal((llmRequests[0]!.request as { system: string }).system, "be brief");
+  assert.equal((llmRequests[0]!.promptEnvelope as { system: string }).system, "be brief");
 });
 
 test("the claude harness offers compaction and detection so a utility role cannot silently disable them", async () => {
@@ -300,4 +327,25 @@ test("the claude harness offers compaction and detection so a utility role canno
     recordModelCall: () => {},
   });
   assert.equal(verdict.respond, true);
+});
+
+test("Claude preserves a committed runtime handoff when SDK interruption returns an error", async () => {
+  const choice = { harnessId: "codex" as const, modelId: "gpt-6-astra" };
+  currentScript = async function* (prompts) {
+    await prompts[Symbol.asyncIterator]().next();
+    await toolHandlers.get("runtime")!({ action: "set", model: "Astra" });
+    yield resultMessage("", { subtype: "error_during_execution", errors: ["turn interrupted"], is_error: true });
+  };
+  const harness = createClaudeHarness({});
+  const { turn, entries } = harnessTurn({
+    readOnly: false,
+    tools: {
+      runtime: async () => ({ ok: true, handoff: { choice, lifetime: "task" } }),
+    } as unknown as HarnessTurnInput["tools"],
+  });
+  const result = await harness.turns.runTurn(turn);
+  assert.deepEqual(result.runtimeHandoff, { choice, lifetime: "task" });
+  assert.equal(result.stopped, undefined);
+  assert.equal(entries.filter((entry) => entry.type === "assistant").length, 0);
+  assert.ok(entries.some((entry) => entry.type === "tool_result"));
 });
