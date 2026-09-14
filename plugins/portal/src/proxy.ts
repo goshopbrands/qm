@@ -205,6 +205,46 @@ export function proxyToDeployment(req: IncomingMessage, res: ServerResponse, t: 
   });
 }
 
+const APPS_HOST_DROPPED_REQUEST_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "x-signature",
+  "x-timestamp",
+  "x-as-principal",
+  "x-admin-actor",
+  "x-agent-capability",
+  PORTAL_IDENTITY_HEADER,
+]);
+
+export function isAppsHost(hostHeader: string | undefined, appsDomain: string | undefined): boolean {
+  if (!appsDomain) return false;
+  const host = (hostHeader ?? "").split(":")[0]!.toLowerCase().replace(/\.$/, "");
+  return host.endsWith(`.${appsDomain.toLowerCase().replace(/\.$/, "")}`);
+}
+
+export function proxyToAppsHost(req: IncomingMessage, res: ServerResponse, coreBase: string): void {
+  const core = new URL(coreBase);
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (value === undefined || APPS_HOST_DROPPED_REQUEST_HEADERS.has(name)) continue;
+    headers[name] = Array.isArray(value) ? value.join(", ") : value;
+  }
+  relay(req, res, {
+    protocol: core.protocol,
+    hostname: core.hostname,
+    port: requestPort(core),
+    path: req.url ?? "/",
+    headers,
+    forwardCookies: true,
+  });
+}
+
 export interface UpstreamTarget {
   forwardCookies?: boolean;
   baseUrl: string;

@@ -30,6 +30,8 @@ import {
   hostedDomainHint,
 } from "./oidc.ts";
 import {
+  isAppsHost,
+  proxyToAppsHost,
   proxyToSurface,
   proxyToDeployment,
   proxyToUpstream,
@@ -877,6 +879,7 @@ const server = createServer((req, res) => {
 });
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (isAppsHost(req.headers.host, APPS_DOMAIN)) return proxyToAppsHost(req, res, CORE);
   const method = req.method ?? "GET";
   const rawTarget = req.url ?? "/";
   const url = new URL(rawTarget, "http://portal.local");
