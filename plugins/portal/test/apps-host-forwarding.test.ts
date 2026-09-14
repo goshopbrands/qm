@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer, request, type IncomingHttpHeaders } from "node:http";
-import type { AddressInfo } from "node:net";
+import { connect, type AddressInfo } from "node:net";
 
 interface Seen {
   method: string;
@@ -137,6 +137,7 @@ test("the portal's own host and look-alike hosts are not forwarded to core", asy
     "apps.qm.example.com",
     "invoice-review.apps.qm.example.com.evil.com",
     "notapps.qm.example.com",
+    "invoice-review.apps.qm.example.com.",
   ]) {
     const res = await send(host, "/healthz");
     assert.equal(res.status, 200, host);
@@ -147,4 +148,43 @@ test("the portal's own host and look-alike hosts are not forwarded to core", asy
     [],
   );
   assert.deepEqual(appRequests(), []);
+});
+
+function sendRaw(raw: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, "localhost", () => socket.write(raw));
+    socket.on("error", reject);
+    socket.on("data", () => undefined);
+    setTimeout(() => {
+      socket.destroy();
+      resolve();
+    }, 500);
+  });
+}
+
+test("a body on a GET cannot smuggle a second request to core", async () => {
+  const inner = "GET /smuggled HTTP/1.1\r\nHost: core\r\nx-as-principal: admin@example.com\r\n\r\n";
+  for (const framing of [
+    `Transfer-Encoding: chunked\r\n\r\n${inner.length.toString(16)}\r\n${inner}\r\n0\r\n\r\n`,
+    `Content-Length: ${inner.length}\r\n\r\n${inner}`,
+  ]) {
+    seen.length = 0;
+    await sendRaw(`GET / HTTP/1.1\r\nHost: invoice-review.apps.qm.example.com\r\n${framing}`);
+    assert.deepEqual(
+      seen.filter((s) => s.url === "/smuggled"),
+      [],
+    );
+    assert.equal(appRequests().length, 1);
+    assert.equal(appRequests()[0]!.body, inner);
+  }
+});
+
+test("a chunked request body reaches core intact", async () => {
+  seen.length = 0;
+  const body = JSON.stringify({ uid: "invoice-2", decision: "denied" });
+  await sendRaw(
+    `POST /api/decide HTTP/1.1\r\nHost: invoice-review.apps.qm.example.com\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n${body.length.toString(16)}\r\n${body}\r\n0\r\n\r\n`,
+  );
+  assert.equal(appRequests().length, 1);
+  assert.equal(appRequests()[0]!.body, body);
 });

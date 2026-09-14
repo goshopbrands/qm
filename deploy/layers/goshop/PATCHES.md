@@ -26,7 +26,7 @@ changes.
 
 ## Patch 1: portal forwards app subdomains to core
 
-**Status:** active since 2026-09-14.
+**Status:** code merged 2026-09-14; takes effect once the deployment settings below are applied.
 
 **Problem.** Upstream serves published apps signed-in at `/d/<app>/` under a sandbox
 content-security policy. The sandbox gives the page an opaque origin, so the app's own
@@ -39,13 +39,21 @@ app subdomains never reach core.
 **Change.** The portal forwards any request whose `Host` is under `DEPLOY_APPS_DOMAIN`
 (or `PORTAL_APPS_DOMAIN`) straight to core, preserving `Host`, cookies, and body, and
 dropping hop-by-hop headers and core trust headers (`x-signature`, `x-timestamp`,
-`x-as-principal`, `x-admin-actor`, `x-agent-capability`, `x-portal-identity`). Sign-in,
-sharing, and cookie stripping before the app all remain upstream core behavior. No new
-settings, URLs, or stored data were introduced.
+`x-as-principal`, `x-admin-actor`, `x-agent-capability`, `x-portal-identity`). Host matching
+mirrors core's `proxyDeploymentSubdomain` exactly. Sign-in, sharing, and cookie stripping
+before the app all remain upstream core behavior. No new settings, URLs, or stored data were
+introduced.
+
+The portal's shared `relay` also now re-frames every forwarded request body from the
+incoming `Content-Length` or `Transfer-Encoding`. Upstream's `relay` pipes bodies without
+framing, so a body on a GET, HEAD, DELETE, or OPTIONS request reaches core as a second,
+smuggled request with arbitrary headers. Upstream only exposes that behind portal sign-in;
+the app-host route would expose it publicly. Keep this part until upstream frames bodies
+itself; the outcome tests cover it.
 
 **Files.**
 
-- `plugins/portal/src/proxy.ts`: `isAppsHost`, `proxyToAppsHost`
+- `plugins/portal/src/proxy.ts`: `isAppsHost`, `proxyToAppsHost`, `framedHeaders` used by `relay`
 - `plugins/portal/src/index.ts`: first line of `handle()` and the import
 - `plugins/portal/test/apps-host-forwarding.test.ts`: outcome tests, which also serve as the
   retirement probe
@@ -53,12 +61,18 @@ settings, URLs, or stored data were introduced.
 **Deployment settings it relies on** (all upstream settings):
 
 - `publicUrl` `https://qm.goshopbrands.com` in the deployment config
-- `env.core.DEPLOY_APPS_DOMAIN` and `env.portal.DEPLOY_APPS_DOMAIN` set to `apps.qm.goshopbrands.com`
-- `AWS_DEPLOY_GATE_SECRET` on `goshop-core`
+- `env.core.DEPLOY_APPS_DOMAIN`, `env.portal.DEPLOY_APPS_DOMAIN`, and `env.web-ui.DEPLOY_APPS_DOMAIN`
+  set to `apps.qm.goshopbrands.com`; core and portal must always change together, and web-ui
+  needs it to allow the owner shell to frame its chat panel
+- `AWS_DEPLOY_GATE_SECRET` (32+ characters) on `goshop-core`
 - `PORTAL_SESSION_SECRET` on `goshop-core`, same value as on `goshop-portal`; the CLI does not
-  deliver it to core on Fly, so it was set directly with `fly secrets set`
-- DNS `qm` and `*.apps.qm` CNAMEs to `goshop-portal.fly.dev`, with Fly certificates for
-  `qm.goshopbrands.com` and `*.apps.qm.goshopbrands.com` on `goshop-portal`
+  deliver it to core on Fly, so it is set directly with `fly secrets set`, and it must be
+  re-copied whenever the portal's value is rotated
+- `PUBLIC_API_URL` stays `https://goshop-portal.fly.dev`: legacy app machines have that URL
+  baked into their boot command, so `goshop-portal.fly.dev` must keep routing to the portal
+- DNS for `qm.goshopbrands.com` and `*.apps.qm.goshopbrands.com` pointing at `goshop-portal`,
+  plus `_acme-challenge` CNAMEs, with Fly certificates for both names on `goshop-portal`; the
+  certificates must be verified before deploying the settings above
 
 **Retirement signal.** `check-patches.sh` copies the outcome tests into a clean checkout of
 the upstream ref and runs them. If they pass without this patch, upstream now routes app
@@ -96,8 +110,7 @@ and archive and restore. See `docs/fly-legacy-deployments.md`.
 tests `test/legacy-fly-deploy-provider.test.ts`, `test/deploy-provider-selection.test.ts`,
 `test/deploy-release-endpoint.test.ts`, `test/config.test.ts`.
 
-**Deployment settings.** `FLY_LEGACY_DEPLOYMENT_IDS` as a secret on `goshop-core` (also in its
-rendered env). Deploy core with `qm up --build-from=<this checkout>`; plain `qm up` pulls
+**Deployment settings.** `FLY_LEGACY_DEPLOYMENT_IDS` as a secret on `goshop-core`. Deploy core with `qm up --build-from=<this checkout>`; plain `qm up` pulls
 upstream images that lack this patch.
 
 **Apps and their data.**
@@ -112,8 +125,8 @@ upstream images that lack this patch.
 The other four IDs in the list are archived test deployments.
 
 **Retirement signal.** `check-patches.sh` reports a migrate candidate when upstream's
-`src/deploy/fly-deploy-provider.ts` declares a `dataDir` in its provider profile, meaning
-upstream Fly apps get durable storage.
+`src/deploy/fly-deploy-provider.ts` mentions `dataDir`, meaning upstream Fly apps may get
+durable storage, and lists upstream commits touching that provider.
 
 **Retirement steps.**
 

@@ -45,6 +45,16 @@ function declaresFrameAncestors(headers: Record<string, string | string[]>): boo
   return /(^|[;,])\s*frame-ancestors\s/i.test(text);
 }
 
+function framedHeaders(req: IncomingMessage, headers: Record<string, string>): Record<string, string> {
+  const framed = Object.fromEntries(
+    Object.entries(headers).filter(([name]) => !/^(?:content-length|transfer-encoding)$/i.test(name)),
+  );
+  const length = req.headers["content-length"];
+  if (typeof length === "string") framed["content-length"] = length;
+  else if (req.headers["transfer-encoding"] !== undefined) framed["transfer-encoding"] = "chunked";
+  return framed;
+}
+
 function relay(
   req: IncomingMessage,
   res: ServerResponse,
@@ -65,7 +75,7 @@ function relay(
       port: target.port,
       method: req.method,
       path: target.path,
-      headers: target.headers,
+      headers: framedHeaders(req, target.headers),
     },
     (upRes) => {
       const out: Record<string, string | string[]> = {};
@@ -224,8 +234,7 @@ const APPS_HOST_DROPPED_REQUEST_HEADERS = new Set([
 
 export function isAppsHost(hostHeader: string | undefined, appsDomain: string | undefined): boolean {
   if (!appsDomain) return false;
-  const host = (hostHeader ?? "").split(":")[0]!.toLowerCase().replace(/\.$/, "");
-  return host.endsWith(`.${appsDomain.toLowerCase().replace(/\.$/, "")}`);
+  return (hostHeader ?? "").split(":")[0]!.toLowerCase().endsWith(`.${appsDomain.toLowerCase()}`);
 }
 
 export function proxyToAppsHost(req: IncomingMessage, res: ServerResponse, coreBase: string): void {
