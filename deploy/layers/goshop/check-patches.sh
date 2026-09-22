@@ -69,6 +69,19 @@ else
   echo "  still needed: $ref's Fly deploy provider has no durable app data"
 fi
 
+echo "== Patch 3: the browse seed skill is removed"
+report_touches skills-seed/browse fly/Dockerfile .github/workflows/release-package.yml
+skill="$(git show "$ref:skills-seed/browse/SKILL.md" 2>/dev/null || true)"
+if [ -z "$skill" ]; then
+  echo "  PROBE ERROR: $ref has no skills-seed/browse/SKILL.md — upstream removed or renamed the skill; inspect before deciding"
+  review=1
+elif grep -q "do not pip install" <<<"$skill" && grep -q "/opt/browser-engine/venv" <<<"$skill"; then
+  echo "  still needed: $ref still tells the agent the runtime is already at /opt/browser-engine/venv"
+else
+  echo "  RETIRE CANDIDATE: $ref no longer makes the unconditional pre-baked-runtime claim — check whether it now gates by backend or bootstraps the runtime, and verify on a fresh sprite"
+  review=1
+fi
+
 if [ "$review" = 1 ]; then
   echo
   echo "Review deploy/layers/goshop/PATCHES.md before merging this update."

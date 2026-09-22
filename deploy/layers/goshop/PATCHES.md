@@ -138,3 +138,93 @@ durable storage, and lists upstream commits touching that provider.
    until the migrated apps are validated, then delete them explicitly.
 4. When the list is empty, take upstream's versions of the files above, delete the
    legacy-only files, and remove this section.
+
+## Patch 3: the browse seed skill is removed
+
+**Status:** active since 2026-09-22.
+
+**Problem.** Upstream's `browse` seed skill tells the agent the browser runtime is already
+on its computer — "The runtime is already on your computer at `/opt/browser-engine/venv` —
+do not pip install." That is true only on the `aws` and `local` sandbox backends, which boot
+the `qm-sandbox-base` image that `fly/Dockerfile` builds with `INSTALL_BROWSER_ENGINE=1`.
+This deployment runs `SANDBOX_BACKEND=sprites`. Sprites is a managed microVM service that
+boots its own stock Ubuntu rootfs; the Sprites API takes no image (`createSprite` accepts
+only `ramMB`, `cpus`, `region`, `storageGB`), so `/opt/browser-engine` cannot exist there and
+never will under this backend. The same holds for `smolmachines`, `e2b`, and `modal`. Core
+installs every directory under `skills-seed/` for every org regardless of backend, so the
+agent advertises browsing, accepts the task, creates and bills a real Kernel browser, and
+only then dies on `ModuleNotFoundError: browser_use`.
+
+A deployment-layer skill cannot override a live seed skill: a layer skill whose name
+collides with a published non-layer skill makes the whole layer PUT fail
+(`src/deployment/deployment-layer-store.ts`, `deployment layer skill "…" collides with an
+existing non-layer skill`), which would take down every layer tool and connector, not just
+browse. Archiving the seed record first does clear that collision — `foreignSkillCollision`
+skips archived skills — but it does not help, because `src/skills/seed.ts` re-reviews and
+re-publishes an archived seed skill on the next core boot, leaving two published `browse`
+skills and breaking the layer again. Deleting the seed directory is the only durable
+fork-local gate.
+
+**Change.** `skills-seed/browse/` is deleted. Nothing else is touched, to keep the core diff
+to a single directory and the retirement to a single `git checkout`.
+
+Core's browse support stays in place and inert: the orchestrator still injects
+`BROWSE_LAB_MAX_STEPS`, `BROWSE_LAB_MODEL`, and `BROWSE_LAB_MODEL_PROVIDER` into sandboxes,
+and the admin model settings still offer a browse model. Neither resolves a skill, so neither
+errors.
+
+Two references to the skill are knowingly left dangling, because removing them would mean
+patching 55 more core files and taking a merge conflict on each at every upstream sync:
+
+- `skills-seed/popular-web-designs/templates/*.md` (54 files) each end with "Verify visual
+  accuracy with `browse` after generating." These ride into the sandbox as skill assets, so
+  an agent rendering a template is pointed at a skill it will not find. The risk is that it
+  hunts for the skill, or installs `browser-use` by hand — the very thing this patch exists
+  to prevent.
+- `plugins/admin/public/index.html` still describes the service-credential delivery picker's
+  browser-provider key as being "for the browse skill".
+
+If the template line proves to cause real confusion, remove it in a follow-up patch rather
+than folding it into this one.
+
+**One-time operator step.** Deleting the directory stops future installs but does not archive
+the record already published in Postgres — the seed installer only ever upserts. Archive the
+existing org-scoped `browse` skill once, from the admin Skills tab. It stays archived,
+because with the seed directory gone nothing re-publishes it.
+
+**Files.** `skills-seed/browse/` (deleted).
+
+**Deployment settings it relies on.** Deploy core with `qm up --build-from=<this checkout>`.
+The deletion only reaches a deployment through `deploy/core/Dockerfile`'s
+`COPY skills-seed ./skills-seed`; a plain `qm up` pulls the upstream image, which still ships
+`skills-seed/browse`, and its next boot re-publishes the archived record and silently undoes
+the one-time step below.
+
+**Retirement signal.** `check-patches.sh` reads upstream's `skills-seed/browse/SKILL.md` and
+reports a retire candidate when the unconditional pre-baked-runtime claim is gone — that is,
+when upstream has either gated the skill by backend or pointed it at a bootstrap that
+installs the runtime on imageless machines. It also lists upstream commits touching the skill
+and `fly/Dockerfile`.
+
+**Retirement steps.**
+
+1. Restore upstream's `skills-seed/browse/` (`git checkout <ref> -- skills-seed/browse`).
+2. Boot a fresh sprite and confirm the runner reaches
+   `{"outcome":"done","answer":"…"}` against `https://example.com` — upstream's fix has to
+   work on an imageless backend, not just compile.
+3. Un-archive the `browse` skill in the admin Skills tab.
+4. Remove this section.
+
+**Merge conflicts.** Because this patch deletes a core directory, any upstream edit to a file
+under `skills-seed/browse/` arrives as a modify/delete conflict (`deleted by us`). Keep the
+deletion — `git rm -r skills-seed/browse` — unless `check-patches.sh` reports a retire
+candidate. This is the one place where the `update-qm` skill's usual "resolve core conflicts
+in upstream's favour" rule does not apply.
+
+**If browse is wanted back before upstream fixes it.** The bootstrap belongs in a layer
+_tool_, not a layer skill: `install.files` converge by content hash on every provision and
+reach imageless machines, and tools do not collide with seed skill names. That needs this
+deployment's `sandbox/` directory (absent today, so `up` currently skips layer sync
+entirely), plus confirmation that the stock sprite image has `python3-venv` and that
+`pypi.org` and `files.pythonhosted.org` pass the egress proxy. The skill text would still
+need a core patch, since a layer cannot override a live seed skill by name.
