@@ -165,8 +165,8 @@ export function managerAccessFor(
   return null;
 }
 
-export const MANAGER_ACTION_REFUSED = "this admin action is limited to org admins";
-export const MANAGER_PICK_A_SCOPE = "choose a specific scope to view this";
+const MANAGER_ACTION_REFUSED = "this admin action is limited to org admins";
+const MANAGER_PICK_A_SCOPE = "choose a specific scope to view this";
 export const MANAGER_SCOPE_REFUSED = "you don't have access to this scope";
 
 export async function managerRefusal(
