@@ -3,7 +3,7 @@ import { ByteSourceTooLargeError } from "../../../files/durable-byte-store.ts";
 import { fileArtifactId } from "../../../files/file-artifact-store.ts";
 import { MAX_ATTACHMENT_BYTES, mimeFromName, safeAttachmentName } from "../../../core/attachments.ts";
 import { contentDispositionAttachment, contentTypeWithUtf8Charset, pipeToResponse, sendJson } from "../../http.ts";
-import { audit, authorizeAdmin, requireScopedAdmin } from "../shared.ts";
+import { audit, authorizeAdmin, readableByAdmin, requireScopedAdmin } from "../shared.ts";
 import { type ApiCtx } from "../route.ts";
 import { discoverScopes, FILES_PAGE_SIZE } from "./common.ts";
 
@@ -87,7 +87,9 @@ export async function listAdminFiles(ctx: ApiCtx): Promise<void> {
   audit(deps, { principalId: actor.id, action: "files.read", resource: "files", scopeLabel: scope });
   if (!deps.files) return sendJson(res, 200, { scopeId: scope, files: [] });
   const orgWide = parseScopeId(scope).kind === "org";
-  const scopes = orgWide ? [...(await discoverScopes(app, deps)).keys()] : [scope];
+  const scopes = orgWide
+    ? await readableByAdmin(ctx, actor, [...(await discoverScopes(app, deps)).keys()], (id) => id)
+    : [scope];
   const files: Array<{
     id: string;
     scopeId: string;

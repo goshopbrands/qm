@@ -82,6 +82,34 @@ else
   review=1
 fi
 
+echo "== Patch 4: org manager role"
+report_touches src/admin/admin-service.ts src/admin/admin-grant-store.ts src/api/routes/shared.ts \
+  src/api/routes/admin src/api/routes/admin.ts src/api/routes/skill-packs.ts src/wiring.ts \
+  src/core/orchestrator.ts src/api/control-service.ts src/api/routes/surface.ts src/api/routes/auth-broker.ts \
+  src/api/routes/deployments.ts plugins/portal/src/index.ts plugins/admin/public/index.html
+new_routes="$(git diff "$base" "$ref" -- src/api/routes | grep -E '^\+.*"/v1/admin' || true)"
+if [ -n "$new_routes" ]; then
+  echo "  upstream added or changed admin routes; ask whether managers should get each, then classify it in src/admin/manager-access.ts:"
+  printf '%s\n' "$new_routes" | sed 's/^/    /'
+  review=1
+fi
+new_checks="$(git diff "$base" "$ref" -- src plugins | grep -E '^\+.*(adminStatusOf|adminStatusFromGrants|canAdminister|\.isAdmin\b|org_admin|adminProbe|authorizeAdmin|requireScopedAdmin)' || true)"
+if [ -n "$new_checks" ]; then
+  echo "  upstream added admin-status checks; decide whether each should require role org_admin:"
+  printf '%s\n' "$new_checks" | sed 's/^/    /'
+  review=1
+fi
+roles="$(git show "$ref:src/admin/admin-grant-store.ts" 2>/dev/null | grep -E 'AdminRole =' || true)"
+if [ -z "$roles" ]; then
+  echo "  PROBE ERROR: $ref has no AdminRole in src/admin/admin-grant-store.ts; inspect before deciding"
+  review=1
+elif grep -q '"org_admin";' <<<"$roles"; then
+  echo "  still needed: $ref has a single admin role"
+else
+  echo "  RETIRE CANDIDATE: $ref's AdminRole is now: $roles"
+  review=1
+fi
+
 if [ "$review" = 1 ]; then
   echo
   echo "Review deploy/layers/goshop/PATCHES.md before merging this update."

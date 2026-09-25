@@ -336,7 +336,7 @@ async function unattendedGrantRefusal(
   if (!cron.ownerScopeId.startsWith("personal:") || (cron.runAs !== undefined && cron.runAs !== "owner"))
     return "unattended grants require a personal-scope cron that runs as its owner";
   const status = await admin?.adminStatusOf({ id: capability.actorId, type: "internal" }).catch(() => undefined);
-  if (!status?.isAdmin) return "unattended grants require the cron owner to be a current org admin";
+  if (status?.role !== "org_admin") return "unattended grants require the cron owner to be a current org admin";
   return null;
 }
 

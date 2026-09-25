@@ -223,9 +223,14 @@ const ADMIN_TTL_MS = 60_000;
 const ADMIN_PROBE_TIMEOUT_MS = 6_500;
 const ADMIN_PROBE_ATTEMPTS = 2;
 const ADMIN_PROBE_RETRY_DELAY_MS = 250;
-const adminCache = new LRUCache<string, boolean>({ max: 10_000, ttl: ADMIN_TTL_MS });
+interface AdminAccess {
+  isAdmin: boolean;
+  role?: string;
+}
 
-async function adminProbeAttempt(sub: string): Promise<boolean | null> {
+const adminCache = new LRUCache<string, AdminAccess>({ max: 10_000, ttl: ADMIN_TTL_MS });
+
+async function adminProbeAttempt(sub: string): Promise<AdminAccess | null> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ADMIN_PROBE_TIMEOUT_MS);
   try {
@@ -241,12 +246,12 @@ async function adminProbeAttempt(sub: string): Promise<boolean | null> {
       console.warn(`[portal] admin probe returned HTTP ${r.status}`);
       return null;
     }
-    const j = (await r.json()) as { isAdmin?: unknown };
+    const j = (await r.json()) as { isAdmin?: unknown; role?: unknown };
     if (typeof j.isAdmin !== "boolean") {
       console.warn("[portal] admin probe returned an invalid admin status");
       return null;
     }
-    return j.isAdmin;
+    return { isAdmin: j.isAdmin, ...(typeof j.role === "string" ? { role: j.role } : {}) };
   } catch (error) {
     console.warn(`[portal] admin probe failed: ${errMessage(error)}`);
     return null;
@@ -255,24 +260,29 @@ async function adminProbeAttempt(sub: string): Promise<boolean | null> {
   }
 }
 
-async function adminProbe(sub: string): Promise<{ isAdmin: boolean; failed: boolean }> {
+async function adminProbe(sub: string): Promise<AdminAccess & { failed: boolean }> {
   const hit = adminCache.get(sub);
-  if (hit !== undefined) return { isAdmin: hit, failed: false };
+  if (hit !== undefined) return { ...hit, failed: false };
   for (let attempt = 0; attempt < ADMIN_PROBE_ATTEMPTS; attempt++) {
-    const isAdmin = await adminProbeAttempt(sub);
-    if (isAdmin === null) {
+    const access = await adminProbeAttempt(sub);
+    if (access === null) {
       if (attempt + 1 < ADMIN_PROBE_ATTEMPTS)
         await new Promise((resolve) => setTimeout(resolve, ADMIN_PROBE_RETRY_DELAY_MS));
       continue;
     }
-    adminCache.set(sub, isAdmin);
-    return { isAdmin, failed: false };
+    adminCache.set(sub, access);
+    return { ...access, failed: false };
   }
   return { isAdmin: false, failed: true };
 }
 
 async function isAdmin(sub: string): Promise<boolean> {
   return (await adminProbe(sub)).isAdmin;
+}
+
+async function mayImpersonate(sub: string): Promise<boolean> {
+  const access = await adminProbe(sub);
+  return access.isAdmin && access.role === "org_admin";
 }
 
 const PAGE_CSP =
@@ -969,7 +979,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (pathname === "/auth/impersonate" && method === "POST") {
     if (!session) return json(res, 401, { error: "sign in" });
     if (!sameOriginRequest(req)) return json(res, 403, { error: "forbidden", message: "cross-origin request refused" });
-    if (!(await isAdmin(session.sub))) return json(res, 403, { error: "forbidden", message: "admin access required" });
+    if (!(await mayImpersonate(session.sub)))
+      return json(res, 403, { error: "forbidden", message: "admin access required" });
     const target = (url.searchParams.get("target") ?? "").trim();
     if (!target) return json(res, 400, { error: "bad_request", message: "target required" });
     if (target === session.sub) return json(res, 400, { error: "bad_request", message: "cannot impersonate yourself" });
@@ -1173,7 +1184,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   let impersonator: string | undefined;
   if (key === "web-ui") {
     const imp = openImpersonation(readCookie(req.headers.cookie, "portal_impersonate"), impersonateKey, Date.now());
-    if (imp && imp.actor === session.sub && imp.org === session.org && (await isAdmin(session.sub))) {
+    if (imp && imp.actor === session.sub && imp.org === session.org && (await mayImpersonate(session.sub))) {
       principal = imp.target;
       impersonator = session.sub;
     }

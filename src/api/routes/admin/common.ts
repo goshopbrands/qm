@@ -2,7 +2,8 @@ import type { App } from "../../app.ts";
 import type { ServerDeps } from "../../deps.ts";
 import { parseScopeId, scopeId as makeScopeId, type Principal } from "../../../types.ts";
 import { sendJson } from "../../http.ts";
-import { orgScope, requireScopedAdmin } from "../shared.ts";
+import { adminScopeReader, orgScope, requireScopedAdmin } from "../shared.ts";
+import { MANAGER_SCOPE_REFUSED } from "../../../admin/manager-access.ts";
 import { type ApiCtx } from "../route.ts";
 
 export async function requireScopedResource<T>(
@@ -19,6 +20,11 @@ export async function requireScopedResource<T>(
     sendJson(ctx.res, 404, { error: "not_found" });
     return null;
   }
+  const canRead = await adminScopeReader(ctx, authz.actor);
+  if (canRead && !(await canRead(scopeOf(record)))) {
+    sendJson(ctx.res, 403, { error: "forbidden", message: MANAGER_SCOPE_REFUSED });
+    return null;
+  }
   if (parseScopeId(authz.scope).kind !== "org" && scopeOf(record) !== authz.scope) {
     if (scopeMismatch === "forbid") {
       sendJson(ctx.res, 403, { error: "forbidden", message: `${noun} is outside the requested scope` });
@@ -26,7 +32,7 @@ export async function requireScopedResource<T>(
     }
     return { actor: authz.actor, scope: scopeOf(record), record };
   }
-  return { ...authz, record };
+  return canRead ? { actor: authz.actor, scope: scopeOf(record), record } : { ...authz, record };
 }
 
 export const FILES_PAGE_SIZE = 200;

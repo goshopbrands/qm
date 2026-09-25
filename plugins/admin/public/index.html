@@ -6495,6 +6495,8 @@
       let scope = "org:acme";
       let view = DEFAULT_VIEW;
       let orgId = "acme";
+      let myRole = null;
+      const isManager = () => myRole === "org_manager";
 
       const brandSelfLabel = () =>
         document.querySelector('meta[name="brand-self-label"]')?.getAttribute("content") || "QM";
@@ -7026,6 +7028,7 @@
         }
         $("org-tag").textContent = me.data.org;
         orgId = me.data.org;
+        myRole = me.data.role || null;
         $("who-name").textContent = me.data.principal;
         if (me.data.isAdmin === false) {
           $("who").classList.remove("hidden");
@@ -11342,7 +11345,9 @@
           const p = document.createElement("p");
           p.className = "empty";
           p.textContent =
-            r.status === 403 ? "You don't administer this scope." : r.data?.message || `Failed to load (${r.status}).`;
+            r.status === 403
+              ? r.data?.message || "You don't administer this scope."
+              : r.data?.message || `Failed to load (${r.status}).`;
           root.appendChild(p);
           return;
         }
@@ -13672,7 +13677,9 @@
       async function revokeGrant(g) {
         if (
           !confirm(
-            'Revoke admin access for "' +
+            "Revoke the " +
+              labelRole(g.role) +
+              ' role for "' +
               g.principalId +
               '"? The core will refuse this if it would remove the last org admin.',
           )
@@ -13961,10 +13968,12 @@
         grantBtn.className = "primary";
         grantBtn.type = "button";
         grantBtn.textContent = "Grant";
+        const grantRole = document.createElement("select");
+        grantRole.append(new Option("Org admin", "org_admin"), new Option("Org manager", "org_manager"));
         grantBtn.onclick = async () => {
           const principalId = pInput.value.trim();
           if (!principalId) return setStatus("st-users", "Principal id required.", "err");
-          const r = await api("POST", "/api/grants", { principalId, role: "org_admin", scopeId: "org:" + orgId });
+          const r = await api("POST", "/api/grants", { principalId, role: grantRole.value, scopeId: "org:" + orgId });
           if (r.ok) {
             pInput.value = "";
             renderData();
@@ -13975,14 +13984,14 @@
               "err",
             );
         };
-        form.append(mkField("grow", "Principal id", pInput), grantBtn);
-        const formCard = dataCard("Grant org admin", "Promote a principal to org admin. Org admins only.", form);
+        form.append(mkField("grow", "Principal id", pInput), mkField("", "Role", grantRole), grantBtn);
+        const formCard = dataCard("Grant a role", "Give a principal an org role. Org admins only.", form);
         const st = document.createElement("p");
         st.className = "status";
         st.id = "st-users";
         st.style.margin = "10px 0 0";
         formCard.querySelector(".body").appendChild(st);
-        root.appendChild(formCard);
+        if (!isManager()) root.appendChild(formCard);
 
         const impForm = document.createElement("div");
         impForm.className = "grant-form";
@@ -14056,7 +14065,7 @@
         impSt.id = "st-imp";
         impSt.style.margin = "10px 0 0";
         impCard.querySelector(".body").append(impDatalist, impSt);
-        root.appendChild(impCard);
+        if (!isManager()) root.appendChild(impCard);
 
         const inviteEmail = d.inviteEmail || {};
         const emailInput = document.createElement("input");
@@ -14065,7 +14074,8 @@
         emailInput.spellcheck = false;
         emailInput.autocapitalize = "none";
         const roleSelect = document.createElement("select");
-        roleSelect.append(new Option("Member", "member"), new Option("Org admin", "org_admin"));
+        roleSelect.append(new Option("Member", "member"));
+        if (!isManager()) roleSelect.append(new Option("Org admin", "org_admin"));
         const isoDay = (ms) => new Date(ms).toISOString().slice(0, 10);
         const expiresInput = document.createElement("input");
         expiresInput.type = "date";
@@ -14170,15 +14180,18 @@
               nodeCell(mutedText(g.role ? labelRole(g.role) : "member")),
               nodeCell(stacked(g.scopeId, scopeKind(g.scopeId)), "mono"),
               g.grantedBy || "-",
-              {
-                action: {
-                  label: "Revoke",
-                  danger: true,
-                  disabled: orgAdminCount <= 1 && g.role === "org_admin",
-                  title: orgAdminCount <= 1 ? "The last org admin cannot be revoked." : "",
-                  run: () => revokeGrant(g),
-                },
-              },
+              isManager()
+                ? { text: "" }
+                : {
+                    action: {
+                      label: "Revoke",
+                      danger: true,
+                      disabled: orgAdminCount <= 1 && g.role === "org_admin",
+                      title:
+                        orgAdminCount <= 1 && g.role === "org_admin" ? "The last org admin cannot be revoked." : "",
+                      run: () => revokeGrant(g),
+                    },
+                  },
             ],
             "No admins match.",
           );
@@ -14198,20 +14211,22 @@
               { text: String(u.turnCount), cls: "num" },
               { text: kcFor(u.principalId) ? String(kcFor(u.principalId)[0]) : "-", cls: "num" },
               { text: kcFor(u.principalId) ? String(kcFor(u.principalId)[1]) : "-", cls: "num" },
-              {
-                action: {
-                  label: "Impersonate ↗",
-                  run: (ev) => {
-                    ev?.stopPropagation?.();
-                    openWebUiAs(u.principalId);
-                  },
-                },
-              },
-              u.admin?.isAdmin
+              isManager()
                 ? { text: "" }
                 : {
                     action: {
-                      label: "Make admin",
+                      label: "Impersonate ↗",
+                      run: (ev) => {
+                        ev?.stopPropagation?.();
+                        openWebUiAs(u.principalId);
+                      },
+                    },
+                  },
+              u.admin?.isAdmin || isManager()
+                ? { text: "" }
+                : {
+                    action: {
+                      label: "Grant role",
                       run: (ev) => {
                         ev?.stopPropagation?.();
                         pInput.value = u.principalId;
@@ -15268,7 +15283,7 @@
         });
         const userActions = document.createElement("div");
         userActions.style.margin = "0 0 14px";
-        userActions.appendChild(webUiAsButton(d.principalId || principalId));
+        if (!isManager()) userActions.appendChild(webUiAsButton(d.principalId || principalId));
         detail.appendChild(userActions);
 
         const stats = d.stats || {};
@@ -16731,7 +16746,7 @@
           title: origin?.label || "Conversation",
           context:
             shortName(session.scopeId || scope) + (session.createdAt ? " · created " + relTime(session.createdAt) : ""),
-          actions: ownerPrincipal ? [webUiAsButton(ownerPrincipal)] : [],
+          actions: ownerPrincipal && !isManager() ? [webUiAsButton(ownerPrincipal)] : [],
         });
         const errStrip = document.createElement("div");
         detail.appendChild(errStrip);

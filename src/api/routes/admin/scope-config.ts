@@ -20,7 +20,7 @@ import {
   type ModelCatalogEntry,
 } from "../../../model/model-catalog.ts";
 import { sendJson } from "../../http.ts";
-import { activePrincipal, adminActorFrom, audit, authorizeAdmin, orgScope } from "../shared.ts";
+import { activePrincipal, adminActorFrom, audit, authorizeAdmin, orgScope, readableByAdmin } from "../shared.ts";
 import {
   ADMIN_RESOURCES,
   ADMIN_RESOURCE_BY_ID,
@@ -200,14 +200,20 @@ export async function listAdminScopes(ctx: ApiCtx): Promise<void> {
       skills: skillN.get(id) ?? 0,
     };
   });
-  scopes.sort(
+  const visible = await readableByAdmin(ctx, actor, scopes, (row) => row.scopeId);
+  const visibleIds = new Set(visible.map((row) => row.scopeId));
+  const visibleEnvironments = environments.flatMap((environment) => {
+    if (!visibleIds.has(environment.id) && !environment.attachedScopes.some((id) => visibleIds.has(id))) return [];
+    return [{ ...environment, attachedScopes: environment.attachedScopes.filter((id) => visibleIds.has(id)) }];
+  });
+  visible.sort(
     (a, b) =>
       b.lastActivity - a.lastActivity ||
       b.sessions - a.sessions ||
       b.backgroundSessions - a.backgroundSessions ||
       a.scopeId.localeCompare(b.scopeId),
   );
-  return sendJson(res, 200, { scopeId: scope, scopes, environments });
+  return sendJson(res, 200, { scopeId: scope, scopes: visible, environments: visibleEnvironments });
 }
 
 interface ScopeEnvironmentMetadata {

@@ -17,7 +17,7 @@ import {
 import { createTranscriptSource } from "../../../harness/tape-projection.ts";
 import { swallowAs } from "../../../util/errors.ts";
 import { sendJson } from "../../http.ts";
-import { audit, requireScopedAdmin } from "../shared.ts";
+import { adminScopeReader, audit, requireScopedAdmin } from "../shared.ts";
 import { type ApiCtx } from "../route.ts";
 import { requireScopedResource } from "./common.ts";
 import {
@@ -323,7 +323,9 @@ export async function getAdminSession(ctx: ApiCtx): Promise<void> {
   const id = params.id!;
   const scoped = await requireAdminSession(ctx, id);
   if (!scoped) return;
-  const { actor, scope, record: session } = scoped;
+  const { actor, record: session } = scoped;
+  const narrowed = parseScopeId(scoped.scope).kind === "org" && (await adminScopeReader(ctx, actor)) !== null;
+  const scope = narrowed ? "" : scoped.scope;
   audit(deps, { principalId: actor.id, action: "session.read", resource: id, scopeLabel: session.scopeId });
   const want = Math.max(1, Number(url.searchParams.get("limit")) || TRANSCRIPT_LIMIT_DEFAULT);
   const all = want >= TRANSCRIPT_LIMIT_MAX;

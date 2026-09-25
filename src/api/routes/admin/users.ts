@@ -2,7 +2,7 @@ import { scopeId as makeScopeId } from "../../../types.ts";
 import { publicUrlOf } from "../../../deploy/deploy-store.ts";
 import { adminStatusFromGrants, AdminError } from "../../../admin/admin-service.ts";
 import { personKey, samePerson } from "../../../directory/person.ts";
-import type { AdminRole } from "../../../admin/admin-grant-store.ts";
+import { ADMIN_ROLES, isAdminRole, type AdminGrant, type AdminRole } from "../../../admin/admin-grant-store.ts";
 import type { DirectoryMember } from "../../../directory/directory-store.ts";
 import { computeUsers } from "../../../admin/users.ts";
 import { forEachAttributedTurn } from "../../../admin/attribution.ts";
@@ -13,7 +13,7 @@ import { errMessage } from "../../../util/errors.ts";
 import { normalizeInboundExpiresAt } from "../../expiry.ts";
 import { detectOnboardingStatus, setOnboardingStatus, type OnboardingStatus } from "../../../onboarding/onboarding.ts";
 import { sendJson } from "../../http.ts";
-import { audit, authorizeAdmin, isObj, orgScope } from "../shared.ts";
+import { audit, authorizeAdmin, isObj, orgScope, readableByAdmin } from "../shared.ts";
 import { type ApiCtx } from "../route.ts";
 import { FILES_PAGE_SIZE } from "./common.ts";
 
@@ -25,6 +25,10 @@ const ALREADY_A_MEMBER =
   "that address already belongs to a member of the org — manage them under Users and Admins, not as an external user";
 const HOLDS_OWN_GRANT =
   "that address holds an org admin grant of its own — revoke it under Admins first, or re-invite with role org_admin";
+function heldRoles(grants: readonly AdminGrant[], principalId: string): AdminRole[] {
+  return ADMIN_ROLES.filter((role) => grants.some((g) => g.role === role && samePerson(g.principalId, principalId)));
+}
+
 const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
 const FORGET_AFTER_MS = 24 * 60 * 60 * 1000;
 
@@ -92,9 +96,14 @@ export async function inviteExternalUser(ctx: ApiCtx): Promise<void> {
   if (!expiry.ok) return bad(expiry.message);
   const now = Date.now();
   if (expiry.value === undefined || expiry.value <= now) return bad("expiresAt is required and must be in the future");
+  const grants = await deps.admin!.listGrants();
+  if (role === "org_admin" && adminStatusFromGrants(grants, actor.id).role !== "org_admin")
+    return sendJson(res, 403, { error: "forbidden", message: "only an org admin may grant admin roles" });
   await deps.identity.refresh(true);
   const existing = deps.identity.externalMember(email);
-  const holdsGrant = adminStatusFromGrants(await deps.admin!.listGrants(), email).isAdmin;
+  const status = adminStatusFromGrants(grants, email);
+  const holdsGrant = status.isAdmin;
+  const holdsAdminGrant = status.role === "org_admin";
   const ownsGrant = existing?.role === "org_admin";
   if ((!existing && holdsGrant) || (await orgMember(ctx, email, !existing)))
     return sendJson(res, 409, { error: "conflict", message: ALREADY_A_MEMBER });
@@ -103,18 +112,18 @@ export async function inviteExternalUser(ctx: ApiCtx): Promise<void> {
   }
   if (role === "member" && holdsGrant && !ownsGrant)
     return sendJson(res, 409, { error: "conflict", message: HOLDS_OWN_GRANT });
-  let grantChange: "grant.create" | "grant.revoke" | null = null;
-  if (role === "org_admin" && !holdsGrant) grantChange = "grant.create";
-  else if (role === "member" && holdsGrant) grantChange = "grant.revoke";
+  const revokedRoles = role === "member" && holdsGrant ? heldRoles(grants, email) : [];
+  const createsAdmin = role === "org_admin" && !holdsAdminGrant;
   try {
-    if (grantChange === "grant.create")
-      await deps.admin!.createGrant(actor, { principalId: email, role: "org_admin", scopeId: scope });
-    else if (grantChange === "grant.revoke") await deps.admin!.revokeGrant(actor, email, scope, "org_admin");
+    if (createsAdmin) await deps.admin!.createGrant(actor, { principalId: email, role: "org_admin", scopeId: scope });
+    for (const held of revokedRoles) await deps.admin!.revokeGrant(actor, email, scope, held);
   } catch (e) {
     return grantError(res, "grant_failed", e);
   }
-  if (grantChange)
-    audit(deps, { principalId: actor.id, action: grantChange, resource: `${email}/org_admin`, scopeLabel: scope });
+  if (createsAdmin)
+    audit(deps, { principalId: actor.id, action: "grant.create", resource: `${email}/org_admin`, scopeLabel: scope });
+  for (const held of revokedRoles)
+    audit(deps, { principalId: actor.id, action: "grant.revoke", resource: `${email}/${held}`, scopeLabel: scope });
   const created = existing === undefined;
   const readmitted = existing !== undefined && !externalMemberActive(existing, now);
   const member: ExternalMember = {
@@ -177,22 +186,23 @@ export async function revokeExternalUser(ctx: ApiCtx): Promise<void> {
   await deps.identity.refresh(true);
   const existing = deps.identity.externalMember(params.email ?? "");
   if (!existing) return sendJson(res, 404, { error: "not_found", message: "external user not found" });
-  const holdsGrant = adminStatusFromGrants(await deps.admin!.listGrants(), existing.email).isAdmin;
+  const grants = await deps.admin!.listGrants();
+  const holdsGrant = adminStatusFromGrants(grants, existing.email).isAdmin;
   const ownsGrant = existing.role === "org_admin";
   if (ctx.capability && (ownsGrant || holdsGrant)) {
     return sendJson(res, 403, { error: "forbidden", message: EXTERNAL_ORG_ADMIN_PORTAL_ONLY });
   }
   if (holdsGrant && !ownsGrant) return sendJson(res, 409, { error: "conflict", message: HOLDS_OWN_GRANT });
-  if (holdsGrant) {
+  for (const held of heldRoles(grants, existing.email)) {
     try {
-      await deps.admin!.revokeGrant(actor, existing.email, scope, "org_admin");
+      await deps.admin!.revokeGrant(actor, existing.email, scope, held);
     } catch (e) {
       return grantError(res, "revoke_failed", e);
     }
     audit(deps, {
       principalId: actor.id,
       action: "grant.revoke",
-      resource: `${existing.email}/org_admin`,
+      resource: `${existing.email}/${held}`,
       scopeLabel: scope,
     });
   }
@@ -330,7 +340,7 @@ export async function getUserDetail(ctx: ApiCtx): Promise<void> {
   const summaries = mySessionIds.size
     ? ((await deps.sessions?.scopeSessionSummaries(org, true, undefined, [...mySessionIds])) ?? [])
     : [];
-  const conversations = summaries
+  const conversations = (await readableByAdmin(ctx, actor, summaries, (s) => s.scopeId))
     .sort((a, b) => b.lastActivity - a.lastActivity)
     .slice(0, USER_CONVERSATIONS_MAX)
     .map((s) => ({
@@ -545,10 +555,10 @@ export async function revokeAdminGrant(ctx: ApiCtx): Promise<void> {
   const principalId = params.principalId!;
   const scope = url.searchParams.get("scope") ?? "";
   const role = url.searchParams.get("role") ?? "";
-  if (!principalId || !scope || role !== "org_admin") {
+  if (!principalId || !scope || !isAdminRole(role)) {
     return sendJson(res, 400, {
       error: "bad_request",
-      message: "principalId (path), and scope + role=org_admin (query) required",
+      message: "principalId (path), and scope + role=org_admin|org_manager (query) required",
     });
   }
   try {

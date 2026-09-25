@@ -2,7 +2,13 @@ import type { ScopeId } from "../types.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import { createMemoryMap } from "../persistence/durable-map.ts";
 
-export type AdminRole = "org_admin";
+export const ADMIN_ROLES = ["org_admin", "org_manager"] as const;
+
+export type AdminRole = (typeof ADMIN_ROLES)[number];
+
+export function isAdminRole(value: unknown): value is AdminRole {
+  return typeof value === "string" && (ADMIN_ROLES as readonly string[]).includes(value);
+}
 
 export interface AdminGrant {
   principalId: string;

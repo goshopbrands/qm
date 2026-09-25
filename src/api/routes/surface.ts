@@ -632,7 +632,10 @@ async function listAgentApis(ctx: ApiCtx): Promise<void> {
   return sendJson(
     res,
     200,
-    renderAgentApis(capability, { isAdmin: admin.isAdmin, ...(admin.role ? { role: admin.role } : {}) }),
+    renderAgentApis(capability, {
+      isAdmin: admin.role === "org_admin",
+      ...(admin.role ? { role: admin.role } : {}),
+    }),
   );
 }
 

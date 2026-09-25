@@ -50,7 +50,8 @@ const upstream = createServer((req: IncomingMessage, res) => {
     const m = (req.headers.cookie ?? "").match(/admin=([^;]+)/);
     const sub = m ? decodeURIComponent(m[1] ?? "") : "";
     res.writeHead(200, { "content-type": "application/json" });
-    return void res.end(JSON.stringify({ isAdmin: sub === "U-admin" }));
+    const role = ({ "U-admin": "org_admin", "U-manager": "org_manager" } as Record<string, string>)[sub];
+    return void res.end(JSON.stringify(role ? { isAdmin: true, role } : { isAdmin: false }));
   }
   if (typeof req.url === "string" && req.url.startsWith("/v1/admin/impersonate")) {
     lastImpersonateIdentity =
@@ -595,6 +596,17 @@ test("impersonate start: non-admin is refused; cross-origin is refused; self-tar
     headers: { cookie: sessionCookie("U-admin"), origin: PUBLIC },
   });
   assert.equal(self.status, 400);
+});
+
+test("impersonate start: a manager reaches the admin surface but is refused impersonation", async () => {
+  const adminHop = await fetch(`${base}/admin/api/me`, { headers: { cookie: sessionCookie("U-manager") } });
+  assert.equal(adminHop.status, 200);
+  const start = await fetch(`${base}/auth/impersonate?target=alice@acme`, {
+    method: "POST",
+    headers: { cookie: sessionCookie("U-manager"), origin: PUBLIC, accept: "application/json" },
+  });
+  assert.equal(start.status, 403);
+  assert.doesNotMatch(start.headers.get("set-cookie") ?? "", /portal_impersonate=/);
 });
 
 test("impersonate: an admin starts it; the web-ui hop carries target + impersonator; admin plane is untouched; cookie is bound to the admin", async () => {
