@@ -3,7 +3,7 @@ import type { Principal, ScopeId } from "../types.ts";
 import { parseScopeId, scopeId } from "../types.ts";
 import type { AdminGrant, AdminGrantStore, AdminRole } from "./admin-grant-store.ts";
 import { personKey, samePerson } from "../directory/person.ts";
-import { createAdminGrantStore, createMemoryAdminGrantPersistence } from "./admin-grant-store.ts";
+import { createAdminGrantStore, createMemoryAdminGrantPersistence, isAdminRole } from "./admin-grant-store.ts";
 
 export type { AdminGrant } from "./admin-grant-store.ts";
 
@@ -23,11 +23,13 @@ export class AdminError extends Error {
 }
 
 export function adminStatusFromGrants(grants: readonly AdminGrant[], principalId: string): AdminStatus {
+  let manager: AdminGrant | undefined;
   for (const g of grants) {
     if (!samePerson(g.principalId, principalId)) continue;
     if (g.role === "org_admin") return { isAdmin: true, role: "org_admin", scopeId: g.scopeId };
+    if (g.role === "org_manager") manager ??= g;
   }
-  return { isAdmin: false };
+  return manager ? { isAdmin: true, role: "org_manager", scopeId: manager.scopeId } : { isAdmin: false };
 }
 
 export interface AdminService {
@@ -37,6 +39,7 @@ export interface AdminService {
   listGrants(): Promise<AdminGrant[]>;
   createGrant(actor: Principal, input: { principalId: string; role: AdminRole; scopeId: ScopeId }): Promise<AdminGrant>;
   revokeGrant(actor: Principal, principalId: string, scope: ScopeId, role: AdminRole): Promise<void>;
+  canReadScope(principalId: string, scope: ScopeId): Promise<boolean>;
 }
 
 export function parseAdminGrants(raw: string | undefined, orgId: string): AdminGrant[] | undefined {
@@ -49,7 +52,7 @@ export function parseAdminGrants(raw: string | undefined, orgId: string): AdminG
     const separator = entry.lastIndexOf(":");
     const principalId = entry.slice(0, separator).trim();
     const role = entry.slice(separator + 1).trim();
-    if (!principalId || role !== "org_admin") continue;
+    if (!principalId || !isAdminRole(role)) continue;
     grants.push({ principalId, scopeId: scopeId("org", orgId), role });
   }
   return grants;
@@ -68,6 +71,7 @@ export function bootAdminGrantSeed(rawAdminGrants: string | undefined, orgId: st
 
 export interface AdminServiceOptions {
   now?: () => number;
+  canReadScope?: (principalId: string, scope: ScopeId) => Promise<boolean>;
 }
 
 export function createAdminService(store?: AdminGrantStore, opts: AdminServiceOptions = {}): AdminService {
@@ -75,6 +79,8 @@ export function createAdminService(store?: AdminGrantStore, opts: AdminServiceOp
   const grants: AdminGrantStore =
     store ?? createAdminGrantStore(createMemoryAdminGrantPersistence(), { seed: defaultAdminGrants(orgId) });
   const now = opts.now ?? (() => Date.now());
+  const canReadScope =
+    opts.canReadScope ?? (async (_principalId: string, scope: ScopeId) => scope === scopeId("org", orgId));
 
   async function isOrgAdmin(actor: Principal): Promise<boolean> {
     return adminStatusFromGrants(await grants.list(), actor.id).role === "org_admin";
@@ -104,12 +110,12 @@ export function createAdminService(store?: AdminGrantStore, opts: AdminServiceOp
       const principalId = input.principalId?.trim();
       if (!principalId) throw new AdminError(400, "principalId required");
       const { role } = input;
-      if (role !== "org_admin") {
-        throw new AdminError(400, "role must be org_admin");
+      if (!isAdminRole(role)) {
+        throw new AdminError(400, "role must be org_admin or org_manager");
       }
       const parsed = parseScopeId(input.scopeId);
       if (parsed.kind !== "org" || parsed.ref !== orgId) {
-        throw new AdminError(400, `org_admin scope must be org:${orgId}`);
+        throw new AdminError(400, `${role} scope must be org:${orgId}`);
       }
       const grant: AdminGrant = { principalId, scopeId: input.scopeId, role, grantedBy: actor.id, createdAt: now() };
       await grants.add(grant);
@@ -132,6 +138,9 @@ export function createAdminService(store?: AdminGrantStore, opts: AdminServiceOp
         }
       }
       for (const g of matched) await grants.revoke(g.principalId, scope, role);
+    },
+    canReadScope(principalId, scope) {
+      return canReadScope(principalId, scope);
     },
   };
 }

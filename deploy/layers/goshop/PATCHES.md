@@ -228,3 +228,55 @@ deployment's `sandbox/` directory (absent today, so `up` currently skips layer s
 entirely), plus confirmation that the stock sprite image has `python3-venv` and that
 `pypi.org` and `files.pythonhosted.org` pass the egress proxy. The skill text would still
 need a core patch, since a layer cannot override a live seed skill by name.
+
+## Patch 4: org manager role
+
+**Status:** active since 2026-09-25.
+
+**Change.** A second grant role, `org_manager`, alongside upstream's `org_admin`. Managers use
+the admin dashboard, with three differences from an org admin: they cannot grant or revoke
+roles (including inviting an external user as org admin), they cannot impersonate, and
+conversation data is limited to scopes they could read as a member (upstream's
+`canReadScope`: org-wide, public channels, and private channels, group DMs, and DMs they
+belong to). Managers also cannot reset or edit another user's personal data, redirect cron
+output, import or sync skill packs into scopes, read raw model requests, or use admin powers
+through the agent (the orchestrator, agent API listing, and unattended cron grants treat only
+`org_admin` as an admin). Managers keep org-wide settings (providers, models, MCP servers,
+Slack app, org instructions and memory, egress, credentials): decided 2026-09-25, relying on
+the audit log. Org admins are unchanged. Roles are granted in the dashboard's Users view;
+`ADMIN_GRANTS` also accepts `:org_manager`.
+
+Enforcement sits in `authorizeAdmin`, which every admin route calls. For managers it looks up
+the request in the table in `src/admin/manager-access.ts`. Every admin route is classified
+there as `allow`, `deny`, a scope check, or `narrowed` (the handler filters or checks the
+record itself). A route missing from the table is refused to managers, so an upstream route
+added later stays org-admin only until someone classifies it.
+
+**Files.** `src/admin/manager-access.ts` (new), `src/admin/admin-grant-store.ts`,
+`src/admin/admin-service.ts`, `src/api/routes/shared.ts`, `src/api/routes/admin/common.ts`,
+`src/api/routes/admin/scope-config.ts`, `src/api/routes/admin/memory.ts`,
+`src/api/routes/admin/files.ts`, `src/api/routes/admin/artifacts.ts`,
+`src/api/routes/admin/users.ts`, `src/api/routes/admin/sessions.ts`, `src/core/orchestrator.ts`,
+`src/api/routes/surface.ts`, `src/api/control-service.ts`, `src/wiring.ts` (`canUseSandboxScope` bypass is org admin
+only), `plugins/portal/src/index.ts` (impersonation needs `org_admin`),
+`plugins/admin/public/index.html`, and tests `test/admin-manager-role.test.ts`,
+`plugins/portal/test/router.test.ts`.
+
+**On every upstream sync.** `check-patches.sh` lists admin routes and admin-status checks that
+upstream added. For each one, ask the operator whether managers should get it, then add the
+route to `src/admin/manager-access.ts` accordingly. `test/admin-manager-role.test.ts` fails
+while any `/v1/admin` route is unclassified. Checks that are not routes (anything new that
+calls `adminStatusOf`, reads `.isAdmin`, or probes admin status in the portal or plugins)
+are not caught by that test, so read those diff lines and decide whether the new behavior
+should require `role === "org_admin"`.
+
+**Retirement signal.** `check-patches.sh` reports a retire candidate when upstream's
+`AdminRole` gains a role besides `org_admin`, meaning upstream may have its own tiered
+admin roles.
+
+**Retirement steps.**
+
+1. Map existing `org_manager` grants onto upstream's equivalent role, if one fits.
+2. Take upstream's versions of the files above and delete `src/admin/manager-access.ts` and
+   `test/admin-manager-role.test.ts`.
+3. Remove this section.

@@ -2,6 +2,7 @@ import { orgId as configOrgId, orgScope as configOrgScope } from "../../config.t
 import type { Principal } from "../../types.ts";
 import type { AuditEvent } from "../../audit/audit-log.ts";
 import { adminStatusFromGrants } from "../../admin/admin-service.ts";
+import { managerRefusal } from "../../admin/manager-access.ts";
 import { samePerson } from "../../directory/person.ts";
 import { isTerminal, type Run } from "../../runs/run-store.ts";
 import type { ServerDeps } from "../deps.ts";
@@ -23,24 +24,70 @@ export function adminActorFrom(ctx: Pick<ApiCtx, "req" | "deps" | "capability" |
   return ctx.deps.admin?.resolveActor(headerValue(ctx.req, "x-admin-actor")) ?? null;
 }
 
+const adminRoleByRequest = new WeakMap<object, string>();
+
 export async function authorizeAdmin(
   ctx: Pick<ApiCtx, "req" | "res" | "deps" | "capability" | "actor">,
-  _scope: string,
+  scope: string,
 ): Promise<Principal | null> {
   const { res, deps } = ctx;
-  if (!deps.admin) {
+  const admin = deps.admin;
+  if (!admin) {
     sendJson(res, 404, { error: "not_found" });
     return null;
   }
-  const grants = await deps.admin.listGrants();
+  const grants = await admin.listGrants();
   const actor = adminActorFrom(ctx);
   if (actor && !(await activePrincipal(deps, actor.id))) {
     sendJson(res, 403, { error: "forbidden", message: "this principal is no longer active" });
     return null;
   }
-  if (actor && adminStatusFromGrants(grants, actor.id).isAdmin) return actor;
+  const status = actor ? adminStatusFromGrants(grants, actor.id) : null;
+  if (actor && status?.isAdmin) {
+    const refusal =
+      status.role === "org_admin"
+        ? null
+        : await managerRefusal(ctx.req, scope, (target) => admin.canReadScope(actor.id, target).catch(() => false));
+    if (!refusal) {
+      if (status.role) adminRoleByRequest.set(ctx.req, status.role);
+      return actor;
+    }
+    sendJson(res, 403, { error: "forbidden", message: refusal });
+    return null;
+  }
   sendJson(res, 403, { error: "forbidden", message: "admin grant required for this scope" });
   return null;
+}
+
+export async function adminScopeReader(
+  ctx: Pick<ApiCtx, "deps" | "req">,
+  actor: Principal,
+): Promise<((scope: string) => Promise<boolean>) | null> {
+  const admin = ctx.deps.admin;
+  if (!admin) return null;
+  const role = adminRoleByRequest.get(ctx.req) ?? adminStatusFromGrants(await admin.listGrants(), actor.id).role;
+  if (role === "org_admin") return null;
+  const verdicts = new Map<string, Promise<boolean>>();
+  return (scope) => {
+    let verdict = verdicts.get(scope);
+    if (!verdict) {
+      verdict = admin.canReadScope(actor.id, scope).catch(() => false);
+      verdicts.set(scope, verdict);
+    }
+    return verdict;
+  };
+}
+
+export async function readableByAdmin<T>(
+  ctx: Pick<ApiCtx, "deps" | "req">,
+  actor: Principal,
+  items: readonly T[],
+  scopeOf: (item: T) => string,
+): Promise<T[]> {
+  const canRead = await adminScopeReader(ctx, actor);
+  if (!canRead) return [...items];
+  const keep = await Promise.all(items.map((item) => canRead(scopeOf(item))));
+  return items.filter((_, i) => keep[i]);
 }
 
 export async function activePrincipal(deps: ServerDeps, principalId: string): Promise<boolean> {

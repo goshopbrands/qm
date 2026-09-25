@@ -1,5 +1,5 @@
 import { sendJson } from "../../http.ts";
-import { audit, authorizeAdmin, orgScope, requireScopedAdmin } from "../shared.ts";
+import { audit, authorizeAdmin, orgScope, readableByAdmin, requireScopedAdmin } from "../shared.ts";
 import { type ApiCtx } from "../route.ts";
 import { discoverScopes } from "./common.ts";
 
@@ -10,10 +10,10 @@ export async function listMemoryScopes(ctx: ApiCtx): Promise<void> {
   if (!actor) return;
   if (!deps.memory) return sendJson(res, 404, { error: "not_found" });
   audit(deps, { principalId: actor.id, action: "memory.scopes.read", resource: "memory", scopeLabel: scope });
-  const labels = await discoverScopes(app, deps);
+  const labels = await readableByAdmin(ctx, actor, [...(await discoverScopes(app, deps))], ([id]) => id);
   const meta = (await deps.memory.metadata?.()) ?? null;
   const scopes = await Promise.all(
-    [...labels].map(async ([id, label]) => {
+    labels.map(async ([id, label]) => {
       let bytes: number;
       let updatedAt: number | undefined;
       if (meta) {

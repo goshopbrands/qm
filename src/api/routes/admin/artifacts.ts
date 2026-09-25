@@ -1,7 +1,7 @@
 import { parseScopeId, type Destination } from "../../../types.ts";
 import { publicUrlOf } from "../../../deploy/deploy-store.ts";
 import { sendJson } from "../../http.ts";
-import { audit, requireScopedAdmin } from "../shared.ts";
+import { audit, readableByAdmin, requireScopedAdmin } from "../shared.ts";
 import { type ApiCtx } from "../route.ts";
 import { notifyOwnerOfCronEdit } from "../../../triggers/edit-notice.ts";
 import { requireScopedResource } from "./common.ts";
@@ -27,7 +27,7 @@ export async function listAdminArtifacts(ctx: ApiCtx): Promise<void> {
   audit(deps, { principalId: actor.id, action: `${resource}.read`, resource, scopeLabel: scope });
   const orgWide = parseScopeId(scope).kind === "org";
   if (resource === "crons") {
-    const crons = (await app.listCrons())
+    const crons = (await readableByAdmin(ctx, actor, await app.listCrons(), (c) => c.ownerScopeId))
       .filter((c) => orgWide || c.ownerScopeId === scope)
       .map((c) => ({
         id: c.id,
@@ -47,7 +47,7 @@ export async function listAdminArtifacts(ctx: ApiCtx): Promise<void> {
     return sendJson(res, 200, { scopeId: scope, crons });
   }
   if (resource === "deployments") {
-    const deployments = (await app.listDeployments())
+    const deployments = (await readableByAdmin(ctx, actor, await app.listDeployments(), (d) => d.ownerScopeId))
       .filter((d) => orgWide || d.ownerScopeId === scope)
       .map((d) => ({
         id: d.id,
@@ -64,7 +64,7 @@ export async function listAdminArtifacts(ctx: ApiCtx): Promise<void> {
     return sendJson(res, 200, { scopeId: scope, deployments });
   }
   const packsById = new Map((await app.listSkillPacks()).map((p) => [p.id, p]));
-  const skills = (await app.listSkills())
+  const skills = (await readableByAdmin(ctx, actor, await app.listSkills(), (s) => s.scopeId))
     .filter((s) => orgWide || s.scopeId === scope)
     .map((s) => {
       const provenancePack = s.pack ? packsById.get(s.pack.packId) : undefined;

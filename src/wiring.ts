@@ -1347,7 +1347,6 @@ export function buildApp(
   const adminGrantStore = createAdminGrantStore(adminGrantPersist, {
     seed: bootAdminGrantSeed(config.adminGrants, config.orgId, !!config.databaseUrl),
   });
-  const admin = createAdminService(adminGrantStore);
   const { strategy: memoryStrategy, memory } = createMemoryStrategy(config.memoryStrategy, {
     harness: harness.models,
     memory: baseMemory,
@@ -1364,6 +1363,7 @@ export function buildApp(
     advisoryLock,
   });
   const canReadScope = createCanReadScope({ managedGroups: projects, directory, identity, sessions });
+  const admin = createAdminService(adminGrantStore, { canReadScope });
   const canWriteScope = createCanWriteScope({ managedGroups: projects, directory, identity });
   const canManageScope = createCanManageScope({ managedGroups: projects, directory, identity, sessions });
   const managesArtifactHome = createManagesArtifactHome({ managedGroups: projects, directory }, canManageScope);
@@ -1373,7 +1373,8 @@ export function buildApp(
   membership.canManageScope = canManageScope;
   membership.canUseSandboxScope = async (actorId, scopeId) =>
     identity.isInternal(identity.classify(actorId)) &&
-    ((await admin.adminStatusOf(identity.classify(actorId))).isAdmin || (await canWriteScope(actorId, scopeId)));
+    ((await admin.adminStatusOf(identity.classify(actorId))).role === "org_admin" ||
+      (await canWriteScope(actorId, scopeId)));
   membership.managesArtifactHome = managesArtifactHome;
   const deployGitSecret = config.signingSecret;
   const deployGitBase = config.apiBaseUrl;
