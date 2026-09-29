@@ -1549,7 +1549,7 @@ async function adminLogin(req: IncomingMessage, res: ServerResponse): Promise<vo
   const allowed = await adminProbeAttempt(claims.email);
   if (allowed === null)
     return sendHtml(res, 503, signInErrorHtml("Admin access could not be checked. Please try again."));
-  if (!allowed) return sendHtml(res, 403, signInErrorHtml("This account does not have admin access."));
+  if (!allowed.isAdmin) return sendHtml(res, 403, signInErrorHtml("This account does not have admin access."));
   try {
     const claimsStore = coreClaimStore(CORE, CORE_SIGNING_SECRET, "portal");
     if (!(await claimOnce(claimsStore, `admin-login:${claims.jti}`, claims.expiresAtMs))) return fail();

@@ -243,7 +243,10 @@ Slack app, org instructions and memory, egress, credentials): decided 2026-09-25
 the audit log. Org admins are unchanged. Roles are granted in the dashboard's Users view;
 `ADMIN_GRANTS` also accepts `:org_manager`.
 
-Enforcement sits in `authorizeAdmin`, which every admin route calls. For managers it looks up
+Enforcement sits in `authorizeAdmin`, which every admin route calls. A manager's agent capability
+token is refused outright there, so a manager's admin powers exist only in the dashboard; `whoami`
+does not go through `authorizeAdmin` and still answers the agent. Transcripts opened by a manager
+leave out the raw model requests attached to deliveries, matching the denied `/llm` route. For managers it looks up
 the request in the table in `src/admin/manager-access.ts`. Every admin route is classified
 there as `allow`, `deny`, a scope check, or `narrowed` (the handler filters or checks the
 record itself). A route missing from the table is refused to managers, so an upstream route
@@ -258,11 +261,15 @@ added later stays org-admin only until someone classifies it.
 `src/api/app-sessions.ts` (promoting a skill org-wide needs `org_admin`),
 `src/api/routes/admin/principal-links.ts` (an org admin sign-in cannot be linked onto a
 non-admin identity), `src/wiring.ts` (`canUseSandboxScope` bypass is org admin only),
-`plugins/portal/src/index.ts` (impersonation needs `org_admin`), `plugins/admin/public/index.html`
+`src/api/routes/admin/sessions.ts` (no raw model requests for managers),
+`plugins/portal/src/index.ts` (impersonation needs `org_admin`; the admin-login link checks
+`isAdmin` on the probe result), `plugins/admin/public/index.html`
 (role from whoami; managers get no "open web UI as" buttons and no Spend tab),
-`plugins/admin/ui/users.ts` (Make manager; no role, impersonation, or teammate invite controls
-for managers), and tests `test/admin-manager-role.test.ts`, `test/loop-routes.test.ts`,
-`plugins/portal/test/router.test.ts`, `plugins/admin/test/manager-users-view.test.ts`.
+`plugins/admin/ui/users.ts` (Make manager; Revoke removes every role the person holds; no role,
+impersonation, or teammate invite controls for managers), `plugins/admin/ui/user-detail.ts` (the
+keychain card is hidden when refused), and tests `test/admin-manager-role.test.ts`,
+`test/loop-routes.test.ts`, `plugins/portal/test/router.test.ts`,
+`plugins/portal/test/admin-login-role.test.ts`, `plugins/admin/test/manager-users-view.test.ts`.
 
 Routes classified in the v0.1.13 sync: managers may start the Slack install, read credential
 usage for scopes they can read, set a cron's model runtime for crons in scopes they can read, and

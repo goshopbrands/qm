@@ -81,3 +81,38 @@ test("a user page stays clean when the keychain is refused to the viewer", async
   );
   f.dom.window.close();
 });
+
+test("revoking someone who holds both roles removes both", async () => {
+  const calls: unknown[] = [];
+  const f = litFixture();
+  const both = { principalId: "pat", admin: { isAdmin: true, scopeId: "org:test", role: "org_admin" } };
+  const controller = f.ui.users.users(
+    f.root,
+    {
+      users: [both],
+      grants: [
+        { principalId: "pat", role: "org_admin", scopeId: "org:test" },
+        { principalId: "pat", role: "org_manager", scopeId: "org:test" },
+        { principalId: "admin-alice", role: "org_admin", scopeId: "org:test" },
+      ],
+      externalUsers: [],
+    },
+    {
+      defaultShell() {},
+      orgScope: "org:test",
+      labelRole: () => "admin",
+      confirm: () => true,
+      clearCache() {},
+      api: async (method: string, path: string) => {
+        if (method !== "GET") calls.push([method, path]);
+        return { ok: true, data: path === "/api/users" ? { users: [], grants: [] } : {} };
+      },
+    },
+  );
+  await controller.admin(both, new f.window.Event("click"));
+  assert.deepEqual(calls, [
+    ["DELETE", "/api/grants/pat?scope=org%3Atest&role=org_admin"],
+    ["DELETE", "/api/grants/pat?scope=org%3Atest&role=org_manager"],
+  ]);
+  f.dom.window.close();
+});

@@ -126,22 +126,31 @@ export class UsersView {
         : confirmGrant.call(this, user.principalId))
     )
       return;
+    const held = (this.data.grants || []).filter((g: any) => g.principalId === user.principalId);
+    const revoked = held.length ? held : [user.admin];
+    const revokeGrant = (g: any) =>
+      this.services.api(
+        "DELETE",
+        "/api/grants/" +
+          encodeURIComponent(user.principalId) +
+          "?scope=" +
+          encodeURIComponent(g.scopeId) +
+          "&role=" +
+          encodeURIComponent(g.role),
+      );
     await this.action(user.principalId, async () => {
-      const r = revoke
-        ? await this.services.api(
-            "DELETE",
-            "/api/grants/" +
-              encodeURIComponent(user.principalId) +
-              "?scope=" +
-              encodeURIComponent(user.admin.scopeId) +
-              "&role=" +
-              encodeURIComponent(user.admin.role),
-          )
-        : await this.services.api("POST", "/api/grants", {
-            principalId: user.principalId,
-            role,
-            scopeId: this.services.orgScope,
-          });
+      let r: any;
+      if (revoke) {
+        for (const g of revoked) {
+          r = await revokeGrant(g);
+          if (!r.ok) break;
+        }
+      } else
+        r = await this.services.api("POST", "/api/grants", {
+          principalId: user.principalId,
+          role,
+          scopeId: this.services.orgScope,
+        });
       if (r.ok) await this.refresh();
       else this.feedback(r.data?.message || "Could not update admin access.", "err");
     });

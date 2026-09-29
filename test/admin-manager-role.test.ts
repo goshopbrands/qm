@@ -6,7 +6,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import { createInsecureTestServer } from "../src/api/server.ts";
+import { createInsecureTestServer, createServer } from "../src/api/server.ts";
 import { buildApp, serverDeps } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 import { adminStatusFromGrants, parseAdminGrants } from "../src/admin/admin-service.ts";
@@ -15,6 +15,7 @@ import { adminRoutes } from "../src/api/routes/admin.ts";
 import { skillPackRoutes } from "../src/api/routes/skill-packs.ts";
 import { apiRoutes, rawRoutes } from "../src/api/routes/index.ts";
 import { unattendedGrantRefusal } from "../src/cron/authority.ts";
+import { mintCapabilityToken, CAPABILITY_TTL_MS, CONTROL_PLANE_AUD } from "../src/auth/capability-token.ts";
 
 const ORG = "org:default-org";
 const ALICE = { id: "admin-alice", type: "internal" as const };
@@ -193,6 +194,105 @@ test("a manager cannot use org-admin powers through the agent", async () => {
       await unattendedGrantRefusal(s.built.app, s.built.admin, own("admin-alice"), live("admin-alice")),
       null,
     );
+  } finally {
+    await s.close();
+  }
+});
+
+test("a manager's agent capability cannot use admin routes, while an org admin's still can", async () => {
+  const secret = "manager-agent-capability-secret".repeat(2);
+  const config = testConfig({
+    dataDir: mkdtempSync(join(tmpdir(), "admin-manager-cap-")),
+    signingSecret: secret,
+    capabilitySecret: secret,
+    apiBaseUrl: "http://core.example.test",
+  });
+  const built = buildApp(config);
+  await built.admin.createGrant(ALICE, { principalId: MANAGER, role: "org_manager", scopeId: ORG });
+  const server = createServer(built.app, {
+    ...serverDeps(config, built),
+    capabilitySecret: secret,
+    signingSecret: secret,
+  });
+  server.listen(0);
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  const asAgentOf = async (actorId: string, method: string, path: string, body?: unknown) =>
+    fetch(`${base}${path}`, {
+      method,
+      headers: {
+        "content-type": "application/json",
+        "x-agent-capability": await mintCapabilityToken(
+          {
+            actorId,
+            scopeId: `personal:${actorId}`,
+            aud: CONTROL_PLANE_AUD,
+            liveActor: true,
+            exp: Date.now() + CAPABILITY_TTL_MS,
+          },
+          secret,
+        ),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+  try {
+    const memory = `/v1/admin/memory?scope=${q(ORG)}`;
+    const refused = await asAgentOf(MANAGER, "PUT", memory, { content: "# Memory\n\n- rewritten by an agent" });
+    assert.equal(refused.status, 403);
+    assert.match(((await refused.json()) as { message: string }).message, /admin dashboard/);
+    assert.equal((await asAgentOf(MANAGER, "GET", "/v1/admin/users")).status, 403);
+    assert.equal((await asAgentOf(MANAGER, "GET", "/v1/admin/whoami")).status, 200);
+    assert.equal((await asAgentOf("admin-alice", "GET", memory)).status, 200);
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
+test("a manager's transcript view leaves out raw model requests behind deliveries", async () => {
+  const s = await start();
+  try {
+    const scope = `personal:${MANAGER}`;
+    const source = await s.built.sessions.getOrCreateByThread("agent:main:monitor:m-mia", "dm", scope);
+    const { lease } = await s.built.sessions.acquireLease(source.id);
+    const user = await s.built.sessions.append(lease!, { type: "user", payload: { text: "wake" }, scopeLabel: scope });
+    const reply = await s.built.sessions.append(lease!, {
+      type: "assistant",
+      payload: { text: "Reminder." },
+      scopeLabel: scope,
+    });
+    await s.built.sessions.releaseLease(lease!);
+    await s.built.sessions.recordLlmRequest(source.id, {
+      turnSeq: user.seq,
+      step: 0,
+      model: "mock",
+      scopeLabel: scope,
+      promptEnvelope: { model: "mock", messages: [{ role: "user", content: "wake" }] },
+      truncated: false,
+    });
+    const delivery = await s.built.deliveries.enqueue({
+      destination: { type: "principal", target: MANAGER, audienceScopeId: scope, onBehalfOf: MANAGER },
+      text: "Reminder.",
+      idempotencyKey: "monitor:m-mia:1",
+      provenance: {
+        trigger: "monitor",
+        surface: "monitor",
+        fireKey: "monitor:m-mia:1",
+        sourceScopeId: scope,
+        sourceThreadRef: "agent:main:monitor:m-mia",
+        sourceSessionId: source.id,
+        sourceUserSeq: user.seq,
+        sourceAssistantEntrySeq: reply.seq,
+      },
+    });
+    await s.built.app.recordPrincipalDelivery(delivery.id, "dm:D-mia");
+    const recipient = (await s.built.sessions.getByThread("dm:D-mia"))!;
+    const path = `/v1/admin/sessions/${q(recipient.id)}?scope=${q(scope)}`;
+    const read = async (as: typeof s.asAdmin) => {
+      const r = await as("GET", path);
+      assert.equal(r.status, 200);
+      return ((await r.json()) as any).deliveryEvents[0];
+    };
+    assert.equal((await read(s.asAdmin)).llmRequests.length, 1);
+    assert.equal((await read(s.asManager)).llmRequests, undefined);
   } finally {
     await s.close();
   }
