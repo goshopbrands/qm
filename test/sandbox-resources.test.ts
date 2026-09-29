@@ -70,7 +70,8 @@ function fixture(configure?: (backend: Sandbox) => void, legacyScopes = ["person
     backends: { local: backend },
     defaultBackend: "local",
     lock: createMemoryAdvisoryLock(),
-    canUseScope: async (actor: string, scope: string) => actor === "admin" || scope === `personal:${actor}`,
+    canUseScope: async (actor: string, scope: string) =>
+      actor === "admin" || scope === `personal:${actor}` || (actor === "alice" && scope === "channel:team"),
   } satisfies Parameters<typeof createSandboxResources>[0];
   const resources = createSandboxResources(options);
   const router = createSandboxRouter({ routes, backends: { local: backend }, defaultBackend: "local", resources });
@@ -101,12 +102,27 @@ test("blank sandbox identities coexist and default changes never copy files or r
   assert.equal(a.resourceId, first.id);
 });
 
+test("explicit sandbox profiles follow selected storage rather than the parent's default provider", async () => {
+  const { backend, options, routes } = fixture();
+  const modal: Sandbox = { ...backend, profile: { ...backend.profile, backend: "modal" } };
+  const backends = { local: backend, modal };
+  const resources = createSandboxResources({ ...options, backends });
+  const router = createSandboxRouter({ backends, routes, defaultBackend: "local", resources });
+  const worker = await resources.create("alice", "personal:alice", "modal", "Worker");
+  assert.equal((await router.profileFor!("personal:alice")).backend, "local");
+  assert.equal((await router.profileFor!("personal:alice", worker.id)).backend, "modal");
+  assert.equal((await router.profileFor!("personal:alice")).backend, "local");
+});
+
 test("unset defaults remain unset durably while explicit execution remains usable", async () => {
   const { resources, router, layers, defaults } = fixture();
   const record = await resources.create("alice", "personal:alice", "local");
   await resources.setDefault("alice", "personal:alice", null);
   assert.equal((await defaults.get("personal:alice"))?.sandboxId, null);
-  await assert.rejects(router.provision(layers), /no default sandbox/);
+  await assert.rejects(
+    router.provision(layers),
+    /sandbox list, create, set_default, then retry before reporting blocked/,
+  );
   const explicit = await router.provision(layers, { sandboxId: record.id });
   assert.equal(explicit.resourceId, record.id);
   const listed = await resources.list("alice", "personal:alice");
@@ -184,7 +200,6 @@ test("turn default changes invalidate cached provisioning while explicit calls d
     turnFilesDir: "turn/s/t",
     connectorEnv: { AGENT_API_TOKEN: "scope-token" },
     ownerAuthAvailable: false,
-    ownerEnvCredentialIds: [],
     credentialCutoverServices: [],
     visibleSkills: [],
     visibleSkillsForTurn: async () => [],
@@ -413,7 +428,6 @@ for (const shared of [false, true])
       connectorEnv: {},
       isolateOwnerKeychain: shared,
       ownerAuthAvailable: false,
-      ownerEnvCredentialIds: [],
       credentialTools: [
         { service: "aws", roots: [".aws"] },
         { service: "gh", roots: [".config/gh"] },
@@ -805,4 +819,132 @@ test("failed background registration kills its process and releases the resource
   assert.deepEqual(signals, ["unregistered:KILL"]);
   await resources.retire("alice", record.id);
   assert.equal((await resources.get(record.id)).cleanupPending, false);
+});
+
+test("resource activation honors scope defaults and preserves explicit legacy provider routes", async () => {
+  const { options, routes, backend } = fixture(undefined, ["personal:alice", "channel:room", "personal:existing"]);
+  await routes.put("personal:existing", { backend: "aws" });
+  const resources = createSandboxResources({
+    ...options,
+    backends: { modal: backend, sprites: backend, aws: backend },
+    defaultBackend: "sprites",
+    scopeDefaults: { personal: "modal", channel: "sprites" },
+  });
+  assert.equal((await resources.resolve("personal:alice"))?.backend, "modal");
+  assert.equal((await resources.resolve("channel:room"))?.backend, "sprites");
+  assert.equal((await resources.resolve("personal:existing"))?.backend, "aws");
+  assert.equal(resources.defaultBackend("personal:new"), "modal");
+  assert.equal(resources.defaultBackend("channel:new"), "sprites");
+});
+
+for (const waiting of ["command", "checkpoint"] as const) {
+  test(`Modal ${waiting} allows other tools while restart waits`, { timeout: 10000 }, async () => {
+    const { options, backend, layers, routes } = fixture();
+    const resources = createSandboxResources({ ...options, backends: { modal: backend }, defaultBackend: "modal" });
+    const router = createSandboxRouter({ routes, backends: { modal: backend }, defaultBackend: "modal", resources });
+    const record = await resources.create("alice", "personal:alice", "modal");
+    await resources.setDefault("alice", "personal:alice", record.id);
+    const handle = await router.provision(layers);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const hold = async () => {
+      entered.resolve();
+      await release.promise;
+    };
+    backend.teardown = hold;
+    backend.run = async (_handle, command) => {
+      if (command === "long") await hold();
+      return { stdout: command, stderr: "", code: 0, timedOut: false };
+    };
+    const long = waiting === "command" ? router.run(handle, "long") : router.teardown(handle);
+    let restarted = false;
+    backend.restartComputer = async () => {
+      restarted = true;
+    };
+    let restarting: Promise<void> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await entered.promise;
+      const result = await Promise.race([
+        router.run(handle, "responsive"),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("ordinary tool was serialized")), 1000);
+        }),
+      ]);
+      assert.equal(result.stdout, "responsive");
+      assert.equal((await resources.status("alice", record.id)).guestResponsive, true);
+      restarting =
+        waiting === "command" ? resources.restart("alice", record.id) : router.restartComputer!("personal:alice");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(restarted, false);
+    } finally {
+      clearTimeout(timer);
+      release.resolve();
+      await long;
+      await restarting;
+    }
+    assert.equal(restarted, true);
+    await resources.setDefault("alice", "personal:alice", null);
+    await resources.retire("alice", record.id);
+    await assert.rejects(router.run(handle, "retired"), /retired/);
+  });
+}
+
+test("Modal provisioning and destructive cleanup wait for active operations", { timeout: 10000 }, async () => {
+  const { options, backend, layers, routes } = fixture();
+  const resources = createSandboxResources({ ...options, backends: { modal: backend }, defaultBackend: "modal" });
+  const router = createSandboxRouter({ routes, backends: { modal: backend }, defaultBackend: "modal", resources });
+  const record = await resources.create("alice", "personal:alice", "modal");
+  const handle = await router.provision(layers, { sandboxId: record.id });
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  backend.run = async () => {
+    entered.resolve();
+    await release.promise;
+    return { stdout: "done", stderr: "", code: 0, timedOut: false };
+  };
+  const running = router.run(handle, "long");
+  await entered.promise;
+  let provisioned = false;
+  let destroyed = false;
+  backend.provision = async () => {
+    provisioned = true;
+    return handle;
+  };
+  backend.teardown = async () => {
+    destroyed = true;
+  };
+  const provision = router.provision(layers, { sandboxId: record.id });
+  const teardown = router.teardown(handle, { destroy: true });
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(provisioned, false);
+    assert.equal(destroyed, false);
+  } finally {
+    release.resolve();
+    await Promise.all([running, provision, teardown]);
+  }
+  assert.equal(provisioned, true);
+  assert.equal(destroyed, true);
+});
+
+test("a verified live turn can create only its own new scope computer without directory mutations", async () => {
+  const { resources, router } = fixture(undefined, []);
+  const scope = "channel:external-slack:T1:policy:C1";
+  await resources.initialize();
+  assert.equal(await resources.resolve(scope), null);
+  await assert.rejects(resources.create("alice", scope, "local"), /permission/);
+  let current = true;
+  const turn = resources.forTurn({ actorId: "alice", scopeId: scope, isCurrent: async () => current });
+  const computer = await turn.create("alice", scope, "local", "external work");
+  await turn.setDefault("alice", scope, computer.id);
+  const handle = await router.provision([{ scopeId: scope, mode: "rw", mountPath: "" }]);
+  assert.equal(handle.scopeId, scope);
+  await router.writeFile(handle, "result", "safe-output");
+  assert.equal(await router.readFile(handle, "result"), "safe-output");
+  await assert.rejects(turn.create("bob", scope, "local"), /permission/);
+  await assert.rejects(turn.create("alice", "personal:bob", "local"), /permission/);
+  current = false;
+  await assert.rejects(turn.access("alice", computer.id), /permission/);
+  await assert.rejects(turn.setDefault("alice", scope, computer.id), /permission/);
 });

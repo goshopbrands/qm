@@ -32,19 +32,23 @@ report_touches() {
   fi
 }
 
-echo "== Patch 1: portal forwards app subdomains to core"
-report_touches plugins/portal/src/index.ts plugins/portal/src/proxy.ts src/api/routes/deployments.ts src/api/server.ts
+echo "== Patch 1: the portal relay frames forwarded request bodies"
+report_touches plugins/portal/src/proxy.ts
 tree="$(mktemp -d)"
 trap 'git -C "$root" worktree remove --force "$tree" >/dev/null 2>&1 || true; rm -rf "$tree"' EXIT
 git worktree add --detach --quiet "$tree" "$ref"
 cp plugins/portal/test/apps-host-forwarding.test.ts "$tree/plugins/portal/test/"
 ln -s "$root/node_modules" "$tree/node_modules"
+npm ci --prefix "$tree/plugins/portal" --ignore-scripts --no-audit --no-fund --silent >/dev/null 2>&1 || {
+  echo "  PROBE ERROR: could not install $ref's portal dependencies (npm ci failed; network?)"
+  exit 1
+}
 status=0
 output="$(cd "$tree/plugins/portal" && node --test test/apps-host-forwarding.test.ts 2>&1)" || status=$?
 passed="$(printf '%s\n' "$output" | sed -n 's/^ℹ pass \([0-9]*\)$/\1/p')"
 failed="$(printf '%s\n' "$output" | sed -n 's/^ℹ fail \([0-9]*\)$/\1/p')"
 if [ "$status" = 0 ]; then
-  echo "  RETIRE CANDIDATE: $ref passes the outcome tests without this patch — upstream appears to route app subdomains itself"
+  echo "  RETIRE CANDIDATE: $ref passes the outcome tests without this patch — upstream appears to frame relayed bodies itself"
   review=1
 elif [ -n "$passed" ] && [ -n "$failed" ] && [ "$passed" -gt 0 ] && [ "$failed" -gt 0 ] && printf '%s\n' "$output" | grep -q AssertionError; then
   echo "  still needed: $ref fails $failed of the outcome tests without this patch"
@@ -86,7 +90,8 @@ echo "== Patch 4: org manager role"
 report_touches src/admin/admin-service.ts src/admin/admin-grant-store.ts src/api/routes/shared.ts \
   src/api/routes/admin src/api/routes/admin.ts src/api/routes/skill-packs.ts src/wiring.ts \
   src/core/orchestrator.ts src/api/control-service.ts src/api/routes/surface.ts src/api/routes/auth-broker.ts \
-  src/api/routes/deployments.ts plugins/portal/src/index.ts plugins/admin/public/index.html
+  src/api/routes/deployments.ts src/cron/authority.ts src/api/app-sessions.ts plugins/portal/src/index.ts \
+  plugins/admin/public/index.html plugins/admin/ui/users.ts
 new_routes="$(git diff "$base" "$ref" -- src/api/routes | grep -E '^\+.*"/v1/admin' || true)"
 if [ -n "$new_routes" ]; then
   echo "  upstream added or changed admin routes; ask whether managers should get each, then classify it in src/admin/manager-access.ts:"

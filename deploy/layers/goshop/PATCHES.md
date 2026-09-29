@@ -24,41 +24,33 @@ reworked the same code.
 Merge release tags (`v0.1.x`), not upstream `main`, unless deliberately taking unreleased
 changes.
 
-## Patch 1: portal forwards app subdomains to core
+## Patch 1: the portal relay frames forwarded request bodies
 
-**Status:** code merged 2026-09-14; takes effect once the deployment settings below are applied.
+**Status:** routing retired 2026-09-29 in the v0.1.13 sync; body framing active since 2026-09-14.
 
-**Problem.** Upstream serves published apps signed-in at `/d/<app>/` under a sandbox
-content-security policy. The sandbox gives the page an opaque origin, so the app's own
-`fetch()` calls to its API or data files fail in the browser and data-driven apps render
-empty. Upstream's remedy is `DEPLOY_APPS_DOMAIN`, which serves each app on its own
-subdomain through core's `proxyDeploymentSubdomain`. On the Fly target core is private and
-the portal is the only public ingress, and upstream's portal ignores the `Host` header, so
-app subdomains never reach core.
+**History.** This patch originally also forwarded app subdomains (`*.apps.qm.goshopbrands.com`)
+from the portal to core on Fly. Upstream v0.1.13 does that itself ("Serve isolated app origins
+through the portal ingress": `proxyToAppHost` in `plugins/portal/src/proxy.ts`), keyed on the
+same `DEPLOY_APPS_DOMAIN` setting, so the fork's routing was dropped in favour of upstream's.
+One behavior differs from the old patch: the bare apps domain (`apps.qm.goshopbrands.com`) now
+gets a 404 from the portal.
 
-**Change.** The portal forwards any request whose `Host` is under `DEPLOY_APPS_DOMAIN`
-(or `PORTAL_APPS_DOMAIN`) straight to core, preserving `Host`, cookies, and body, and
-dropping hop-by-hop headers and core trust headers (`x-signature`, `x-timestamp`,
-`x-as-principal`, `x-admin-actor`, `x-agent-capability`, `x-portal-identity`). Host matching
-mirrors core's `proxyDeploymentSubdomain` exactly. Sign-in, sharing, and cookie stripping
-before the app all remain upstream core behavior. No new settings, URLs, or stored data were
-introduced.
+**Problem.** Upstream's shared `relay` pipes request bodies without framing them, so a body on a
+GET, HEAD, DELETE, or OPTIONS request reaches core as a second, smuggled request with arbitrary
+headers, including core trust headers such as `x-as-principal`. The app-host route is public, so
+without this fix the hole is reachable without signing in.
 
-The portal's shared `relay` also now re-frames every forwarded request body from the
-incoming `Content-Length` or `Transfer-Encoding`. Upstream's `relay` pipes bodies without
-framing, so a body on a GET, HEAD, DELETE, or OPTIONS request reaches core as a second,
-smuggled request with arbitrary headers. Upstream only exposes that behind portal sign-in;
-the app-host route would expose it publicly. Keep this part until upstream frames bodies
-itself; the outcome tests cover it.
+**Change.** `relay` re-frames every forwarded request body from the incoming `Content-Length` or
+`Transfer-Encoding` (`framedHeaders` in `plugins/portal/src/proxy.ts`). Nothing else in the portal
+differs from upstream for this patch.
 
 **Files.**
 
-- `plugins/portal/src/proxy.ts`: `isAppsHost`, `proxyToAppsHost`, `framedHeaders` used by `relay`
-- `plugins/portal/src/index.ts`: first line of `handle()` and the import
-- `plugins/portal/test/apps-host-forwarding.test.ts`: outcome tests, which also serve as the
-  retirement probe
+- `plugins/portal/src/proxy.ts`: `framedHeaders`, used by `relay`
+- `plugins/portal/test/apps-host-forwarding.test.ts`: outcome tests for the app-host route,
+  including the smuggling cases; also the retirement probe
 
-**Deployment settings it relies on** (all upstream settings):
+**Deployment settings it relies on** (all upstream settings, unchanged by the routing retirement):
 
 - `publicUrl` `https://qm.goshopbrands.com` in the deployment config
 - `env.core.DEPLOY_APPS_DOMAIN`, `env.portal.DEPLOY_APPS_DOMAIN`, and `env.web-ui.DEPLOY_APPS_DOMAIN`
@@ -71,25 +63,18 @@ itself; the outcome tests cover it.
 - `PUBLIC_API_URL` stays `https://goshop-portal.fly.dev`: legacy app machines have that URL
   baked into their boot command, so `goshop-portal.fly.dev` must keep routing to the portal
 - DNS for `qm.goshopbrands.com` and `*.apps.qm.goshopbrands.com` pointing at `goshop-portal`,
-  plus `_acme-challenge` CNAMEs, with Fly certificates for both names on `goshop-portal`; the
-  certificates must be verified before deploying the settings above
+  plus `_acme-challenge` CNAMEs, with Fly certificates for both names on `goshop-portal`
 
-**Retirement signal.** `check-patches.sh` copies the outcome tests into a clean checkout of
-the upstream ref and runs them. If they pass without this patch, upstream now routes app
-subdomains itself. Upstream may instead fix it by giving core its own public ingress on
-Fly; the probe would still fail, but the script also lists upstream commits touching the
-portal files and release notes will mention it. Either way the settings and app URLs above
-stay upstream's, so retirement needs no data or URL migration.
+**Retirement signal.** `check-patches.sh` copies the outcome tests into a clean checkout of the
+upstream ref, installs that ref's portal dependencies, and runs them. If they all pass, upstream
+now frames relayed bodies itself.
 
 **Retirement steps.**
 
-1. Take upstream's versions of `plugins/portal/src/proxy.ts` and `plugins/portal/src/index.ts`.
-2. Delete `plugins/portal/test/apps-host-forwarding.test.ts` if upstream has its own coverage,
-   otherwise keep it as a regression test only if it passes on upstream code.
-3. If upstream's fix points the wildcard at a different Fly app, move the
-   `*.apps.qm.goshopbrands.com` certificate and DNS record to it.
-4. Deploy, then open an app at `https://<app>.apps.qm.goshopbrands.com/` and confirm its data loads.
-5. Remove this section.
+1. Take upstream's version of `plugins/portal/src/proxy.ts`.
+2. Keep `plugins/portal/test/apps-host-forwarding.test.ts` as a regression test only if it passes
+   on upstream code; otherwise delete it.
+3. Remove this section.
 
 ## Patch 2: legacy volume-backed Fly deploy provider
 
@@ -109,6 +94,17 @@ and archive and restore. See `docs/fly-legacy-deployments.md`.
 `src/deploy/legacy-fly-deploy-provider.ts`, `src/tools/primitives.ts`, `src/wiring.ts`, and
 tests `test/legacy-fly-deploy-provider.test.ts`, `test/deploy-provider-selection.test.ts`,
 `test/deploy-release-endpoint.test.ts`, `test/config.test.ts`.
+
+Upstream calls the deploy provider from `src/deploy/deploy-service.ts` in several places; every
+call must go through `providerFor(d)`, never `deps.provider` directly, or legacy deployments are
+sent to the current provider. v0.1.13 added such a call in `setDeploymentAlwaysOn`, fixed in the
+sync and covered by `test/deploy-provider-selection.test.ts`. Check new `deps.provider.` calls in
+that file on every sync.
+
+Upstream v0.1.13 added optional durable `/data` volumes for its own Fly provider
+(`FLY_DEPLOY_DATA_VOLUME_SIZE_GB`, off by default and described upstream as a prototype). Turning
+it on refuses redeploys of apps already published without a volume, so it is left off until the
+legacy apps are migrated deliberately.
 
 **Deployment settings.** `FLY_LEGACY_DEPLOYMENT_IDS` as a secret on `goshop-core`. Deploy core with `qm up --build-from=<this checkout>`; plain `qm up` pulls
 upstream images that lack this patch.
@@ -257,10 +253,22 @@ added later stays org-admin only until someone classifies it.
 `src/api/routes/admin/scope-config.ts`, `src/api/routes/admin/memory.ts`,
 `src/api/routes/admin/files.ts`, `src/api/routes/admin/artifacts.ts`,
 `src/api/routes/admin/users.ts`, `src/api/routes/admin/sessions.ts`, `src/core/orchestrator.ts`,
-`src/api/routes/surface.ts`, `src/api/control-service.ts`, `src/wiring.ts` (`canUseSandboxScope` bypass is org admin
-only), `plugins/portal/src/index.ts` (impersonation needs `org_admin`),
-`plugins/admin/public/index.html`, and tests `test/admin-manager-role.test.ts`,
-`plugins/portal/test/router.test.ts`.
+`src/api/routes/surface.ts`, `src/cron/authority.ts` (unattended cron grants need `org_admin`),
+`src/api/app-sessions.ts` (promoting a skill org-wide needs `org_admin`),
+`src/api/routes/admin/principal-links.ts` (an org admin sign-in cannot be linked onto a
+non-admin identity), `src/wiring.ts` (`canUseSandboxScope` bypass is org admin only),
+`plugins/portal/src/index.ts` (impersonation needs `org_admin`), `plugins/admin/public/index.html`
+(role from whoami; managers get no "open web UI as" buttons and no Spend tab),
+`plugins/admin/ui/users.ts` (Make manager; no role, impersonation, or teammate invite controls
+for managers), and tests `test/admin-manager-role.test.ts`, `test/loop-routes.test.ts`,
+`plugins/portal/test/router.test.ts`, `plugins/admin/test/manager-users-view.test.ts`.
+
+Routes classified in the v0.1.13 sync: managers may start the Slack install, read credential
+usage for scopes they can read, set a cron's model runtime for crons in scopes they can read, and
+list principal links. They may not open Spend (org-wide cost including private scope labels),
+invite teammates (the response can return a working sign-in link for any email, including an
+existing admin's), or create or delete principal links (linking a sign-in onto an admin makes
+that sign-in the admin).
 
 **On every upstream sync.** `check-patches.sh` lists admin routes and admin-status checks that
 upstream added. For each one, ask the operator whether managers should get it, then add the

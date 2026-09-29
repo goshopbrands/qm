@@ -13,6 +13,7 @@ import {
   flyLiveSessionCommand,
   flyS3ProbeCommand,
   flyUp,
+  verifyLocalFlyTokens,
 } from "../src/backends/fly.ts";
 import type { ResolvedPlugin } from "../src/plugins.ts";
 
@@ -592,7 +593,7 @@ else console.log("ok");`,
     }
     assert.match(
       calls,
-      /ssh console -a acme-core --machine machine-core .* --quiet/,
+      /machine exec -a acme-core machine-core .* --timeout 120/,
       "live readiness proves S3 from the running core",
     );
   } finally {
@@ -639,7 +640,7 @@ else console.log("ok");`,
     );
     assert.doesNotMatch(
       readFileSync(fake.log, "utf8"),
-      /ssh console/,
+      /machine exec/,
       "an unowned core never receives the storage probe",
     );
   } finally {
@@ -835,7 +836,7 @@ test("fly live readiness fails when core cannot round-trip durable object storag
 if (a.startsWith("apps list")) console.log(JSON.stringify([{ Name: "acme-core" }]));
 else if (a.startsWith("status")) console.log(JSON.stringify({ Machines: [{ id: "machine-core", state: "started", region: "sjc", config: { image: "registry.fly.io/app@sha256:abc", env: ${JSON.stringify(env)} } }] }));
 else if (a.startsWith("checks list")) console.log(JSON.stringify({ machine: [{ status: "passing" }] }));
-else if (a.startsWith("ssh console")) { console.error("AccessDenied"); process.exit(1); }
+else if (a.startsWith("machine exec")) { console.error("AccessDenied"); process.exit(1); }
 else console.log("ok");`,
   );
   try {
@@ -1166,6 +1167,30 @@ test("fly secrets push stages a secretEnv alias under its declared env name on i
     );
   } finally {
     console.log = log;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("shared publisher authorization uses app-scoped access without organization listing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-fly-app-token-"));
+  const fake = fakeFly(dir, 'if (a !== "machines list -a acme-apps --json") process.exit(1);');
+  try {
+    const { config } = loadConfigAt(join(repoRoot, "deploy", "stacks", "acme", "qm.config.jsonc"));
+    verifyLocalFlyTokens(
+      {
+        ...config,
+        env: {
+          core: {
+            DEPLOY_PROVIDER: "fly",
+            FLY_DEPLOY_SHARED_APP_NAME: "acme-apps",
+          },
+        },
+      },
+      new Map([["FLY_DEPLOY_API_TOKEN", "app-scoped-test-token"]]),
+    );
+    assert.equal(readFileSync(fake.log, "utf8").trim(), "machines list -a acme-apps --json");
+  } finally {
     fake.restore();
     rmSync(dir, { recursive: true, force: true });
   }

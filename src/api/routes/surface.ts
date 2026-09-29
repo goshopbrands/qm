@@ -1,6 +1,8 @@
-import { runtimeFallback, runtimeConfigBody, webuiModelEnabled } from "../runtime-config.ts";
+import { isSessionStatus } from "../../sessions/session-status.ts";
+import { suggestedActivityRoutes } from "./suggested-activities.ts";
+import { runtimeFallback, runtimeConfigBody, userRuntimeConfigBody, webuiModelEnabled } from "../runtime-config.ts";
 import { sessionSharingRoutes } from "./session-sharing.ts";
-import type { Grant, ScopeId } from "../../types.ts";
+import type { Grant, ScopeId, Session } from "../../types.ts";
 import { parseScopeId, scopeId as makeScopeId } from "../../types.ts";
 import type { Skill, SkillResolution } from "../../skills/skill-store.ts";
 import { ByteSourceTooLargeError } from "../../files/durable-byte-store.ts";
@@ -9,7 +11,7 @@ import {
   isHarnessId,
   modelSupportedByHarness,
   modelOfferedInWebui,
-  THINKING_LEVELS,
+  thinkingLevelsForHarness,
   fastModeModelIds,
 } from "../../model/pi-models.ts";
 import { builtInModelCatalog, selectableCatalogForHarness, selectableModelCatalog } from "../../model/model-catalog.ts";
@@ -58,6 +60,19 @@ function isConversationColor(value: unknown): value is string | null {
   return value === null || (typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value));
 }
 
+function conversationWebUrl(publicWebUrl: string | undefined, sessionId: string): string | undefined {
+  const raw = publicWebUrl?.trim();
+  if (!raw || !/^https?:\/\//i.test(raw) || /[?#]/.test(raw)) return undefined;
+  try {
+    const base = new URL(raw);
+    if ((base.protocol !== "http:" && base.protocol !== "https:") || base.username || base.password) return undefined;
+    base.pathname = `${base.pathname.replace(/\/+$/, "")}/s/${encodeURIComponent(sessionId)}`;
+    return base.toString();
+  } catch {
+    return undefined;
+  }
+}
+
 async function regenerateSessionTitle(ctx: ApiCtx): Promise<void> {
   const { res, app, body } = ctx;
   const id = ctx.params.id!;
@@ -68,6 +83,26 @@ async function regenerateSessionTitle(ctx: ApiCtx): Promise<void> {
   const out = await app.regenerateTitle(id, principalId);
   if (!out) return sendJson(res, 404, { error: "not_found" });
   return sendJson(res, 200, out);
+}
+
+async function detachSession(ctx: ApiCtx): Promise<void> {
+  const { res, app, body } = ctx;
+  const id = ctx.params.id!;
+  const principalId = (body as { principalId?: unknown }).principalId;
+  if (typeof principalId !== "string" || !principalId) {
+    return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  }
+  const out = await app.detachSession(id, principalId);
+  if (!out) return sendJson(res, 404, { error: "not_found" });
+  return sendJson(res, 200, out);
+}
+
+async function adoptSession(ctx: ApiCtx): Promise<void> {
+  const { principalId, parentSessionId } = ctx.body as { principalId?: unknown; parentSessionId?: unknown };
+  if (typeof principalId !== "string" || typeof parentSessionId !== "string" || !principalId || !parentSessionId)
+    return sendJson(ctx.res, 400, { error: "bad_request" });
+  const out = await ctx.app.adoptSession(ctx.params.id!, parentSessionId, principalId);
+  return sendJson(ctx.res, out ? 200 : 404, out ?? { error: "not_found" });
 }
 
 async function forkSession(ctx: ApiCtx): Promise<void> {
@@ -86,7 +121,7 @@ async function forkSession(ctx: ApiCtx): Promise<void> {
 }
 
 async function spawnAgentConversation(ctx: ApiCtx): Promise<void> {
-  const { res, app, body, capability } = ctx;
+  const { res, app, body, capability, deps } = ctx;
   if (!capability) {
     return sendJson(res, 401, { error: "capability_required", message: "this endpoint is for the agent self-API" });
   }
@@ -132,7 +167,12 @@ async function spawnAgentConversation(ctx: ApiCtx): Promise<void> {
     });
   }
   const runId = (turn as { runId?: string }).runId;
-  return sendJson(res, 202, { session, turn: { status: turn.status, ...(runId ? { runId } : {}) } });
+  const webUrl = conversationWebUrl(deps.portalUrl, session.id);
+  return sendJson(res, 202, {
+    session,
+    turn: { status: turn.status, ...(runId ? { runId } : {}) },
+    ...(webUrl ? { webUrl } : {}),
+  });
 }
 
 async function forkAgentConversation(ctx: ApiCtx): Promise<void> {
@@ -332,10 +372,23 @@ async function uploadFile(ctx: ApiCtx): Promise<void> {
 async function patchSession(ctx: ApiCtx): Promise<void> {
   const { res, app, body } = ctx;
   const id = ctx.params.id!;
-  const b = body as { principalId?: unknown; title?: unknown; archived?: unknown; pinned?: unknown; color?: unknown };
+  const b = body as {
+    principalId?: unknown;
+    title?: unknown;
+    archived?: unknown;
+    pinned?: unknown;
+    color?: unknown;
+    status?: unknown;
+  };
   const principalId = typeof b.principalId === "string" ? b.principalId : null;
   if (!principalId) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
-  const patch: { title?: string | null; archived?: boolean; pinned?: boolean; color?: string | null } = {};
+  const patch: {
+    title?: string | null;
+    archived?: boolean;
+    pinned?: boolean;
+    color?: string | null;
+    status?: Session["status"];
+  } = {};
   if ("title" in b) {
     if (b.title !== null && typeof b.title !== "string") {
       return sendJson(res, 400, { error: "bad_request", message: "title must be a string or null" });
@@ -361,13 +414,23 @@ async function patchSession(ctx: ApiCtx): Promise<void> {
     }
     patch.color = typeof b.color === "string" ? b.color.toLowerCase() : null;
   }
+  if ("status" in b) {
+    if (!isSessionStatus(b.status)) {
+      return sendJson(res, 400, {
+        error: "bad_request",
+        message: "status must be null or {emoji: one Unicode emoji, text: 1–200 characters without control characters}",
+      });
+    }
+    patch.status = b.status;
+  }
   if (
     patch.title === undefined &&
     patch.archived === undefined &&
     patch.pinned === undefined &&
-    patch.color === undefined
+    patch.color === undefined &&
+    patch.status === undefined
   ) {
-    return sendJson(res, 400, { error: "bad_request", message: "title, archived, pinned, or color required" });
+    return sendJson(res, 400, { error: "bad_request", message: "title, archived, pinned, color, or status required" });
   }
   const session = await app.updateSession(id, principalId, patch);
   if (!session) return sendJson(res, 404, { error: "not_found" });
@@ -386,6 +449,7 @@ async function listAgentConversations(ctx: ApiCtx): Promise<void> {
       scopeId: s.scopeId,
       surface: s.surface ?? "unknown",
       title: s.title ?? null,
+      status: s.status ?? null,
       archived: s.archived === true,
       pinned: s.pinned === true,
       createdAt: s.createdAt,
@@ -400,7 +464,13 @@ async function patchAgentConversation(ctx: ApiCtx): Promise<void> {
     return sendJson(res, 401, { error: "capability_required", message: "this endpoint is for the agent self-API" });
   }
   const b = isObj(body) ? body : {};
-  const patch: { title?: string | null; archived?: boolean; pinned?: boolean; color?: string | null } = {};
+  const patch: {
+    title?: string | null;
+    archived?: boolean;
+    pinned?: boolean;
+    color?: string | null;
+    status?: Session["status"];
+  } = {};
   if ("archived" in b) {
     if (typeof b.archived !== "boolean") {
       return sendJson(res, 400, { error: "bad_request", message: "archived must be a boolean" });
@@ -426,13 +496,23 @@ async function patchAgentConversation(ctx: ApiCtx): Promise<void> {
     }
     patch.color = typeof b.color === "string" ? b.color.toLowerCase() : null;
   }
+  if ("status" in b) {
+    if (!isSessionStatus(b.status)) {
+      return sendJson(res, 400, {
+        error: "bad_request",
+        message: "status must be null or {emoji: one Unicode emoji, text: 1–200 characters without control characters}",
+      });
+    }
+    patch.status = b.status;
+  }
   if (
     patch.archived === undefined &&
     patch.pinned === undefined &&
     patch.title === undefined &&
-    patch.color === undefined
+    patch.color === undefined &&
+    patch.status === undefined
   ) {
-    return sendJson(res, 400, { error: "bad_request", message: "archived, pinned, title, or color required" });
+    return sendJson(res, 400, { error: "bad_request", message: "archived, pinned, title, color, or status required" });
   }
   const session = await app.updateSession(ctx.params.id!, capability.actorId, patch);
   if (!session) return sendJson(res, 404, { error: "not_found", message: "not a conversation you can see" });
@@ -450,6 +530,7 @@ async function patchAgentConversation(ctx: ApiCtx): Promise<void> {
       archived: session.archived === true,
       pinned: session.pinned === true,
       color: session.color ?? null,
+      status: session.status ?? null,
     },
   });
 }
@@ -459,6 +540,13 @@ async function listSessions(ctx: ApiCtx): Promise<void> {
   const principalId = url.searchParams.get("principalId");
   if (!principalId) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
   return sendJson(res, 200, { sessions: await app.listSessions(principalId) });
+}
+
+async function searchResources(ctx: ApiCtx): Promise<void> {
+  const principalId = ctx.actor?.p ?? ctx.url.searchParams.get("principalId");
+  if (!principalId) return sendJson(ctx.res, 400, { error: "bad_request" });
+  const query = (ctx.url.searchParams.get("q") ?? "").slice(0, 500);
+  return sendJson(ctx.res, 200, await ctx.app.searchResources(principalId, query));
 }
 
 async function searchSessions(ctx: ApiCtx): Promise<void> {
@@ -613,6 +701,7 @@ async function sessionCapability(ctx: ApiCtx): Promise<void> {
   const token = await mintCapabilityToken(
     { actorId: actor.p, scopeId: makeScopeId("personal", actor.p), exp: Date.now() + CAPABILITY_TTL_MS },
     secret,
+    deps.capabilityTokenCompression,
   );
   return sendJson(res, 200, { token });
 }
@@ -632,10 +721,11 @@ async function listAgentApis(ctx: ApiCtx): Promise<void> {
   return sendJson(
     res,
     200,
-    renderAgentApis(capability, {
-      isAdmin: admin.role === "org_admin",
-      ...(admin.role ? { role: admin.role } : {}),
-    }),
+    renderAgentApis(
+      capability,
+      { isAdmin: admin.role === "org_admin", ...(admin.role ? { role: admin.role } : {}) },
+      { swarmsEnabled: Boolean(ctx.app.swarms) },
+    ),
   );
 }
 
@@ -1013,6 +1103,7 @@ export async function shareArtifact(ctx: ApiCtx): Promise<void> {
     type?: unknown;
     id?: unknown;
     toScope?: unknown;
+    email?: unknown;
     permission?: unknown;
     move?: unknown;
   };
@@ -1021,7 +1112,15 @@ export async function shareArtifact(ctx: ApiCtx): Promise<void> {
   }
   if (typeof b.id !== "string" || !b.id.trim())
     return sendJson(res, 400, { error: "bad_request", message: "id required" });
-  if (typeof b.toScope !== "string" || !b.toScope.trim()) {
+  if (
+    b.email !== undefined &&
+    (typeof b.email !== "string" || b.toScope !== undefined || b.type !== "deploy" || b.move === true)
+  )
+    return sendJson(res, 400, {
+      error: "bad_request",
+      message: "email is only supported for app sharing, instead of toScope",
+    });
+  if (b.email === undefined && (typeof b.toScope !== "string" || !b.toScope.trim())) {
     return sendJson(res, 400, {
       error: "bad_request",
       message: 'toScope required ("org", a scope id, or a teammate\'s name)',
@@ -1034,7 +1133,8 @@ export async function shareArtifact(ctx: ApiCtx): Promise<void> {
     {
       type: b.type,
       id: b.id,
-      ...splitToScope(b.toScope),
+      ...(typeof b.toScope === "string" ? splitToScope(b.toScope) : {}),
+      ...(typeof b.email === "string" ? { email: b.email } : {}),
       ...(b.permission === "read" || b.permission === "write" ? { permission: b.permission } : {}),
       ...(b.move === true ? { move: true } : {}),
     },
@@ -1054,6 +1154,7 @@ export async function shareArtifact(ctx: ApiCtx): Promise<void> {
     id: result.id,
     target: result.target,
     permission: result.permission,
+    ...(result.invitation ? { invitation: result.invitation } : {}),
   });
 }
 
@@ -1082,6 +1183,7 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
     ? baseModel!
     : defaultModelForHarness(harnessId, deps.baseModelDefault);
   const resolvedBranding = {
+    ...(branding.orgName ? { orgName: branding.orgName } : {}),
     ...(branding.accent ? { accent: branding.accent } : {}),
     ...(branding.mark ? { mark: branding.mark } : {}),
     ...(branding.markUrl ? { markUrl: branding.markUrl } : {}),
@@ -1124,11 +1226,19 @@ async function runtimeTarget(ctx: ApiCtx): Promise<{ actorId: string; scope: Sco
 }
 
 async function getRuntimeConfig(ctx: ApiCtx): Promise<void> {
+  const account = ctx.url.searchParams.get("account");
+  if (account !== null && account !== "company") return sendJson(ctx.res, 400, { error: "invalid_account" });
   if (!ctx.deps.config) return sendJson(ctx.res, 404, { error: "not_found" });
   const target = await runtimeTarget(ctx);
   if (!target) return sendJson(ctx.res, 403, { error: "forbidden" });
   await ctx.deps.refreshModels?.();
-  return sendJson(ctx.res, 200, await runtimeConfigBody(ctx, target.scope));
+  return sendJson(
+    ctx.res,
+    200,
+    ctx.url.searchParams.get("account") === "company"
+      ? await runtimeConfigBody(ctx, target.scope)
+      : await userRuntimeConfigBody(ctx, target.scope, target.actorId),
+  );
 }
 
 async function putRuntimeConfig(ctx: ApiCtx): Promise<void> {
@@ -1167,11 +1277,16 @@ async function putRuntimeConfig(ctx: ApiCtx): Promise<void> {
       return sendJson(ctx.res, 400, { error: "model_not_supported" });
     if (!(await webuiModelEnabled(ctx, modelId))) return sendJson(ctx.res, 400, { error: "model_not_enabled" });
     const effortLevel = ctx.body.effortLevel ?? "auto";
-    if (typeof effortLevel !== "string" || !(THINKING_LEVELS as readonly string[]).includes(effortLevel))
+    if (typeof effortLevel !== "string" || !thinkingLevelsForHarness(harnessId, modelId).includes(effortLevel))
       return sendJson(ctx.res, 400, { error: "effort_not_supported" });
     const fastMode = ctx.body.fastMode ?? false;
     if (typeof fastMode !== "boolean") return sendJson(ctx.res, 400, { error: "fast_mode_invalid" });
     const choice = { harnessId, modelId, effortLevel, fastMode: fastMode && fastModeModelIds().includes(modelId) };
+    if ((await config.getModelAccountDurable(target.actorId)) !== "company") {
+      const available = await userRuntimeConfigBody(ctx, target.scope, target.actorId);
+      if (!available.modelsByHarness[harnessId]?.includes(modelId))
+        return sendJson(ctx.res, 400, { error: "account_runtime_unavailable" });
+    }
     await config.setRuntimeSelectionLatest(target.scope, choice);
   }
   audit(ctx.deps, {
@@ -1180,7 +1295,7 @@ async function putRuntimeConfig(ctx: ApiCtx): Promise<void> {
     resource: "runtime-config",
     scopeLabel: target.scope,
   });
-  return sendJson(ctx.res, 200, await runtimeConfigBody(ctx, target.scope));
+  return sendJson(ctx.res, 200, await userRuntimeConfigBody(ctx, target.scope, target.actorId));
 }
 
 async function getChannelHeaderPin(ctx: ApiCtx): Promise<void> {
@@ -1268,10 +1383,14 @@ export async function postSoul(ctx: ApiCtx): Promise<void> {
 
 export const surfaceRoutes: ReadonlyArray<Route<ApiCtx>> = [
   ...sessionSharingRoutes,
+  ...suggestedActivityRoutes,
   { method: "POST", path: "/v1/session-cap", auth: "source", handle: sessionCapability },
+  { method: "GET", path: "/v1/resources/search", auth: "source", handle: searchResources },
   { method: "GET", path: "/v1/sessions/search", auth: "source", handle: searchSessions },
   { method: "POST", path: "/v1/sessions/:id/title", auth: "source", handle: regenerateSessionTitle },
   { method: "POST", path: "/v1/sessions/:id/fork", auth: "source", handle: forkSession },
+  { method: "POST", path: "/v1/sessions/:id/adopt", auth: "source", handle: adoptSession },
+  { method: "POST", path: "/v1/sessions/:id/detach", auth: "source", handle: detachSession },
   { method: "GET", path: "/v1/sessions/:id/approvals", auth: "source", handle: listSessionApprovals },
   { method: "GET", path: "/v1/sessions/:id/background", auth: "source", handle: getSessionBackground },
   {

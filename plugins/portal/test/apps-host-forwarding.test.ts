@@ -132,9 +132,9 @@ test("a browser cannot smuggle core trust headers through an app host", async ()
 
 test("the portal's own host and look-alike hosts are not forwarded to core", async () => {
   seen.length = 0;
+  assert.equal((await send("apps.qm.example.com", "/healthz")).status, 404);
   for (const host of [
     "qm.example.com",
-    "apps.qm.example.com",
     "invoice-review.apps.qm.example.com.evil.com",
     "notapps.qm.example.com",
     "invoice-review.apps.qm.example.com.",

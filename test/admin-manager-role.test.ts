@@ -14,6 +14,7 @@ import { managerAccessFor, managerRefusal } from "../src/admin/manager-access.ts
 import { adminRoutes } from "../src/api/routes/admin.ts";
 import { skillPackRoutes } from "../src/api/routes/skill-packs.ts";
 import { apiRoutes, rawRoutes } from "../src/api/routes/index.ts";
+import { unattendedGrantRefusal } from "../src/cron/authority.ts";
 
 const ORG = "org:default-org";
 const ALICE = { id: "admin-alice", type: "internal" as const };
@@ -143,6 +144,15 @@ test("a manager cannot grant, revoke, or impersonate", async () => {
       expiresAt: new Date(Date.now() + 7 * 86_400_000).toISOString().slice(0, 10),
     });
     assert.equal(invite.status, 403);
+    const teammate = await s.asManager("POST", "/v1/admin/users/invite", { email: "admin-bob@example.com" });
+    assert.equal(teammate.status, 403);
+    const link = await s.asManager("POST", "/v1/admin/principal-links", {
+      principalId: "mia-second-login",
+      canonicalId: "admin-alice",
+    });
+    assert.equal(link.status, 403);
+    assert.equal((await s.asManager("DELETE", "/v1/admin/principal-links/admin-bob")).status, 403);
+    assert.equal((await s.asManager("GET", "/v1/admin/spend")).status, 403);
     const roles = (await s.built.admin.listGrants()).map((g) => `${g.principalId}:${g.role}`).sort();
     assert.deepEqual(roles, ["admin-alice:org_admin", "admin-bob:org_admin", `${MANAGER}:org_manager`]);
   } finally {
@@ -164,6 +174,41 @@ test("an org admin can grant and revoke the manager role, and still impersonates
     assert.equal(revoke.status, 200);
     assert.equal((await s.built.admin.adminStatusOf({ id: OTHER, type: "internal" })).isAdmin, false);
     assert.equal((await s.asAdmin("POST", "/v1/admin/impersonate", { target: OTHER })).status, 200);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a manager cannot use org-admin powers through the agent", async () => {
+  const s = await start();
+  try {
+    await assert.rejects(s.built.app.promoteSkill("any-skill", ORG, MANAGER, true), /only an org admin/);
+    const own = (owner: string) => ({ owner, ownerScopeId: `personal:${owner}` });
+    const live = (actorId: string) => ({ actorId, liveActor: true });
+    assert.match(
+      String(await unattendedGrantRefusal(s.built.app, s.built.admin, own(MANAGER), live(MANAGER))),
+      /current org admin/,
+    );
+    assert.equal(
+      await unattendedGrantRefusal(s.built.app, s.built.admin, own("admin-alice"), live("admin-alice")),
+      null,
+    );
+  } finally {
+    await s.close();
+  }
+});
+
+test("an org admin sign-in cannot be linked onto a manager identity", async () => {
+  const s = await start();
+  try {
+    const r = await s.asAdmin("POST", "/v1/admin/principal-links", {
+      principalId: "admin-bob",
+      canonicalId: MANAGER,
+      evidence: "same person, confirmed in person",
+    });
+    assert.equal(r.status, 400);
+    assert.match(((await r.json()) as { message: string }).message, /holds an org admin grant/);
+    assert.equal((await s.built.admin.adminStatusOf({ id: MANAGER, type: "internal" })).role, "org_manager");
   } finally {
     await s.close();
   }

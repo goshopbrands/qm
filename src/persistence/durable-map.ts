@@ -4,6 +4,8 @@ import { pgTextSafe } from "../util/text.ts";
 export interface DurableMapSelect<T, K extends Extract<keyof T, string>> {
   omit?: readonly K[];
   where?: { field: Extract<keyof T, string>; anyOfFold: readonly string[] };
+  limit?: number;
+  afterId?: string;
 }
 
 export interface DurableMap<T> {
@@ -34,7 +36,7 @@ function jsonbSafe(value: unknown): unknown {
   if (typeof value === "string") return pgTextSafe(value);
   if (Array.isArray(value)) return value.map(jsonbSafe);
   if (value && typeof value === "object") {
-    const out: Record<string, unknown> = {};
+    const out: Record<string, unknown> = Object.create(null);
     for (const [k, v] of Object.entries(value)) out[pgTextSafe(k)] = jsonbSafe(v);
     return out;
   }
@@ -62,6 +64,7 @@ export function selectValues<T, K extends Extract<keyof T, string>>(
   const folded = query.where ? new Set(query.where.anyOfFold.map((v) => v.toLowerCase())) : null;
   const out: Array<Omit<T, K>> = [];
   for (const value of values) {
+    if (query.limit !== undefined && out.length >= query.limit) break;
     if (folded && query.where) {
       const text = fieldText((value as Record<string, unknown>)[query.where.field]);
       if (text === null || !(folded.has(text.toLowerCase()) || !isAscii(text))) continue;
@@ -99,7 +102,9 @@ export function createMemoryMap<T>(): DurableMap<T> {
     },
     async select(query) {
       return selectValues(
-        sortedEntries().map(([, v]) => v),
+        sortedEntries()
+          .filter(([id]) => query.afterId === undefined || id > query.afterId)
+          .map(([, v]) => v),
         query,
       );
     },
@@ -153,7 +158,11 @@ export function createMemoryMap<T>(): DurableMap<T> {
 
 const VERSIONS_TABLE = "durable_map_versions";
 
-export function createPostgresMap<T>(pg: PgPool, table: string): DurableMap<T> {
+export function createPostgresMap<T>(
+  pg: PgPool,
+  table: string,
+  indexedFields: readonly Extract<keyof T, string>[] = [],
+): DurableMap<T> {
   if (!/^[a-z_][a-z0-9_]*$/i.test(table)) throw new Error(`invalid table name: ${table}`);
   const migration = {
     id: `durable-map/${table}/0001`,
@@ -162,11 +171,41 @@ export function createPostgresMap<T>(pg: PgPool, table: string): DurableMap<T> {
       `CREATE TABLE IF NOT EXISTS ${VERSIONS_TABLE} (tbl TEXT PRIMARY KEY, v BIGINT NOT NULL)`,
     ],
   };
-  pg.registerMigration(migration);
+  const migrations = [
+    migration,
+    ...indexedFields.flatMap((field) => {
+      if (!/^[a-z_][a-z0-9_]*$/i.test(field)) throw new Error(`invalid index field: ${field}`);
+      return [
+        {
+          id: `durable-map/${table}/lookup-${field.toLowerCase()}-drop`,
+          statements: [`SET LOCAL lock_timeout = '3s'`, `DROP INDEX IF EXISTS ${table}_${field.toLowerCase()}_fold`],
+        },
+        {
+          id: `durable-map/${table}/lookup-${field.toLowerCase()}-hash`,
+          statements: [
+            `CREATE INDEX CONCURRENTLY IF NOT EXISTS ${table}_${field.toLowerCase()}_fold
+           ON ${table} USING hash (lower(json->>'${field}'))`,
+          ],
+        },
+        {
+          id: `durable-map/${table}/select-${field.toLowerCase()}`,
+          statements: [
+            `CREATE INDEX CONCURRENTLY IF NOT EXISTS ${table}_${field.toLowerCase()}_fold
+           ON ${table} (lower(json->>'${field}'))`,
+            `CREATE INDEX CONCURRENTLY IF NOT EXISTS ${table}_${field.toLowerCase()}_unicode
+           ON ${table} (id) WHERE json->>'${field}' ~ '[^\\x01-\\x7f]'`,
+          ],
+        },
+      ];
+    }),
+  ];
+  for (const definition of migrations) pg.registerMigration(definition);
   let readyP: Promise<void> | null = null;
   function ready(): Promise<void> {
     if (!readyP) {
-      readyP = pg.migrate(migration).catch((e) => {
+      readyP = (async () => {
+        for (const definition of migrations) await pg.migrate(definition);
+      })().catch((e) => {
         readyP = null;
         throw e;
       });
@@ -219,9 +258,21 @@ export function createPostgresMap<T>(pg: PgPool, table: string): DurableMap<T> {
           query.where.field,
           query.where.anyOfFold.map((v) => v.toLowerCase()),
         );
-        sql += ` WHERE lower(json->>$2) = ANY($3::text[]) OR json->>$2 ~ '[^\\x01-\\x7f]'`;
+        sql += ` WHERE id IN (
+          SELECT id FROM ${table} WHERE lower(json->>$2) = ANY($3::text[])
+          UNION
+          SELECT id FROM ${table} WHERE json->>$2 ~ '[^\\x01-\\x7f]')`;
       }
-      const rows = await pg.q(`${sql} ORDER BY id`, params);
+      if (query.afterId !== undefined) {
+        params.push(query.afterId);
+        sql += `${query.where ? " AND" : " WHERE"} id > $${params.length}`;
+      }
+      sql += " ORDER BY id";
+      if (query.limit !== undefined) {
+        params.push(query.limit);
+        sql += ` LIMIT $${params.length}`;
+      }
+      const rows = await pg.q(sql, params);
       return rows.map((row) => row.json as Omit<T, K>);
     },
     async get(id) {
@@ -300,11 +351,15 @@ export function createPostgresMap<T>(pg: PgPool, table: string): DurableMap<T> {
 }
 
 export interface PostgresArtifactMaps {
-  map<T>(table: string): DurableMap<T>;
+  map<T>(table: string, indexedFields?: readonly Extract<keyof T, string>[]): DurableMap<T>;
   pool: PgPool;
 }
 
 export function createPostgresMapFactory(connectionString: string): PostgresArtifactMaps {
   const pg = createPgPool(connectionString);
-  return { map: <T>(table: string): DurableMap<T> => createPostgresMap<T>(pg, table), pool: pg };
+  return {
+    map: <T>(table: string, indexedFields?: readonly Extract<keyof T, string>[]): DurableMap<T> =>
+      createPostgresMap<T>(pg, table, indexedFields),
+    pool: pg,
+  };
 }
