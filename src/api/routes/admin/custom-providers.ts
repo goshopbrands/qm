@@ -5,7 +5,7 @@ import {
 } from "../../../model/custom-providers.ts";
 import { sendJson } from "../../http.ts";
 import type { ApiCtx } from "../route.ts";
-import { audit, authorizeAdmin, orgScope } from "../shared.ts";
+import { actsAsManager, audit, authorizeAdmin, orgScope } from "../shared.ts";
 
 async function actor(ctx: ApiCtx) {
   const scope = orgScope(ctx.deps);
@@ -83,6 +83,12 @@ export async function putCustomProvider(ctx: ApiCtx): Promise<void> {
     models: Array.isArray(body.models) ? (body.models as CustomProviderSpec["models"]) : [],
   };
   const apiKey = typeof body.apiKey === "string" && body.apiKey.trim() ? body.apiKey.trim() : undefined;
+  if (
+    !apiKey &&
+    (await actsAsManager(ctx, authorized)) &&
+    (await ctx.deps.customProviders.statuses()).some((p) => p.id === id)
+  )
+    return sendJson(ctx.res, 403, { error: "forbidden", message: "re-enter the API key to change this provider" });
   const shouldValidate = body.validate !== false && apiKey !== undefined;
   if (shouldValidate && !(await validateKey(ctx, spec.protocol, spec.baseUrl, apiKey!))) {
     return sendJson(ctx.res, 400, {

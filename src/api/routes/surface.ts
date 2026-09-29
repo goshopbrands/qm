@@ -723,7 +723,7 @@ async function listAgentApis(ctx: ApiCtx): Promise<void> {
     200,
     renderAgentApis(
       capability,
-      { isAdmin: admin.role === "org_admin", ...(admin.role ? { role: admin.role } : {}) },
+      { isAdmin: admin.isAdmin, ...(admin.role ? { role: admin.role } : {}) },
       { swarmsEnabled: Boolean(ctx.app.swarms) },
     ),
   );

@@ -17,7 +17,7 @@ import {
 import { createTranscriptSource } from "../../../harness/tape-projection.ts";
 import { swallowAs } from "../../../util/errors.ts";
 import { sendJson } from "../../http.ts";
-import { adminScopeReader, audit, requireScopedAdmin } from "../shared.ts";
+import { actsAsManager, audit, requireScopedAdmin } from "../shared.ts";
 import { type ApiCtx } from "../route.ts";
 import { requireScopedResource } from "./common.ts";
 import {
@@ -324,7 +324,7 @@ export async function getAdminSession(ctx: ApiCtx): Promise<void> {
   const scoped = await requireAdminSession(ctx, id);
   if (!scoped) return;
   const { actor, record: session } = scoped;
-  const manager = (await adminScopeReader(ctx, actor)) !== null;
+  const manager = await actsAsManager(ctx, actor);
   const narrowed = parseScopeId(scoped.scope).kind === "org" && manager;
   const scope = narrowed ? "" : scoped.scope;
   audit(deps, { principalId: actor.id, action: "session.read", resource: id, scopeLabel: session.scopeId });

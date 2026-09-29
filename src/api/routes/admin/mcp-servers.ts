@@ -7,7 +7,7 @@
 import { isValidMcpServerId, type McpServer, type McpServerAuthMode } from "../../../mcp/mcp-server-store.ts";
 import { sendJson } from "../../http.ts";
 import type { ApiCtx } from "../route.ts";
-import { audit, authorizeAdmin, orgScope } from "../shared.ts";
+import { actsAsManager, audit, authorizeAdmin, orgScope } from "../shared.ts";
 
 const AUTH_MODES: McpServerAuthMode[] = ["none", "bearer", "client-credentials"];
 
@@ -110,6 +110,27 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
       error: "bad_request",
       message: "per-user credentials require HTTPS (except loopback)",
     });
+  }
+  if (await actsAsManager(ctx, authorized)) {
+    const newSecret =
+      (auth === "bearer" && typeof b.bearerToken === "string" && b.bearerToken) ||
+      (auth === "client-credentials" &&
+        typeof b.clientId === "string" &&
+        b.clientId &&
+        typeof b.clientSecret === "string" &&
+        b.clientSecret);
+    if (existing && auth !== "none" && !newSecret)
+      return sendJson(ctx.res, 403, { error: "forbidden", message: "re-enter the secret to change this server" });
+    const host = parsed.hostname.toLowerCase();
+    const onCredentialHost =
+      typeof credentialHost === "string" &&
+      credentialHost.includes(".") &&
+      (host === credentialHost || host.endsWith(`.${credentialHost}`));
+    if (credentialScope === "per-user" && !onCredentialHost)
+      return sendJson(ctx.res, 403, {
+        error: "forbidden",
+        message: "a per-user server's URL must be on its credential host",
+      });
   }
   const server: McpServer = {
     id,

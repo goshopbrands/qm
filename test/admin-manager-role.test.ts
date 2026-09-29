@@ -153,7 +153,6 @@ test("a manager cannot grant, revoke, or impersonate", async () => {
     });
     assert.equal(link.status, 403);
     assert.equal((await s.asManager("DELETE", "/v1/admin/principal-links/admin-bob")).status, 403);
-    assert.equal((await s.asManager("GET", "/v1/admin/spend")).status, 403);
     const roles = (await s.built.admin.listGrants()).map((g) => `${g.principalId}:${g.role}`).sort();
     assert.deepEqual(roles, ["admin-alice:org_admin", "admin-bob:org_admin", `${MANAGER}:org_manager`]);
   } finally {
@@ -180,26 +179,152 @@ test("an org admin can grant and revoke the manager role, and still impersonates
   }
 });
 
-test("a manager cannot use org-admin powers through the agent", async () => {
+test("a manager can promote skills org-wide and give their crons unattended grants", async () => {
   const s = await start();
   try {
-    await assert.rejects(s.built.app.promoteSkill("any-skill", ORG, MANAGER, true), /only an org admin/);
+    const skill = async (owner: string) =>
+      (await s.built.app.createOwnedSkill({
+        principalId: owner,
+        name: `notes-${owner}`,
+        description: "notes",
+        body: `${owner} private`,
+      }))!;
+    const theirs = await skill(OTHER);
+    const mine = await skill(MANAGER);
+    await assert.rejects(s.built.app.promoteSkill(mine.id, ORG, OTHER, true), /only an org admin/);
+    await assert.rejects(s.built.app.promoteSkill(theirs.id, ORG, MANAGER, true), /spaces they can read/);
+    assert.equal((await s.built.app.promoteSkill(mine.id, ORG, MANAGER, true)).scopeId, ORG);
     const own = (owner: string) => ({ owner, ownerScopeId: `personal:${owner}` });
     const live = (actorId: string) => ({ actorId, liveActor: true });
+    assert.equal(await unattendedGrantRefusal(s.built.app, s.built.admin, own(MANAGER), live(MANAGER)), null);
     assert.match(
-      String(await unattendedGrantRefusal(s.built.app, s.built.admin, own(MANAGER), live(MANAGER))),
+      String(await unattendedGrantRefusal(s.built.app, s.built.admin, own(OTHER), live(OTHER))),
       /current org admin/,
-    );
-    assert.equal(
-      await unattendedGrantRefusal(s.built.app, s.built.admin, own("admin-alice"), live("admin-alice")),
-      null,
     );
   } finally {
     await s.close();
   }
 });
 
-test("a manager's agent capability cannot use admin routes, while an org admin's still can", async () => {
+test("a manager imports skill packs only into spaces they can read and cannot repoint another person's pack", async () => {
+  const s = await start();
+  try {
+    const pack = await s.built.app.registerSkillPack({
+      kind: "git",
+      url: "https://github.com/acme/skills-pack.git",
+      ref: "main",
+      syncMode: "pinned",
+      trustTier: "third-party",
+      targetScopeId: ORG,
+      subset: "all",
+      createdBy: "admin-alice",
+    });
+    const importInto = (scopeIds: string[]) =>
+      s.asManager("POST", `/v1/admin/skill-packs/${pack.id}/import`, { selected: "all", scopeIds });
+    assert.equal((await importInto([`personal:${OTHER}`])).status, 403);
+    assert.equal((await importInto(["channel:CPUB", "channel:CHR"])).status, 403);
+    assert.notEqual((await importInto(["channel:CPUB"])).status, 403);
+    const repoint = await s.asManager("PATCH", `/v1/admin/skill-packs/${pack.id}`, {
+      url: "https://github.com/acme/private.git",
+    });
+    assert.equal(repoint.status, 403);
+    assert.equal((await s.built.app.getSkillPack(pack.id))!.url, "https://github.com/acme/skills-pack.git");
+    assert.equal((await s.asManager("PATCH", `/v1/admin/skill-packs/${pack.id}`, { syncMode: "tracked" })).status, 200);
+    const withOrgCredential = await s.asManager("POST", "/v1/admin/skill-packs", {
+      url: "https://github.com/acme/private.git",
+      authCredentialSlug: "gh",
+    });
+    assert.equal(withOrgCredential.status, 403);
+    assert.equal(
+      (await s.asManager("POST", `/v1/admin/scopes/${q(ORG)}/auto-flagger/test`, {})).status,
+      403,
+      "the auto flagger test samples every scope's messages",
+    );
+  } finally {
+    await s.close();
+  }
+});
+
+test("a manager must re-enter a stored secret to change where it is sent", async () => {
+  const s = await start();
+  try {
+    const cred = `/v1/admin/scopes/${q(ORG)}/service-credentials`;
+    assert.equal(
+      (await s.asAdmin("PUT", cred, { slug: "gh", name: "GitHub", host: "api.github.com", secret: "s3cret" })).status,
+      200,
+    );
+    const version = async () =>
+      ((await (await s.asAdmin("GET", `/v1/admin/scopes/${q(ORG)}`)).json()) as any).serviceCredentials[0].updatedAt;
+    const moved = { slug: "gh", name: "GitHub", host: "evil.example.com" };
+    assert.equal((await s.asManager("PUT", cred, { ...moved, expectedUpdatedAt: await version() })).status, 403);
+    assert.equal(
+      (await s.asManager("PUT", cred, { ...moved, secret: "new", expectedUpdatedAt: await version() })).status,
+      200,
+    );
+
+    const provider = "/v1/admin/custom-providers/gateway";
+    const spec = {
+      name: "Gateway",
+      protocol: "openai",
+      baseUrl: "https://gateway.example.com/v1",
+      models: [{ id: "gw-1" }],
+      validate: false,
+    };
+    assert.equal((await s.asAdmin("PUT", provider, { ...spec, apiKey: "sk-admin" })).status, 200);
+    const repointed = { ...spec, baseUrl: "https://evil.example.com/v1" };
+    assert.equal((await s.asManager("PUT", provider, repointed)).status, 403);
+    assert.equal((await s.asManager("PUT", provider, { ...repointed, apiKey: "sk-mine" })).status, 200);
+
+    const mcp = "/v1/admin/mcp-servers/tools";
+    const server = { url: "https://mcp.example.com/mcp", auth: "bearer", validate: false };
+    assert.equal((await s.asAdmin("PUT", mcp, { ...server, bearerToken: "admin-token" })).status, 200);
+    assert.equal((await s.asManager("PUT", mcp, { ...server, url: "https://evil.example.com/mcp" })).status, 403);
+    assert.equal((await s.asManager("PUT", mcp, { ...server, bearerToken: "mine" })).status, 200);
+    const perUser = { auth: "none", credentialScope: "per-user", credentialHost: "github.com", validate: false };
+    const perUserServer = "/v1/admin/mcp-servers/gh";
+    assert.equal(
+      (await s.asManager("PUT", perUserServer, { ...perUser, url: "https://evil.example.com/mcp" })).status,
+      403,
+    );
+    const suffixOnly = { ...perUser, credentialHost: "com", url: "https://evil.com/mcp" };
+    assert.equal((await s.asManager("PUT", perUserServer, suffixOnly)).status, 403);
+    assert.equal(
+      (await s.asManager("PUT", perUserServer, { ...perUser, url: "https://api.github.com/mcp" })).status,
+      200,
+    );
+  } finally {
+    await s.close();
+  }
+});
+
+test("a manager can open Spend and redirect output only for crons in spaces they can read", async () => {
+  const s = await start();
+  try {
+    assert.notEqual((await s.asManager("GET", "/v1/admin/spend")).status, 403);
+    const crons = await s.built.app.listCrons();
+    const inScope = (scope: string) => crons.find((c) => c.ownerScopeId === scope)!.id;
+    const redirect = (scope: string) =>
+      s.asManager("PUT", `/v1/admin/crons/${q(inScope(scope))}/destination?scope=${q(ORG)}`, {
+        destination: { type: "slack", target: "CPUB" },
+      });
+    assert.equal((await redirect("channel:CPUB")).status, 200);
+    assert.equal((await redirect("group:GTHEIRS")).status, 403);
+    const send = (destination: unknown) =>
+      s.asManager("PUT", `/v1/admin/crons/${q(inScope("channel:CPUB"))}/destination?scope=${q(ORG)}`, {
+        destination,
+      });
+    assert.equal((await send({ type: "slack", target: "CLEADS" })).status, 200);
+    assert.equal((await send({ type: "slack", target: "CHR" })).status, 403);
+    assert.equal((await send({ type: "principal", target: "outsider@example.com" })).status, 403);
+    assert.equal((await send({ type: "principal", target: MANAGER })).status, 200);
+    assert.equal((await send({ type: "principal", target: OTHER })).status, 200);
+    assert.equal((await send({ type: "principal", target: MANAGER, audienceScopeId: "channel:CPUB" })).status, 403);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a manager's agent has the manager's dashboard powers and no way to raise its role", async () => {
   const secret = "manager-agent-capability-secret".repeat(2);
   const config = testConfig({
     dataDir: mkdtempSync(join(tmpdir(), "admin-manager-cap-")),
@@ -236,12 +361,20 @@ test("a manager's agent capability cannot use admin routes, while an org admin's
     });
   try {
     const memory = `/v1/admin/memory?scope=${q(ORG)}`;
-    const refused = await asAgentOf(MANAGER, "PUT", memory, { content: "# Memory\n\n- rewritten by an agent" });
-    assert.equal(refused.status, 403);
-    assert.match(((await refused.json()) as { message: string }).message, /admin dashboard/);
-    assert.equal((await asAgentOf(MANAGER, "GET", "/v1/admin/users")).status, 403);
-    assert.equal((await asAgentOf(MANAGER, "GET", "/v1/admin/whoami")).status, 200);
-    assert.equal((await asAgentOf("admin-alice", "GET", memory)).status, 200);
+    const put = await asAgentOf(MANAGER, "PUT", memory, { content: "# Memory\n\n- standup is 9:30" });
+    assert.equal(put.status, 200);
+    assert.equal((await asAgentOf(MANAGER, "GET", "/v1/admin/users")).status, 200);
+    for (const role of ["org_admin", "org_manager"]) {
+      const grant = await asAgentOf(MANAGER, "POST", "/v1/admin/grants", { principalId: OTHER, role, scopeId: ORG });
+      assert.equal(grant.status, 403, role);
+    }
+    assert.equal((await asAgentOf(MANAGER, "POST", "/v1/admin/impersonate", { target: OTHER })).status, 403);
+    assert.equal((await asAgentOf(MANAGER, "POST", "/v1/admin/users/invite", { email: "a@example.com" })).status, 403);
+    assert.deepEqual((await built.admin.listGrants()).map((g) => `${g.principalId}:${g.role}`).sort(), [
+      "admin-alice:org_admin",
+      "admin-bob:org_admin",
+      `${MANAGER}:org_manager`,
+    ]);
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
   }
@@ -371,20 +504,6 @@ test("a manager reads conversations only in spaces they belong to or that are pu
     assert.ok(await s.built.sessions.get(s.sessionIds[`personal:${OTHER}`]!), "the DM survives");
     const publicId = s.sessionIds["channel:CPUB"]!;
     assert.equal((await s.asManager("GET", `/v1/admin/sessions/${publicId}/llm?scope=${q(ORG)}`)).status, 403);
-    const cron = (await s.built.app.listCrons()).find((c) => c.ownerScopeId === "channel:CPUB")!;
-    const move = await s.asManager("PUT", `/v1/admin/crons/${cron.id}/destination?scope=${q(ORG)}`, {
-      destination: { type: "slack", target: "CHR" },
-    });
-    assert.equal(move.status, 403);
-    assert.equal(
-      (
-        await s.asManager("POST", "/v1/admin/skill-packs/x/import", {
-          selected: "all",
-          scopeIds: [`personal:${OTHER}`],
-        })
-      ).status,
-      403,
-    );
   } finally {
     await s.close();
   }
@@ -434,7 +553,6 @@ test("views that mix every space's messages are org-admin only", async () => {
       assert.equal((await s.asManager("GET", path)).status, 403, path);
       assert.notEqual((await s.asAdmin("GET", path)).status, 403, path);
     }
-    assert.equal((await s.asManager("POST", `/v1/admin/scopes/${q(ORG)}/auto-flagger/test`, {})).status, 403);
   } finally {
     await s.close();
   }

@@ -93,7 +93,7 @@ echo "== Patch 4: org manager role"
 report_touches src/admin/admin-service.ts src/admin/admin-grant-store.ts src/api/routes/shared.ts \
   src/api/routes/admin src/api/routes/admin.ts src/api/routes/skill-packs.ts src/wiring.ts \
   src/core/orchestrator.ts src/api/control-service.ts src/api/routes/surface.ts src/api/routes/auth-broker.ts \
-  src/api/routes/deployments.ts src/cron/authority.ts src/api/app-sessions.ts src/api/server.ts plugins/portal/src/index.ts \
+  src/api/routes/deployments.ts src/api/server.ts src/api/app-sessions.ts src/api/routes/admin-resources.ts plugins/portal/src/index.ts \
   plugins/admin/public/index.html plugins/admin/ui/users.ts plugins/admin/ui/user-detail.ts
 new_routes="$(git diff "$base" "$ref" -- src/api/routes | grep -E '^\+.*"/v1/admin' || true)"
 if [ -n "$new_routes" ]; then

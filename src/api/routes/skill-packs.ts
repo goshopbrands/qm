@@ -1,6 +1,6 @@
 import { sendJson } from "../http.ts";
 import type { ApiCtx, Route } from "./route.ts";
-import { audit, authorizeAdmin, orgScope } from "./shared.ts";
+import { actsAsManager, adminScopeReader, audit, authorizeAdmin, orgScope } from "./shared.ts";
 import type { NewSkillPack, SkillPack } from "../../skills/skill-pack-store.ts";
 import type { PackConfig } from "../../skills/normalize.ts";
 import { parseScopeId, type ScopeId } from "../../types.ts";
@@ -68,6 +68,11 @@ async function registerPack(ctx: ApiCtx): Promise<void> {
   const subset = asSubset(b.subset);
   if (subset === undefined)
     return sendJson(ctx.res, 400, { error: "bad_request", message: "subset must be 'all' or string[]" });
+  if (typeof b.authCredentialSlug === "string" && b.authCredentialSlug && (await actsAsManager(ctx, actor)))
+    return sendJson(ctx.res, 403, {
+      error: "forbidden",
+      message: "a manager cannot register a pack that fetches with an org credential",
+    });
   const input: NewSkillPack = {
     kind: "git",
     url: b.url.trim(),
@@ -119,6 +124,11 @@ async function importPack(ctx: ApiCtx): Promise<void> {
       error: "bad_request",
       message: "scopeIds must be an array of 'kind:ref' scope ids",
     });
+  const canRead = await adminScopeReader(ctx, actor);
+  if (canRead)
+    for (const scope of scopeIds)
+      if (!(await canRead(scope)))
+        return sendJson(ctx.res, 403, { error: "forbidden", message: `you can't import into ${scope}` });
   const result = await ctx.app.importSkillPack(ctx.params.id!, subset, scopeIds);
   audit(ctx.deps, {
     principalId: actor.id,
@@ -158,6 +168,14 @@ async function patchPack(ctx: ApiCtx): Promise<void> {
     patch.subset = subset;
   }
   if (b.config !== undefined) patch.config = asConfig(b.config);
+  if ((patch.url || patch.ref) && (await actsAsManager(ctx, actor))) {
+    const existing = await ctx.app.getSkillPack(ctx.params.id!);
+    if (existing && existing.createdBy !== actor.id)
+      return sendJson(ctx.res, 403, {
+        error: "forbidden",
+        message: "only the person who registered this pack can change its source",
+      });
+  }
   const pack = await ctx.app.updateSkillPack(ctx.params.id!, patch);
   audit(ctx.deps, {
     principalId: actor.id,

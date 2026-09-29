@@ -25,7 +25,6 @@ function rawAdminActor(ctx: Pick<ApiCtx, "req" | "deps" | "capability" | "actor"
 }
 
 const adminRoleByRequest = new WeakMap<object, string>();
-const MANAGER_AGENT_REFUSED = "org managers use admin powers in the admin dashboard, not through the agent";
 export function adminActorFrom(ctx: Pick<ApiCtx, "req" | "deps" | "capability" | "actor">): Principal | null {
   const actor = rawAdminActor(ctx);
   return actor ? { ...actor, id: canonicalPerson(actor.id) } : null;
@@ -49,10 +48,9 @@ export async function authorizeAdmin(
   }
   const status = actor ? adminStatusFromGrants(grants, actor.id) : null;
   if (actor && status?.isAdmin) {
-    let refusal: string | null = null;
-    if (status.role !== "org_admin")
-      refusal = ctx.capability
-        ? MANAGER_AGENT_REFUSED
+    const refusal =
+      status.role === "org_admin"
+        ? null
         : await managerRefusal(ctx.req, scope, (target) => admin.canReadScope(actor.id, target).catch(() => false));
     if (!refusal) {
       if (status.role) adminRoleByRequest.set(ctx.req, status.role);
@@ -65,9 +63,13 @@ export async function authorizeAdmin(
   return null;
 }
 
+export async function actsAsManager(ctx: Pick<ApiCtx, "deps" | "req">, actor: Pick<Principal, "id">): Promise<boolean> {
+  return (await adminScopeReader(ctx, actor)) !== null;
+}
+
 export async function adminScopeReader(
   ctx: Pick<ApiCtx, "deps" | "req">,
-  actor: Principal,
+  actor: Pick<Principal, "id">,
 ): Promise<((scope: string) => Promise<boolean>) | null> {
   const admin = ctx.deps.admin;
   if (!admin) return null;

@@ -7290,7 +7290,6 @@
           }
           s.views.forEach((v) => {
             if (v === "design-system" && !permissions.includes("inbox")) return;
-            if (v === "spend" && isManager()) return;
             const b = document.createElement("button");
             b.className = "tab" + (s.label ? "" : " tab-top") + (v === view ? " active" : "");
             if (v === "design-system") b.classList.add("tab-footer");
@@ -7550,7 +7549,6 @@
       }
       function setView(v) {
         if (v === "design-system" && !permissions.includes("inbox")) return;
-        if (v === "spend" && isManager()) return;
         go({
           view: v,
           scope: v === "history" || v === "errors" ? "org:" + orgId : scope,

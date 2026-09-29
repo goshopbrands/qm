@@ -1027,7 +1027,12 @@ export function createSessionMethods(
         throw new AdminError(403, "promoting a skill org-wide takes a live person, never an autonomous trigger");
       if (!deps.admin) throw new Error("org promotion requires an admin service");
       const status = await deps.admin.adminStatusOf({ id: actorId, type: "internal" });
-      if (status.role !== "org_admin") throw new AdminError(403, "only an org admin can promote a skill org-wide");
+      if (!status.isAdmin) throw new AdminError(403, "only an org admin can promote a skill org-wide");
+      if (status.role !== "org_admin") {
+        const source = await deps.skills.get(id);
+        if (!source || !(await deps.admin.canReadScope(actorId, source.scopeId)))
+          throw new AdminError(403, "a manager can only promote skills from spaces they can read");
+      }
       const promoted = await deps.skills.promote(id, targetScopeId);
       deps.auditLog.record({
         at: Date.now(),
