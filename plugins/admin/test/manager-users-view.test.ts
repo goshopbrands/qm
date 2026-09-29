@@ -55,3 +55,29 @@ test("an org admin can make a member a manager, and revoke a manager while only 
   ]);
   f.dom.window.close();
 });
+
+test("a user page stays clean when the keychain is refused to the viewer", async () => {
+  const f = litFixture();
+  await f.ui.userDetail.detail(f.root, "mgr-mia", {
+    pageShell() {},
+    current: () => true,
+    labelRole: () => "org manager",
+    scopeKind: () => "personal",
+    fmtTime: String,
+    plural: (n: number, noun: string) => `${n} ${noun}s`,
+    stateToUrl: ({ view }: any) => `/admin/${view}`,
+    webUiAsButton: () => f.document.createDocumentFragment(),
+    api: (_method: string, path: string) =>
+      Promise.resolve(
+        path.startsWith("/api/keychain")
+          ? { ok: false, status: 403, data: { message: "this admin action is limited to org admins" } }
+          : { ok: true, data: { principalId: "mgr-mia", scopeId: "personal:mgr-mia", stats: { sessions: 0 } } },
+      ),
+  });
+  assert.ok(!f.root.textContent!.includes("limited to org admins"));
+  assert.deepEqual(
+    [...f.root.querySelectorAll("h2")].map((e) => e.textContent),
+    ["Configuration", "Onboarding"],
+  );
+  f.dom.window.close();
+});

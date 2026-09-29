@@ -29,6 +29,7 @@ export async function detail(root: HTMLElement, principal: string, s: Record<str
   let resetHint = "";
   let credentials: any = null;
   let credentialError = "";
+  let credentialsRefused = false;
   let sort = "default";
   let selectedGrant: any = null;
   let usage: any = null;
@@ -103,6 +104,7 @@ export async function detail(root: HTMLElement, principal: string, s: Record<str
     draw();
   }
   function keychain() {
+    if (credentialsRefused) return "";
     if (credentialError) return credentialError;
     if (!credentials) return "Loading credentials and grants…";
     if (credentials.enabled === false) return html`<div><p class="empty">Keychain is not enabled.</p></div>`;
@@ -314,8 +316,9 @@ export async function detail(root: HTMLElement, principal: string, s: Record<str
   draw();
   try {
     const result = await s.api("GET", "/api/keychain?principal=" + encodeURIComponent(d.principalId || principal));
-    if (!result.ok) throw new Error(result.data?.message || "Failed to load credentials and grants.");
-    credentials = result.data || {};
+    if (result.status === 403) credentialsRefused = true;
+    else if (!result.ok) throw new Error(result.data?.message || "Failed to load credentials and grants.");
+    else credentials = result.data || {};
   } catch (error) {
     credentialError = (error as Error).message || "Failed to load credentials and grants.";
   }
