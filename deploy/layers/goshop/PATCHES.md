@@ -120,9 +120,10 @@ upstream images that lack this patch.
 
 The other four IDs in the list are archived test deployments.
 
-**Retirement signal.** `check-patches.sh` reports a migrate candidate when upstream's
-`src/deploy/fly-deploy-provider.ts` mentions `dataDir`, meaning upstream Fly apps may get
-durable storage, and lists upstream commits touching that provider.
+**Retirement signal.** Upstream v0.1.13 already has opt-in durable `/data` for its Fly provider,
+but documents it as a prototype. `check-patches.sh` reports a migrate candidate when
+`docs/qa/fly-published-apps.md` stops calling it a prototype, and lists upstream commits touching
+that provider.
 
 **Retirement steps.**
 

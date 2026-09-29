@@ -39,7 +39,7 @@ trap 'git -C "$root" worktree remove --force "$tree" >/dev/null 2>&1 || true; rm
 git worktree add --detach --quiet "$tree" "$ref"
 cp plugins/portal/test/apps-host-forwarding.test.ts "$tree/plugins/portal/test/"
 ln -s "$root/node_modules" "$tree/node_modules"
-npm ci --prefix "$tree/plugins/portal" --ignore-scripts --no-audit --no-fund --silent >/dev/null 2>&1 || {
+(cd "$tree/plugins/portal" && npm ci --ignore-scripts --no-audit --no-fund --silent >/dev/null 2>&1) || {
   echo "  PROBE ERROR: could not install $ref's portal dependencies (npm ci failed; network?)"
   exit 1
 }
@@ -63,11 +63,14 @@ report_touches src/deploy/fly-deploy-provider.ts src/deploy/deploy-provider.ts s
   src/api/routes/deploy-releases.ts src/api/routes/index.ts src/auth/capability-token.ts src/config.ts \
   src/deploy/deploy-service.ts src/tools/primitives.ts src/wiring.ts
 provider="$(git show "$ref:src/deploy/fly-deploy-provider.ts" 2>/dev/null || true)"
+qa="$(git show "$ref:docs/qa/fly-published-apps.md" 2>/dev/null || true)"
 if [ -z "$provider" ]; then
   echo "  PROBE ERROR: $ref has no src/deploy/fly-deploy-provider.ts — upstream reorganized Fly deploys; inspect before deciding"
   review=1
+elif grep -q dataDir <<<"$provider" && grep -qi prototype <<<"$qa"; then
+  echo "  still needed: $ref's durable Fly app data is still an opt-in prototype (docs/qa/fly-published-apps.md)"
 elif grep -q dataDir <<<"$provider"; then
-  echo "  MIGRATE CANDIDATE: $ref's Fly deploy provider mentions dataDir — upstream Fly apps may now get durable storage"
+  echo "  MIGRATE CANDIDATE: $ref's durable Fly app data is no longer described as a prototype — plan the legacy app migration"
   review=1
 else
   echo "  still needed: $ref's Fly deploy provider has no durable app data"
