@@ -74,10 +74,7 @@ async function call(
       managesScope: async () => managesScope,
       samePerson: async (a: string, b: string) => a === b,
     },
-    deps: {
-      loops: deps,
-      admin: { adminStatusOf: async () => (isAdmin ? { isAdmin, role: "org_admin" } : { isAdmin }) },
-    },
+    deps: { loops: deps, admin: { adminStatusOf: async () => ({ isAdmin }) } },
   } as unknown as ApiCtx;
   await found.route.handle(ctx);
   return out;

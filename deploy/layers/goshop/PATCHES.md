@@ -231,53 +231,47 @@ need a core patch, since a layer cannot override a live seed skill by name.
 
 **Status:** active since 2026-09-25.
 
-**Change.** A second grant role, `org_manager`, alongside upstream's `org_admin`. Managers use
-the admin dashboard, with three differences from an org admin: they cannot grant or revoke
-roles (including inviting an external user as org admin), they cannot impersonate, and
-conversation data is limited to scopes they could read as a member (upstream's
-`canReadScope`: org-wide, public channels, and private channels, group DMs, and DMs they
-belong to). Managers also cannot reset or edit another user's personal data, redirect cron
-output, import or sync skill packs into scopes, read raw model requests, or use admin powers
-through the agent (the orchestrator, agent API listing, and unattended cron grants treat only
-`org_admin` as an admin). Managers keep org-wide settings (providers, models, MCP servers,
-Slack app, org instructions and memory, egress, credentials): decided 2026-09-25, relying on
-the audit log. Org admins are unchanged. Roles are granted in the dashboard's Users view;
-`ADMIN_GRANTS` also accepts `:org_manager`.
+**Change.** A second grant role, `org_manager`, alongside upstream's `org_admin`. A manager has
+an org admin's powers, in the dashboard and through the agent, except in two areas.
 
-Enforcement sits in `authorizeAdmin`, which every admin route calls. A manager's agent capability
-token is refused outright there, so a manager's admin powers exist only in the dashboard; `whoami`
-does not go through `authorizeAdmin` and still answers the agent. Transcripts opened by a manager
-leave out the raw model requests attached to deliveries, matching the denied `/llm` route. For managers it looks up
-the request in the table in `src/admin/manager-access.ts`. Every admin route is classified
-there as `allow`, `deny`, a scope check, or `narrowed` (the handler filters or checks the
-record itself). A route missing from the table is refused to managers, so an upstream route
-added later stays org-admin only until someone classifies it.
+- **No role escalation.** Managers cannot grant or revoke roles (including inviting an external
+  user as org admin), impersonate, invite teammates (the response can return a working sign-in
+  link for any email, including an existing admin's), or create or delete principal links
+  (linking a sign-in onto an admin makes that sign-in the admin).
+- **Privacy.** Conversation data is limited to scopes they could read as a member (upstream's
+  `canReadScope`: org-wide, public channels, and private channels, group DMs, and DMs they
+  belong to). Org-wide logs need a specific scope. They cannot read raw model requests
+  (including those attached to deliveries in transcripts), the keychain, security flags, the
+  Slack mirror, ambient judgments, or ack-emoji picks, reset or edit another user's personal
+  data, or use another scope's sandbox through the agent (`canUseSandboxScope`).
+
+Everything else is allowed, decided 2026-09-29: org-wide settings, Spend, cron output
+destinations and model runtimes for crons in scopes they can read, skill-pack import, sync, and
+edit, auto-flagger tests, broker session revocation, promoting a skill org-wide, and unattended
+cron grants. The agent treats a manager as an admin, and the API enforces the limits above.
+Org admins are unchanged. Roles are granted in the dashboard's Users view; `ADMIN_GRANTS` also
+accepts `:org_manager`.
+
+Enforcement sits in `authorizeAdmin`, which every admin route calls, dashboard or agent. For
+managers it looks up the request in the table in `src/admin/manager-access.ts`. Every admin route
+is classified there as `allow`, `deny`, a scope check, or `narrowed` (the handler filters or
+checks the record itself). A route missing from the table is refused to managers, so an upstream
+route added later stays org-admin only until someone classifies it.
 
 **Files.** `src/admin/manager-access.ts` (new), `src/admin/admin-grant-store.ts`,
 `src/admin/admin-service.ts`, `src/api/routes/shared.ts`, `src/api/routes/admin/common.ts`,
 `src/api/routes/admin/scope-config.ts`, `src/api/routes/admin/memory.ts`,
 `src/api/routes/admin/files.ts`, `src/api/routes/admin/artifacts.ts`,
-`src/api/routes/admin/users.ts`, `src/api/routes/admin/sessions.ts`, `src/core/orchestrator.ts`,
-`src/api/routes/surface.ts`, `src/cron/authority.ts` (unattended cron grants need `org_admin`),
-`src/api/app-sessions.ts` (promoting a skill org-wide needs `org_admin`),
-`src/api/routes/admin/principal-links.ts` (an org admin sign-in cannot be linked onto a
+`src/api/routes/admin/users.ts`, `src/api/routes/admin/sessions.ts` (no raw model requests for
+managers), `src/api/routes/admin/principal-links.ts` (an org admin sign-in cannot be linked onto a
 non-admin identity), `src/wiring.ts` (`canUseSandboxScope` bypass is org admin only),
-`src/api/routes/admin/sessions.ts` (no raw model requests for managers),
 `plugins/portal/src/index.ts` (impersonation needs `org_admin`; the admin-login link checks
-`isAdmin` on the probe result), `plugins/admin/public/index.html`
-(role from whoami; managers get no "open web UI as" buttons and no Spend tab),
-`plugins/admin/ui/users.ts` (Make manager; Revoke removes every role the person holds; no role,
-impersonation, or teammate invite controls for managers), `plugins/admin/ui/user-detail.ts` (the
-keychain card is hidden when refused), and tests `test/admin-manager-role.test.ts`,
-`test/loop-routes.test.ts`, `plugins/portal/test/router.test.ts`,
+`isAdmin` on the probe result), `plugins/admin/public/index.html` (role from whoami; managers get
+no "open web UI as" buttons), `plugins/admin/ui/users.ts` (Make manager; Revoke removes both
+roles; no role, impersonation, or teammate invite controls for managers),
+`plugins/admin/ui/user-detail.ts` (the keychain card is hidden when refused), and tests
+`test/admin-manager-role.test.ts`, `plugins/portal/test/router.test.ts`,
 `plugins/portal/test/admin-login-role.test.ts`, `plugins/admin/test/manager-users-view.test.ts`.
-
-Routes classified in the v0.1.13 sync: managers may start the Slack install, read credential
-usage for scopes they can read, set a cron's model runtime for crons in scopes they can read, and
-list principal links. They may not open Spend (org-wide cost including private scope labels),
-invite teammates (the response can return a working sign-in link for any email, including an
-existing admin's), or create or delete principal links (linking a sign-in onto an admin makes
-that sign-in the admin).
 
 **On every upstream sync.** `check-patches.sh` lists admin routes and admin-status checks that
 upstream added. For each one, ask the operator whether managers should get it, then add the
