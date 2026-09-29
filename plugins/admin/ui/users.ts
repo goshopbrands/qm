@@ -120,29 +120,23 @@ export class UsersView {
     const confirmGrant = role === "org_manager" ? this.confirmManager : this.confirmAdmin;
     if (
       !(revoke
-        ? this.services.confirm(
-            "Revoke the " + this.services.labelRole(user.admin.role) + " role for " + user.principalId + "?",
-          )
+        ? this.services.confirm("Revoke every admin role " + user.principalId + " holds?")
         : confirmGrant.call(this, user.principalId))
     )
       return;
-    const held = (this.data.grants || []).filter((g: any) => g.principalId === user.principalId);
-    const revoked = held.length ? held : [user.admin];
-    const revokeGrant = (g: any) =>
-      this.services.api(
-        "DELETE",
-        "/api/grants/" +
-          encodeURIComponent(user.principalId) +
-          "?scope=" +
-          encodeURIComponent(g.scopeId) +
-          "&role=" +
-          encodeURIComponent(g.role),
-      );
     await this.action(user.principalId, async () => {
       let r: any;
       if (revoke) {
-        for (const g of revoked) {
-          r = await revokeGrant(g);
+        for (const held of ["org_admin", "org_manager"]) {
+          r = await this.services.api(
+            "DELETE",
+            "/api/grants/" +
+              encodeURIComponent(user.principalId) +
+              "?scope=" +
+              encodeURIComponent(this.services.orgScope) +
+              "&role=" +
+              held,
+          );
           if (!r.ok) break;
         }
       } else
@@ -151,8 +145,8 @@ export class UsersView {
           role,
           scopeId: this.services.orgScope,
         });
-      if (r.ok) await this.refresh();
-      else this.feedback(r.data?.message || "Could not update admin access.", "err");
+      await this.refresh();
+      if (!r.ok) this.feedback(r.data?.message || "Could not update admin access.", "err");
     });
   }
   async revoke(member: any) {

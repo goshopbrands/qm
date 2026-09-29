@@ -51,6 +51,7 @@ test("an org admin can make a member a manager, and revoke a manager while only 
   await controller.admin(users[1], event);
   assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
     ["POST", "/api/grants", { principalId: "user-uma", role: "org_manager", scopeId: "org:test" }],
+    ["DELETE", "/api/grants/mgr-mia?scope=org%3Atest&role=org_admin"],
     ["DELETE", "/api/grants/mgr-mia?scope=org%3Atest&role=org_manager"],
   ]);
   f.dom.window.close();
@@ -82,7 +83,7 @@ test("a user page stays clean when the keychain is refused to the viewer", async
   f.dom.window.close();
 });
 
-test("revoking someone who holds both roles removes both", async () => {
+test("revoking removes both roles, however the grants are stored", async () => {
   const calls: unknown[] = [];
   const f = litFixture();
   const both = { principalId: "pat", admin: { isAdmin: true, scopeId: "org:test", role: "org_admin" } };
@@ -91,7 +92,7 @@ test("revoking someone who holds both roles removes both", async () => {
     {
       users: [both],
       grants: [
-        { principalId: "pat", role: "org_admin", scopeId: "org:test" },
+        { principalId: "oidc:issuer:pat", role: "org_admin", scopeId: "org:test" },
         { principalId: "pat", role: "org_manager", scopeId: "org:test" },
         { principalId: "admin-alice", role: "org_admin", scopeId: "org:test" },
       ],

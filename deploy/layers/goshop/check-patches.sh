@@ -67,7 +67,7 @@ qa="$(git show "$ref:docs/qa/fly-published-apps.md" 2>/dev/null || true)"
 if [ -z "$provider" ]; then
   echo "  PROBE ERROR: $ref has no src/deploy/fly-deploy-provider.ts — upstream reorganized Fly deploys; inspect before deciding"
   review=1
-elif grep -q dataDir <<<"$provider" && grep -qi prototype <<<"$qa"; then
+elif grep -q dataDir <<<"$provider" && grep FLY_DEPLOY_DATA_VOLUME_SIZE_GB <<<"$qa" | grep -qi prototype; then
   echo "  still needed: $ref's durable Fly app data is still an opt-in prototype (docs/qa/fly-published-apps.md)"
 elif grep -q dataDir <<<"$provider"; then
   echo "  MIGRATE CANDIDATE: $ref's durable Fly app data is no longer described as a prototype — plan the legacy app migration"

@@ -122,7 +122,8 @@ The other four IDs in the list are archived test deployments.
 
 **Retirement signal.** Upstream v0.1.13 already has opt-in durable `/data` for its Fly provider,
 but documents it as a prototype. `check-patches.sh` reports a migrate candidate when
-`docs/qa/fly-published-apps.md` stops calling it a prototype, and lists upstream commits touching
+the `FLY_DEPLOY_DATA_VOLUME_SIZE_GB` paragraph of `docs/qa/fly-published-apps.md` stops calling it a
+prototype, and lists upstream commits touching
 that provider.
 
 **Retirement steps.**
