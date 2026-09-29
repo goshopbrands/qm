@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { orgId as configOrgId } from "../config.ts";
 import type { Principal, ScopeId } from "../types.ts";
 import { parseScopeId, scopeId } from "../types.ts";
@@ -37,6 +38,7 @@ export interface AdminService {
   canAdminister(principal: Principal, target: ScopeId): Promise<boolean>;
   adminStatusOf(principal: Principal): Promise<AdminStatus>;
   listGrants(): Promise<AdminGrant[]>;
+  provisionTrustedEntry(issuer: string, subject: string): Promise<{ grant: AdminGrant; created: boolean }>;
   createGrant(actor: Principal, input: { principalId: string; role: AdminRole; scopeId: ScopeId }): Promise<AdminGrant>;
   revokeGrant(actor: Principal, principalId: string, scope: ScopeId, role: AdminRole): Promise<void>;
   canReadScope(principalId: string, scope: ScopeId): Promise<boolean>;
@@ -72,6 +74,7 @@ export function bootAdminGrantSeed(rawAdminGrants: string | undefined, orgId: st
 export interface AdminServiceOptions {
   now?: () => number;
   canReadScope?: (principalId: string, scope: ScopeId) => Promise<boolean>;
+  trustedOidcAdminIssuer?: string;
 }
 
 export function createAdminService(store?: AdminGrantStore, opts: AdminServiceOptions = {}): AdminService {
@@ -101,6 +104,24 @@ export function createAdminService(store?: AdminGrantStore, opts: AdminServiceOp
     },
     async adminStatusOf(principal) {
       return adminStatusFromGrants(await grants.list(), principal.id);
+    },
+    async provisionTrustedEntry(issuer, subject) {
+      if (!opts.trustedOidcAdminIssuer || issuer !== opts.trustedOidcAdminIssuer)
+        throw new AdminError(403, "trusted administrator provisioning is not enabled for this issuer");
+      if (!subject || subject.length > 255 || Buffer.from(subject).toString("utf8") !== subject)
+        throw new AdminError(400, "invalid trusted subject");
+      const principalId = `oidc:${createHash("sha256").update(issuer).digest("hex")}:${Buffer.from(subject).toString("base64url")}`;
+      const existing = (await grants.list()).find((g) => g.principalId === principalId && g.role === "org_admin");
+      if (existing) return { grant: existing, created: false };
+      const grant: AdminGrant = {
+        principalId,
+        role: "org_admin",
+        scopeId: scopeId("org", orgId),
+        grantedBy: `trusted-oidc:${issuer}`,
+        createdAt: now(),
+      };
+      const created = await grants.addIfAbsent(grant);
+      return { grant, created };
     },
     listGrants() {
       return grants.list();

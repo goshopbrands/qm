@@ -2,6 +2,7 @@ import type { EgressPolicy, WorkspaceLayer } from "../types.ts";
 
 export interface SandboxHandle {
   resourceId?: string;
+  providerSandboxId?: string;
   id: string;
   rootDir: string;
   homeDir?: string;
@@ -155,6 +156,15 @@ export interface ComputerStatus {
   guestResponsive: boolean;
   probeError?: string;
   pressure?: ExecPressure;
+  resources?: ComputerResources;
+}
+
+interface ComputerResources {
+  cpuUsedPct: number;
+  memUsedMb: number;
+  memTotalMb: number;
+  diskUsedGb: number;
+  diskTotalGb: number;
 }
 
 export type ComputerVerdict = "ok" | "wedged" | "down";
@@ -176,7 +186,7 @@ export interface TeardownOptions {
 
 export interface Sandbox {
   readonly profile: AgentComputerProfile;
-  profileFor?(scopeId: string): Promise<AgentComputerProfile>;
+  profileFor?(scopeId: string, sandboxId?: string): Promise<AgentComputerProfile>;
   provision(layers: WorkspaceLayer[], opts?: ProvisionOptions): Promise<SandboxHandle>;
   run(handle: SandboxHandle, command: string, opts?: ExecOptions): Promise<ExecResult>;
   readFile(handle: SandboxHandle, relPath: string): Promise<string | null>;
@@ -188,6 +198,7 @@ export interface Sandbox {
   importFiles?(handle: SandboxHandle, entries: ReadonlyArray<{ path: string; data: Uint8Array }>): Promise<void>;
   listDir(handle: SandboxHandle, relDir: string): Promise<string[]>;
   removeDir(handle: SandboxHandle, relDir: string): Promise<void>;
+  removeDirAndList?(handle: SandboxHandle, removeRelDir: string, listRelDir: string): Promise<string[]>;
   exportFiles?(handle: SandboxHandle, opts?: AgentComputerExportOptions): Promise<AgentComputerExportEntry[]>;
   startRegisteredProcess?(
     handle: SandboxHandle,

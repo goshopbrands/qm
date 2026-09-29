@@ -24,11 +24,25 @@ interface SharingSourcesInput {
   isCurrentSharedScopeMember?: IsCurrentSharedScopeMember;
 }
 
+export async function isOpenScopeMember(input: {
+  actorId: string;
+  scope: ScopeId;
+  config: Pick<ScopedConfigStore, "resolveSharingPostureDurable">;
+  isCurrentSharedScopeMember: IsCurrentSharedScopeMember;
+}): Promise<boolean> {
+  const { kind } = parseScopeId(input.scope);
+  return (
+    (kind === "channel" || kind === "group") &&
+    (await input.isCurrentSharedScopeMember(input.actorId, input.scope)) &&
+    (await input.config.resolveSharingPostureDurable(personalScope(input.actorId), input.scope)) === "open"
+  );
+}
+
 export async function sharingSourcesForTurn(input: SharingSourcesInput): Promise<ScopeId[]> {
   if (
     input.posture !== "open" ||
     input.actor.type !== "internal" ||
-    input.origin.kind !== "human" ||
+    (input.origin.kind !== "human" && !(input.origin.kind === "ambient" && input.origin.live === true)) ||
     !input.trustedLiveHuman ||
     !input.config ||
     !input.isCurrentSharedScopeMember

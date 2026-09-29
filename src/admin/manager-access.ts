@@ -34,6 +34,7 @@ const RULES: readonly ManagerRule[] = [
   rule("GET", "/v1/admin/slack-installation", allow),
   rule("PUT", "/v1/admin/slack-installation", allow),
   rule("DELETE", "/v1/admin/slack-installation", allow),
+  rule("POST", "/v1/admin/slack-installation/start", allow),
   rule("GET", "/v1/admin/slack-emoji", allow),
   rule("GET", "/v1/admin/model-providers", allow),
   rule("PUT", "/v1/admin/model-providers/:provider", allow),
@@ -53,6 +54,7 @@ const RULES: readonly ManagerRule[] = [
   rule("GET", "/v1/admin/retention", allow),
   rule("GET", "/v1/admin/users", allow),
   rule("GET", "/v1/admin/directory", allow),
+  rule("GET", "/v1/admin/principal-links", allow),
   rule("POST", "/v1/admin/external-users", allow),
   rule("DELETE", "/v1/admin/external-users/:email", allow),
   rule("GET", "/v1/admin/sandbox-routes", allow),
@@ -62,6 +64,7 @@ const RULES: readonly ManagerRule[] = [
   rule("DELETE", "/v1/admin/skill-packs/:id", allow),
 
   rule("GET", "/v1/admin/scopes/:scope", requestedScope),
+  rule("GET", "/v1/admin/scopes/:scope/credential-usage", requestedScope),
   rule("PUT", "/v1/admin/scopes/:scope/:resource", requestedScope),
   rule("GET", "/v1/admin/memory", requestedScope),
   rule("PUT", "/v1/admin/memory", requestedScope),
@@ -105,6 +108,7 @@ const RULES: readonly ManagerRule[] = [
   rule("GET", "/v1/admin/sessions/:id", narrowed),
   rule("GET", "/v1/admin/skills/:id", narrowed),
   rule("DELETE", "/v1/admin/skills/:id", narrowed),
+  rule("PUT", "/v1/admin/crons/:id/runtime", narrowed),
 
   rule("GET", "/v1/admin/sessions/:id/llm", deny),
   rule("PUT", "/v1/admin/crons/:id/destination", deny),
@@ -124,6 +128,10 @@ const RULES: readonly ManagerRule[] = [
   rule("DELETE", "/v1/admin/grants/:principalId", deny),
   rule("POST", "/v1/admin/impersonate", deny),
   rule("POST", "/v1/admin/impersonate/stop", deny),
+  rule("GET", "/v1/admin/spend", deny),
+  rule("POST", "/v1/admin/users/invite", deny),
+  rule("POST", "/v1/admin/principal-links", deny),
+  rule("DELETE", "/v1/admin/principal-links/:principalId", deny),
 ];
 
 function decodeSegment(segment: string): string | null {

@@ -45,7 +45,10 @@ function declaresFrameAncestors(headers: Record<string, string | string[]>): boo
   return /(^|[;,])\s*frame-ancestors\s/i.test(text);
 }
 
-function framedHeaders(req: IncomingMessage, headers: Record<string, string>): Record<string, string> {
+function framedHeaders(
+  req: IncomingMessage,
+  headers: Record<string, string | string[]>,
+): Record<string, string | string[]> {
   const framed = Object.fromEntries(
     Object.entries(headers).filter(([name]) => !/^(?:content-length|transfer-encoding)$/i.test(name)),
   );
@@ -63,7 +66,7 @@ function relay(
     hostname: string;
     port?: string;
     path: string;
-    headers: Record<string, string>;
+    headers: Record<string, string | string[]>;
     honorFramePolicy?: boolean;
     forwardCookies?: boolean;
   },
@@ -115,6 +118,7 @@ export interface SurfaceTarget {
   displayName?: string;
   impersonator?: string;
   identitySecret?: string;
+  authenticatedPrincipal?: string;
   nowMs?: number;
 }
 
@@ -130,6 +134,7 @@ export function proxyToSurface(req: IncomingMessage, res: ServerResponse, t: Sur
     base[PORTAL_IDENTITY_HEADER] = mintPortalIdentity(
       {
         p: t.principal,
+        ...(t.authenticatedPrincipal ? { authenticatedAs: t.authenticatedPrincipal } : {}),
         ...(t.displayName ? { n: t.displayName } : {}),
         ...(t.impersonator ? { imp: t.impersonator } : {}),
         exp: now + IDENTITY_TTL_MS,
@@ -215,45 +220,6 @@ export function proxyToDeployment(req: IncomingMessage, res: ServerResponse, t: 
   });
 }
 
-const APPS_HOST_DROPPED_REQUEST_HEADERS = new Set([
-  "connection",
-  "keep-alive",
-  "proxy-authorization",
-  "proxy-connection",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-  "x-signature",
-  "x-timestamp",
-  "x-as-principal",
-  "x-admin-actor",
-  "x-agent-capability",
-  PORTAL_IDENTITY_HEADER,
-]);
-
-export function isAppsHost(hostHeader: string | undefined, appsDomain: string | undefined): boolean {
-  if (!appsDomain) return false;
-  return (hostHeader ?? "").split(":")[0]!.toLowerCase().endsWith(`.${appsDomain.toLowerCase()}`);
-}
-
-export function proxyToAppsHost(req: IncomingMessage, res: ServerResponse, coreBase: string): void {
-  const core = new URL(coreBase);
-  const headers: Record<string, string> = {};
-  for (const [name, value] of Object.entries(req.headers)) {
-    if (value === undefined || APPS_HOST_DROPPED_REQUEST_HEADERS.has(name)) continue;
-    headers[name] = Array.isArray(value) ? value.join(", ") : value;
-  }
-  relay(req, res, {
-    protocol: core.protocol,
-    hostname: core.hostname,
-    port: requestPort(core),
-    path: req.url ?? "/",
-    headers,
-    forwardCookies: true,
-  });
-}
-
 export interface UpstreamTarget {
   forwardCookies?: boolean;
   baseUrl: string;
@@ -286,3 +252,35 @@ export function proxyToUpstream(
 }
 
 export const FORWARD_BROKER_HEADERS = ["accept", "accept-language", "user-agent", "content-type", "content-length"];
+
+export function proxyToAppHost(req: IncomingMessage, res: ServerResponse, coreBase: string): void {
+  const upstream = new URL(coreBase);
+  const blocked = new Set([
+    ...DROP_RESPONSE_HEADERS,
+    "x-signature",
+    "x-timestamp",
+    "x-as-principal",
+    "x-admin-actor",
+    "x-agent-capability",
+    PORTAL_IDENTITY_HEADER,
+    "x-qm-app-host",
+    "forwarded",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-for",
+    ...(req.headers.connection ?? "").split(",").map((name) => name.trim().toLowerCase()),
+  ]);
+  const headers: Record<string, string | string[]> = { "x-qm-app-host": "1" };
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (value !== undefined && !blocked.has(name)) headers[name] = value;
+  }
+  res.removeHeader("x-frame-options");
+  relay(req, res, {
+    protocol: upstream.protocol,
+    hostname: upstream.hostname,
+    port: requestPort(upstream),
+    path: req.url ?? "/",
+    headers,
+    forwardCookies: true,
+  });
+}

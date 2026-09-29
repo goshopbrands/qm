@@ -324,7 +324,8 @@ export async function getAdminSession(ctx: ApiCtx): Promise<void> {
   const scoped = await requireAdminSession(ctx, id);
   if (!scoped) return;
   const { actor, record: session } = scoped;
-  const narrowed = parseScopeId(scoped.scope).kind === "org" && (await adminScopeReader(ctx, actor)) !== null;
+  const manager = (await adminScopeReader(ctx, actor)) !== null;
+  const narrowed = parseScopeId(scoped.scope).kind === "org" && manager;
   const scope = narrowed ? "" : scoped.scope;
   audit(deps, { principalId: actor.id, action: "session.read", resource: id, scopeLabel: session.scopeId });
   const want = Math.max(1, Number(url.searchParams.get("limit")) || TRANSCRIPT_LIMIT_DEFAULT);
@@ -361,7 +362,7 @@ export async function getAdminSession(ctx: ApiCtx): Promise<void> {
         provenance: d.provenance ?? null,
         origin: await deliveryOrigin(app, d, scope),
         ...(provenance?.sourceSession ? { sourceSession: provenance.sourceSession } : {}),
-        ...(provenance?.llmRequests ? { llmRequests: provenance.llmRequests } : {}),
+        ...(provenance?.llmRequests && !manager ? { llmRequests: provenance.llmRequests } : {}),
       };
     }),
   );

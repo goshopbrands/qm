@@ -3,7 +3,7 @@ import type { Principal } from "../../types.ts";
 import type { AuditEvent } from "../../audit/audit-log.ts";
 import { adminStatusFromGrants } from "../../admin/admin-service.ts";
 import { managerRefusal } from "../../admin/manager-access.ts";
-import { samePerson } from "../../directory/person.ts";
+import { canonicalPerson, samePerson } from "../../directory/person.ts";
 import { isTerminal, type Run } from "../../runs/run-store.ts";
 import type { ServerDeps } from "../deps.ts";
 import type { ApiCtx } from "./route.ts";
@@ -17,7 +17,7 @@ export function audit(deps: ServerDeps, e: Omit<AuditEvent, "at">): void {
   deps.auditLog?.record({ at: Date.now(), ...e });
 }
 
-export function adminActorFrom(ctx: Pick<ApiCtx, "req" | "deps" | "capability" | "actor">): Principal | null {
+function rawAdminActor(ctx: Pick<ApiCtx, "req" | "deps" | "capability" | "actor">): Principal | null {
   if (ctx.capability) return { id: ctx.capability.actorId, type: "internal" };
   if (ctx.actor)
     return ctx.deps.admin?.resolveActor(`${ctx.actor.p}@${configOrgId()}`) ?? { id: ctx.actor.p, type: "internal" };
@@ -25,6 +25,11 @@ export function adminActorFrom(ctx: Pick<ApiCtx, "req" | "deps" | "capability" |
 }
 
 const adminRoleByRequest = new WeakMap<object, string>();
+const MANAGER_AGENT_REFUSED = "org managers use admin powers in the admin dashboard, not through the agent";
+export function adminActorFrom(ctx: Pick<ApiCtx, "req" | "deps" | "capability" | "actor">): Principal | null {
+  const actor = rawAdminActor(ctx);
+  return actor ? { ...actor, id: canonicalPerson(actor.id) } : null;
+}
 
 export async function authorizeAdmin(
   ctx: Pick<ApiCtx, "req" | "res" | "deps" | "capability" | "actor">,
@@ -44,9 +49,10 @@ export async function authorizeAdmin(
   }
   const status = actor ? adminStatusFromGrants(grants, actor.id) : null;
   if (actor && status?.isAdmin) {
-    const refusal =
-      status.role === "org_admin"
-        ? null
+    let refusal: string | null = null;
+    if (status.role !== "org_admin")
+      refusal = ctx.capability
+        ? MANAGER_AGENT_REFUSED
         : await managerRefusal(ctx.req, scope, (target) => admin.canReadScope(actor.id, target).catch(() => false));
     if (!refusal) {
       if (status.role) adminRoleByRequest.set(ctx.req, status.role);

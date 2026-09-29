@@ -25,6 +25,7 @@ test("mixed deployment providers preserve Git updates, restore, reach, profiles 
   const legacyIds = new Set([old.id]);
   const applied: string[] = [];
   const destroyed: string[] = [];
+  const alwaysOnChanges: string[] = [];
   let reconciles = 0;
   let resolutions = 0;
   const modern: DeployProvider = {
@@ -37,6 +38,9 @@ test("mixed deployment providers preserve Git updates, restore, reach, profiles 
       destroyed.push(`modern:${d.id}`);
     },
     logs: async () => "modern logs",
+    setAlwaysOn: async (d) => {
+      alwaysOnChanges.push(d.id);
+    },
   };
   const legacy: DeployProvider = {
     profile: { managedScaleToZero: true, inPlaceReconcile: true, dataDir: "/data" },
@@ -94,6 +98,9 @@ test("mixed deployment providers preserve Git updates, restore, reach, profiles 
   assert.equal(await service.reapIdleDeployments(60_000, Date.now() + 1_000_000), 1);
   assert.deepEqual(destroyed, [`modern:${fresh.id}`]);
   assert.equal((await store.get(old.id))!.status, "running");
+  await service.setDeploymentAlwaysOn(old.id, true);
+  assert.equal((await store.get(old.id))!.alwaysOn, true);
+  assert.deepEqual(alwaysOnChanges, []);
   await service.archiveDeployment(old.id);
   assert.equal((await store.get(old.id))!.endpoint, null);
   assert.deepEqual(destroyed, [`modern:${fresh.id}`, `legacy:${old.id}`]);
