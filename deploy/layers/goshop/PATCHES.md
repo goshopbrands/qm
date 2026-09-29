@@ -245,10 +245,20 @@ an org admin's powers, in the dashboard and through the agent, except in two are
   Slack mirror, ambient judgments, or ack-emoji picks, reset or edit another user's personal
   data, or use another scope's sandbox through the agent (`canUseSandboxScope`).
 
+Also under privacy: the auto-flagger test (it samples every scope's recent messages) stays org
+admin only, and the powers below are fenced to what the manager can read. Promoting a skill
+org-wide needs its source scope to be readable, skill-pack import targets must be readable,
+only the person who registered a pack can change its `url` or `ref` (the pack fetches with its
+creator's GitHub login), and cron output can go only to a readable channel, the manager, or the
+cron's owner, with no client-supplied audience.
+
 Everything else is allowed, decided 2026-09-29: org-wide settings, Spend, cron output
 destinations and model runtimes for crons in scopes they can read, skill-pack import, sync, and
-edit, auto-flagger tests, broker session revocation, promoting a skill org-wide, and unattended
-cron grants. The agent treats a manager as an admin, and the API enforces the limits above.
+edit, broker session revocation, promoting a skill org-wide, and unattended cron grants. The
+agent treats a manager as an admin, and the API enforces the limits above. Known risk: a
+manager can write org-wide skills, org memory, and synced packs that reach every agent turn,
+including org admins', so a malicious manager could try prompt injection against an admin's
+agent; the audit log records who wrote them.
 Org admins are unchanged. Roles are granted in the dashboard's Users view; `ADMIN_GRANTS` also
 accepts `:org_manager`.
 
@@ -263,7 +273,8 @@ route added later stays org-admin only until someone classifies it.
 `src/api/routes/admin/scope-config.ts`, `src/api/routes/admin/memory.ts`,
 `src/api/routes/admin/files.ts`, `src/api/routes/admin/artifacts.ts`,
 `src/api/routes/admin/users.ts`, `src/api/routes/admin/sessions.ts` (no raw model requests for
-managers), `src/api/routes/admin/principal-links.ts` (an org admin sign-in cannot be linked onto a
+managers), `src/api/routes/skill-packs.ts` (readable import targets; pack source changes by its
+creator only), `src/api/app-sessions.ts` (promotion from readable scopes), `src/api/routes/admin/principal-links.ts` (an org admin sign-in cannot be linked onto a
 non-admin identity), `src/wiring.ts` (`canUseSandboxScope` bypass is org admin only),
 `plugins/portal/src/index.ts` (impersonation needs `org_admin`; the admin-login link checks
 `isAdmin` on the probe result), `plugins/admin/public/index.html` (role from whoami; managers get

@@ -182,17 +182,58 @@ test("an org admin can grant and revoke the manager role, and still impersonates
 test("a manager can promote skills org-wide and give their crons unattended grants", async () => {
   const s = await start();
   try {
-    await assert.rejects(s.built.app.promoteSkill("any-skill", ORG, OTHER, true), /only an org admin/);
-    await assert.rejects(
-      s.built.app.promoteSkill("any-skill", ORG, MANAGER, true),
-      (e) => !/only an org/.test(String(e)),
-    );
+    const skill = async (owner: string) =>
+      (await s.built.app.createOwnedSkill({
+        principalId: owner,
+        name: `notes-${owner}`,
+        description: "notes",
+        body: `${owner} private`,
+      }))!;
+    const theirs = await skill(OTHER);
+    const mine = await skill(MANAGER);
+    await assert.rejects(s.built.app.promoteSkill(mine.id, ORG, OTHER, true), /only an org admin/);
+    await assert.rejects(s.built.app.promoteSkill(theirs.id, ORG, MANAGER, true), /spaces they can read/);
+    assert.equal((await s.built.app.promoteSkill(mine.id, ORG, MANAGER, true)).scopeId, ORG);
     const own = (owner: string) => ({ owner, ownerScopeId: `personal:${owner}` });
     const live = (actorId: string) => ({ actorId, liveActor: true });
     assert.equal(await unattendedGrantRefusal(s.built.app, s.built.admin, own(MANAGER), live(MANAGER)), null);
     assert.match(
       String(await unattendedGrantRefusal(s.built.app, s.built.admin, own(OTHER), live(OTHER))),
       /current org admin/,
+    );
+  } finally {
+    await s.close();
+  }
+});
+
+test("a manager imports skill packs only into spaces they can read and cannot repoint another person's pack", async () => {
+  const s = await start();
+  try {
+    const pack = await s.built.app.registerSkillPack({
+      kind: "git",
+      url: "https://github.com/acme/skills-pack.git",
+      ref: "main",
+      syncMode: "pinned",
+      trustTier: "third-party",
+      targetScopeId: ORG,
+      subset: "all",
+      createdBy: "admin-alice",
+    });
+    const importInto = (scopeIds: string[]) =>
+      s.asManager("POST", `/v1/admin/skill-packs/${pack.id}/import`, { selected: "all", scopeIds });
+    assert.equal((await importInto([`personal:${OTHER}`])).status, 403);
+    assert.equal((await importInto(["channel:CPUB", "channel:CHR"])).status, 403);
+    assert.notEqual((await importInto(["channel:CPUB"])).status, 403);
+    const repoint = await s.asManager("PATCH", `/v1/admin/skill-packs/${pack.id}`, {
+      url: "https://github.com/acme/private.git",
+    });
+    assert.equal(repoint.status, 403);
+    assert.equal((await s.built.app.getSkillPack(pack.id))!.url, "https://github.com/acme/skills-pack.git");
+    assert.equal((await s.asManager("PATCH", `/v1/admin/skill-packs/${pack.id}`, { syncMode: "tracked" })).status, 200);
+    assert.equal(
+      (await s.asManager("POST", `/v1/admin/scopes/${q(ORG)}/auto-flagger/test`, {})).status,
+      403,
+      "the auto flagger test samples every scope's messages",
     );
   } finally {
     await s.close();
@@ -211,6 +252,16 @@ test("a manager can open Spend and redirect output only for crons in spaces they
       });
     assert.equal((await redirect("channel:CPUB")).status, 200);
     assert.equal((await redirect("group:GTHEIRS")).status, 403);
+    const send = (destination: unknown) =>
+      s.asManager("PUT", `/v1/admin/crons/${q(inScope("channel:CPUB"))}/destination?scope=${q(ORG)}`, {
+        destination,
+      });
+    assert.equal((await send({ type: "slack", target: "CLEADS" })).status, 200);
+    assert.equal((await send({ type: "slack", target: "CHR" })).status, 403);
+    assert.equal((await send({ type: "principal", target: "outsider@example.com" })).status, 403);
+    assert.equal((await send({ type: "principal", target: MANAGER })).status, 200);
+    assert.equal((await send({ type: "principal", target: OTHER })).status, 200);
+    assert.equal((await send({ type: "principal", target: MANAGER, audienceScopeId: "channel:CPUB" })).status, 403);
   } finally {
     await s.close();
   }

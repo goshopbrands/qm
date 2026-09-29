@@ -66,7 +66,6 @@ const RULES: readonly ManagerRule[] = [
   rule("POST", "/v1/admin/skill-packs/:id/sync", allow),
   rule("PATCH", "/v1/admin/skill-packs/:id", allow),
   rule("POST", "/v1/auth/broker/sessions/revoke", allow),
-  rule("POST", "/v1/admin/scopes/:scope/auto-flagger/test", allow),
   rule("GET", "/v1/admin/spend", allow),
 
   rule("GET", "/v1/admin/scopes/:scope", requestedScope),
@@ -118,6 +117,7 @@ const RULES: readonly ManagerRule[] = [
   rule("PUT", "/v1/admin/crons/:id/destination", narrowed),
 
   rule("GET", "/v1/admin/sessions/:id/llm", deny),
+  rule("POST", "/v1/admin/scopes/:scope/auto-flagger/test", deny),
   rule("GET", "/v1/admin/keychain", deny),
   rule("GET", "/v1/admin/security/flags", deny),
   rule("POST", "/v1/admin/security/release", deny),

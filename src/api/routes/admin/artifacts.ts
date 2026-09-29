@@ -4,10 +4,22 @@ import { errMessage } from "../../../util/errors.ts";
 import { parseScopeId, type Destination } from "../../../types.ts";
 import { publicUrlOf } from "../../../deploy/deploy-store.ts";
 import { sendJson } from "../../http.ts";
-import { audit, readableByAdmin, requireScopedAdmin } from "../shared.ts";
+import { adminScopeReader, audit, readableByAdmin, requireScopedAdmin } from "../shared.ts";
 import { type ApiCtx } from "../route.ts";
 import { notifyOwnerOfCronEdit } from "../../../triggers/edit-notice.ts";
 import { requireScopedResource } from "./common.ts";
+
+async function managerMayDeliverTo(
+  app: ApiCtx["app"],
+  canRead: (scope: string) => Promise<boolean>,
+  d: Destination,
+  people: string[],
+): Promise<boolean> {
+  if (d.audienceScopeId !== undefined || d.onBehalfOf !== undefined) return false;
+  if (d.type === "slack") return canRead(`channel:${d.target}`);
+  for (const person of people) if (await app.samePerson(d.target, person)) return true;
+  return false;
+}
 
 function isAdminCronDestination(v: unknown): v is Destination {
   if (typeof v !== "object" || v === null) return false;
@@ -146,6 +158,12 @@ export async function putAdminCronDestination(ctx: ApiCtx): Promise<void> {
     });
   }
   const next = destination === null ? undefined : destination;
+  const canRead = await adminScopeReader(ctx, actor);
+  if (next && canRead && !(await managerMayDeliverTo(app, canRead, next, [actor.id, cron.owner])))
+    return sendJson(res, 403, {
+      error: "forbidden",
+      message: "send cron output to a channel you can read, yourself, or the cron's owner",
+    });
   if (isDeepStrictEqual(cron.destination, next))
     return sendJson(res, 200, { cron: { id: cron.id, destination: cron.destination } });
   const updated = await app.setCronDestination(id, next);
