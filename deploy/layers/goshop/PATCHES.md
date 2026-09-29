@@ -249,7 +249,8 @@ Also under privacy: the auto-flagger test (it samples every scope's recent messa
 admin only, and the powers below are fenced to what the manager can read. Promoting a skill
 org-wide needs its source scope to be readable, skill-pack import targets must be readable,
 only the person who registered a pack can change its `url` or `ref` (the pack fetches with its
-creator's GitHub login), and cron output can go only to a readable channel, the manager, or the
+creator's GitHub login), a manager cannot register a pack that fetches with an org credential,
+and cron output can go only to a readable channel, the manager, or the
 cron's owner, with no client-supplied audience. A manager changing an existing service
 credential, custom provider, or authenticated MCP server must re-enter its secret, so they
 cannot redirect a secret someone else entered; a per-user MCP server they set must live on its

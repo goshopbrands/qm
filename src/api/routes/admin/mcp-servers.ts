@@ -114,11 +114,19 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
   if (await actsAsManager(ctx, authorized)) {
     const newSecret =
       (auth === "bearer" && typeof b.bearerToken === "string" && b.bearerToken) ||
-      (auth === "client-credentials" && typeof b.clientSecret === "string" && b.clientSecret);
+      (auth === "client-credentials" &&
+        typeof b.clientId === "string" &&
+        b.clientId &&
+        typeof b.clientSecret === "string" &&
+        b.clientSecret);
     if (existing && auth !== "none" && !newSecret)
       return sendJson(ctx.res, 403, { error: "forbidden", message: "re-enter the secret to change this server" });
     const host = parsed.hostname.toLowerCase();
-    if (credentialScope === "per-user" && host !== credentialHost && !host.endsWith(`.${credentialHost}`))
+    const onCredentialHost =
+      typeof credentialHost === "string" &&
+      credentialHost.includes(".") &&
+      (host === credentialHost || host.endsWith(`.${credentialHost}`));
+    if (credentialScope === "per-user" && !onCredentialHost)
       return sendJson(ctx.res, 403, {
         error: "forbidden",
         message: "a per-user server's URL must be on its credential host",

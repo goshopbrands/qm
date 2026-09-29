@@ -230,6 +230,11 @@ test("a manager imports skill packs only into spaces they can read and cannot re
     assert.equal(repoint.status, 403);
     assert.equal((await s.built.app.getSkillPack(pack.id))!.url, "https://github.com/acme/skills-pack.git");
     assert.equal((await s.asManager("PATCH", `/v1/admin/skill-packs/${pack.id}`, { syncMode: "tracked" })).status, 200);
+    const withOrgCredential = await s.asManager("POST", "/v1/admin/skill-packs", {
+      url: "https://github.com/acme/private.git",
+      authCredentialSlug: "gh",
+    });
+    assert.equal(withOrgCredential.status, 403);
     assert.equal(
       (await s.asManager("POST", `/v1/admin/scopes/${q(ORG)}/auto-flagger/test`, {})).status,
       403,
@@ -281,6 +286,8 @@ test("a manager must re-enter a stored secret to change where it is sent", async
       (await s.asManager("PUT", perUserServer, { ...perUser, url: "https://evil.example.com/mcp" })).status,
       403,
     );
+    const suffixOnly = { ...perUser, credentialHost: "com", url: "https://evil.com/mcp" };
+    assert.equal((await s.asManager("PUT", perUserServer, suffixOnly)).status, 403);
     assert.equal(
       (await s.asManager("PUT", perUserServer, { ...perUser, url: "https://api.github.com/mcp" })).status,
       200,

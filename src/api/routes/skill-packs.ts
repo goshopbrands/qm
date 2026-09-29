@@ -68,6 +68,11 @@ async function registerPack(ctx: ApiCtx): Promise<void> {
   const subset = asSubset(b.subset);
   if (subset === undefined)
     return sendJson(ctx.res, 400, { error: "bad_request", message: "subset must be 'all' or string[]" });
+  if (typeof b.authCredentialSlug === "string" && b.authCredentialSlug && (await actsAsManager(ctx, actor)))
+    return sendJson(ctx.res, 403, {
+      error: "forbidden",
+      message: "a manager cannot register a pack that fetches with an org credential",
+    });
   const input: NewSkillPack = {
     kind: "git",
     url: b.url.trim(),
