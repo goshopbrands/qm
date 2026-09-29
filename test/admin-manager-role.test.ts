@@ -240,6 +240,56 @@ test("a manager imports skill packs only into spaces they can read and cannot re
   }
 });
 
+test("a manager must re-enter a stored secret to change where it is sent", async () => {
+  const s = await start();
+  try {
+    const cred = `/v1/admin/scopes/${q(ORG)}/service-credentials`;
+    assert.equal(
+      (await s.asAdmin("PUT", cred, { slug: "gh", name: "GitHub", host: "api.github.com", secret: "s3cret" })).status,
+      200,
+    );
+    const version = async () =>
+      ((await (await s.asAdmin("GET", `/v1/admin/scopes/${q(ORG)}`)).json()) as any).serviceCredentials[0].updatedAt;
+    const moved = { slug: "gh", name: "GitHub", host: "evil.example.com" };
+    assert.equal((await s.asManager("PUT", cred, { ...moved, expectedUpdatedAt: await version() })).status, 403);
+    assert.equal(
+      (await s.asManager("PUT", cred, { ...moved, secret: "new", expectedUpdatedAt: await version() })).status,
+      200,
+    );
+
+    const provider = "/v1/admin/custom-providers/gateway";
+    const spec = {
+      name: "Gateway",
+      protocol: "openai",
+      baseUrl: "https://gateway.example.com/v1",
+      models: [{ id: "gw-1" }],
+      validate: false,
+    };
+    assert.equal((await s.asAdmin("PUT", provider, { ...spec, apiKey: "sk-admin" })).status, 200);
+    const repointed = { ...spec, baseUrl: "https://evil.example.com/v1" };
+    assert.equal((await s.asManager("PUT", provider, repointed)).status, 403);
+    assert.equal((await s.asManager("PUT", provider, { ...repointed, apiKey: "sk-mine" })).status, 200);
+
+    const mcp = "/v1/admin/mcp-servers/tools";
+    const server = { url: "https://mcp.example.com/mcp", auth: "bearer", validate: false };
+    assert.equal((await s.asAdmin("PUT", mcp, { ...server, bearerToken: "admin-token" })).status, 200);
+    assert.equal((await s.asManager("PUT", mcp, { ...server, url: "https://evil.example.com/mcp" })).status, 403);
+    assert.equal((await s.asManager("PUT", mcp, { ...server, bearerToken: "mine" })).status, 200);
+    const perUser = { auth: "none", credentialScope: "per-user", credentialHost: "github.com", validate: false };
+    const perUserServer = "/v1/admin/mcp-servers/gh";
+    assert.equal(
+      (await s.asManager("PUT", perUserServer, { ...perUser, url: "https://evil.example.com/mcp" })).status,
+      403,
+    );
+    assert.equal(
+      (await s.asManager("PUT", perUserServer, { ...perUser, url: "https://api.github.com/mcp" })).status,
+      200,
+    );
+  } finally {
+    await s.close();
+  }
+});
+
 test("a manager can open Spend and redirect output only for crons in spaces they can read", async () => {
   const s = await start();
   try {

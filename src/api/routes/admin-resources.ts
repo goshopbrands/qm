@@ -34,7 +34,7 @@ import { parseBotLedger } from "../../surface-cache/channel-policy-store.ts";
 import { authorizeUrl, PROVIDERS, type ConsentMode } from "../../connectors/oauth.ts";
 import { resolverFor } from "./connectors.ts";
 import { encodeRef, serviceCredRef } from "../../acl/resource-ref.ts";
-import { audit } from "./shared.ts";
+import { actsAsManager, audit } from "./shared.ts";
 import { errMessage, reportFailure } from "../../util/errors.ts";
 import {
   DEFAULT_SECURITY_SCREEN_RUBRIC,
@@ -1158,6 +1158,9 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
       if (delivery === "env" && host) return { error: "a pinned host only applies to broker delivery" };
       if (!existing && (typeof b.secret !== "string" || !b.secret)) {
         return { error: "a new credential requires a secret" };
+      }
+      if (existing && (typeof b.secret !== "string" || !b.secret) && (await actsAsManager(ctx, actor))) {
+        return { error: "re-enter the secret to change this credential", status: 403 };
       }
       const methods = Array.isArray(b.allowedMethods)
         ? b.allowedMethods

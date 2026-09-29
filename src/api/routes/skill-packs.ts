@@ -1,6 +1,6 @@
 import { sendJson } from "../http.ts";
 import type { ApiCtx, Route } from "./route.ts";
-import { adminScopeReader, audit, authorizeAdmin, orgScope } from "./shared.ts";
+import { actsAsManager, adminScopeReader, audit, authorizeAdmin, orgScope } from "./shared.ts";
 import type { NewSkillPack, SkillPack } from "../../skills/skill-pack-store.ts";
 import type { PackConfig } from "../../skills/normalize.ts";
 import { parseScopeId, type ScopeId } from "../../types.ts";
@@ -163,7 +163,7 @@ async function patchPack(ctx: ApiCtx): Promise<void> {
     patch.subset = subset;
   }
   if (b.config !== undefined) patch.config = asConfig(b.config);
-  if ((patch.url || patch.ref) && (await adminScopeReader(ctx, actor))) {
+  if ((patch.url || patch.ref) && (await actsAsManager(ctx, actor))) {
     const existing = await ctx.app.getSkillPack(ctx.params.id!);
     if (existing && existing.createdBy !== actor.id)
       return sendJson(ctx.res, 403, {

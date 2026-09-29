@@ -63,9 +63,13 @@ export async function authorizeAdmin(
   return null;
 }
 
+export async function actsAsManager(ctx: Pick<ApiCtx, "deps" | "req">, actor: Pick<Principal, "id">): Promise<boolean> {
+  return (await adminScopeReader(ctx, actor)) !== null;
+}
+
 export async function adminScopeReader(
   ctx: Pick<ApiCtx, "deps" | "req">,
-  actor: Principal,
+  actor: Pick<Principal, "id">,
 ): Promise<((scope: string) => Promise<boolean>) | null> {
   const admin = ctx.deps.admin;
   if (!admin) return null;

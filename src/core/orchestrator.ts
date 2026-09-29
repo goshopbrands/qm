@@ -1635,7 +1635,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           const status = await deps.admin
             .adminStatusOf(actor)
             .catch(swallowAs("orchestrator: admin status for turn", { isAdmin: false }));
-          actorIsOrgAdmin = status.isAdmin;
+          actorIsOrgAdmin = "role" in status && status.role === "org_admin";
           if (
             actorIsOrgAdmin &&
             liveTurn &&

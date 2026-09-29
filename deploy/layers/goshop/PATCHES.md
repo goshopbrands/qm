@@ -250,15 +250,22 @@ admin only, and the powers below are fenced to what the manager can read. Promot
 org-wide needs its source scope to be readable, skill-pack import targets must be readable,
 only the person who registered a pack can change its `url` or `ref` (the pack fetches with its
 creator's GitHub login), and cron output can go only to a readable channel, the manager, or the
-cron's owner, with no client-supplied audience.
+cron's owner, with no client-supplied audience. A manager changing an existing service
+credential, custom provider, or authenticated MCP server must re-enter its secret, so they
+cannot redirect a secret someone else entered; a per-user MCP server they set must live on its
+credential host, since it receives each caller's own token.
 
 Everything else is allowed, decided 2026-09-29: org-wide settings, Spend, cron output
 destinations and model runtimes for crons in scopes they can read, skill-pack import, sync, and
-edit, broker session revocation, promoting a skill org-wide, and unattended cron grants. The
-agent treats a manager as an admin, and the API enforces the limits above. Known risk: a
-manager can write org-wide skills, org memory, and synced packs that reach every agent turn,
-including org admins', so a malicious manager could try prompt injection against an admin's
-agent; the audit log records who wrote them.
+edit, broker session revocation, promoting a skill org-wide, and unattended cron grants. A
+manager's agent has the same API access, but the orchestrator's "Acting for an org admin" prompt
+(which tells the agent it may work around refusals) and its org-memory self-write stay org admin
+only.
+
+Known risk: a manager can write org-wide skills, org memory, and synced packs that reach every
+agent turn, including org admins', so a malicious manager could try prompt injection against an
+admin's agent; the audit log records who wrote them.
+
 Org admins are unchanged. Roles are granted in the dashboard's Users view; `ADMIN_GRANTS` also
 accepts `:org_manager`.
 
@@ -274,7 +281,10 @@ route added later stays org-admin only until someone classifies it.
 `src/api/routes/admin/files.ts`, `src/api/routes/admin/artifacts.ts`,
 `src/api/routes/admin/users.ts`, `src/api/routes/admin/sessions.ts` (no raw model requests for
 managers), `src/api/routes/skill-packs.ts` (readable import targets; pack source changes by its
-creator only), `src/api/app-sessions.ts` (promotion from readable scopes), `src/api/routes/admin/principal-links.ts` (an org admin sign-in cannot be linked onto a
+creator only), `src/api/app-sessions.ts` (promotion from readable scopes), `src/core/orchestrator.ts` (admin
+prompt for org admins only), `src/api/routes/admin-resources.ts`,
+`src/api/routes/admin/custom-providers.ts`, and `src/api/routes/admin/mcp-servers.ts` (secret
+re-entry), `src/api/routes/admin/principal-links.ts` (an org admin sign-in cannot be linked onto a
 non-admin identity), `src/wiring.ts` (`canUseSandboxScope` bypass is org admin only),
 `plugins/portal/src/index.ts` (impersonation needs `org_admin`; the admin-login link checks
 `isAdmin` on the probe result), `plugins/admin/public/index.html` (role from whoami; managers get
