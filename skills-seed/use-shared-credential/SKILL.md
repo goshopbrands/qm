@@ -15,12 +15,16 @@ core stamps the secret onto the outbound call at the wire and returns the respon
 
 Your system prompt lists, under **"Shared org credentials available to you"**, any credentials
 vended to _this_ conversation — each with its slug, host, and the methods/paths you may use. If
-that section is absent (or your environment has no `AGENT_CREDENTIAL_TOKEN`), you have no shared
-broker credentials. A separately authorized personal login or connected app may still be
+that section is absent, you have no shared broker credentials. A separately authorized personal login or connected app may still be
 available; use only its advertised capabilities and permissions. Never route around a denial
 or ask the user to paste a token.
 
 ## How to call it
+
+Select the credential's `service_<slug>` handle in the execute call's `credentials` (for example
+`credentials: ["service_<slug>"]`). That selection is what puts `AGENT_CREDENTIAL_TOKEN` in the
+environment, for that call only. An unselected call has an empty token and the broker refuses it,
+so select the handle on every call that uses the broker, including Git and retries.
 
 ```bash
 curl -fsS -X POST "$AGENT_API_URL/v1/credentials/broker" \
@@ -84,6 +88,9 @@ prefixes**. The broker enforces them, so:
 - `403 host_not_allowed` — the URL host isn't the credential's host. Use the host from your prompt.
 - `403 path_not_allowed` / `403 method_not_allowed` — outside what the admin allowed. Don't retry
   variations to get around it; if the task genuinely needs more, tell the user it's not permitted.
+- `401 unauthorized` (capability token required) — the execute call did not select the
+  `service_<slug>` handle, so `AGENT_CREDENTIAL_TOKEN` was empty. Run it again with the handle
+  selected. This is not an outage.
 - `403 not_entitled` — that credential isn't vended to this conversation. You can't use it here.
 - `404 credential_unavailable` — it was disabled/removed. Tell the user.
 

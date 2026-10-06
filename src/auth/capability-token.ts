@@ -11,6 +11,8 @@ export const DEPLOYMENT_CREDENTIAL_TTL_MS = 10 * 365 * 24 * 60 * 60_000;
 export const CONTROL_PLANE_AUD = "control-plane";
 export const OAUTH_CONSENT_AUD = "oauth-consent";
 export const CREDENTIAL_BROKER_AUD = "credential-broker";
+export const CREDENTIAL_BROKER_TOKEN_REQUIRED =
+  "credential-broker capability token required: $AGENT_CREDENTIAL_TOKEN is set only when the execute call selects the credential's service_<slug> handle in credentials. Run the call again with that handle selected.";
 export const EGRESS_PROXY_AUD = "egress-proxy";
 export const BLOB_TRANSFER_AUD = "blob-transfer";
 export const DEPLOY_RELEASE_AUD = "deploy-release";

@@ -1,7 +1,12 @@
 import { externalSlackCapabilityAllowed } from "./external-slack-capability.ts";
 import { orgId as configOrgId } from "../config.ts";
 import { Readable } from "node:stream";
-import { CREDENTIAL_BROKER_AUD, verifyCapabilityToken, type CapabilityClaims } from "../auth/capability-token.ts";
+import {
+  CREDENTIAL_BROKER_AUD,
+  CREDENTIAL_BROKER_TOKEN_REQUIRED,
+  verifyCapabilityToken,
+  type CapabilityClaims,
+} from "../auth/capability-token.ts";
 import { scopeId as makeScopeId } from "../types.ts";
 import { type DecryptedServiceCredential, isValidCredentialSlug, isComposioHost } from "../credentials/keychain.ts";
 import { brokerCredentialAuthHeader, brokerPathAllowed } from "./credential-broker.ts";
@@ -130,8 +135,7 @@ export async function brokerGitHttp(ctx: BaseCtx): Promise<void> {
   if (!ctx.deps.serviceCreds) return sendJson(ctx.res, 404, { error: "not_found" });
 
   const claims = await capabilityFrom(ctx);
-  if (!claims)
-    return sendJson(ctx.res, 401, { error: "unauthorized", message: "credential-broker capability token required" });
+  if (!claims) return sendJson(ctx.res, 401, { error: "unauthorized", message: CREDENTIAL_BROKER_TOKEN_REQUIRED });
   if (ctx.deps.identity) {
     await ctx.deps.identity.refresh();
     if (ctx.deps.identity.classify(claims.actorId).type !== "internal") {
