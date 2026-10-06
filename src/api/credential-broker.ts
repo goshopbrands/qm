@@ -1,5 +1,5 @@
 import { isComposioHost } from "../credentials/keychain.ts";
-import type { CapabilityClaims } from "../auth/capability-token.ts";
+import { CREDENTIAL_NOT_ENTITLED, type CapabilityClaims } from "../auth/capability-token.ts";
 import type { ScopeId } from "../types.ts";
 import type { CredentialUsageSink } from "../admin/credential-usage-sink.ts";
 import {
@@ -125,7 +125,7 @@ export async function brokerCredentialCall(opts: {
     return { status: 400, json: { error: "bad_request", message: "credential (slug) and url are required" } };
   }
   if (!Array.isArray(claims.credentials) || !claims.credentials.includes(slug)) {
-    return deny(403, "not_entitled", "this session is not entitled to that credential", "");
+    return deny(403, "not_entitled", CREDENTIAL_NOT_ENTITLED, "");
   }
   const rec: DecryptedServiceCredential | null = await reader.getServiceCredentialSecret(orgScopeId, slug);
   if (!rec || !rec.enabled || rec.delivery === "env") {

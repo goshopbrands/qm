@@ -313,3 +313,68 @@ admin roles.
 2. Take upstream's versions of the files above and delete `src/admin/manager-access.ts` and
    `test/admin-manager-role.test.ts`.
 3. Remove this section.
+
+## Patch 5: a broker call without its credential handle explains itself
+
+**Status:** active since 2026-10-06.
+
+**Problem.** Upstream's "Resolve selected execution credentials on demand" change (deployed here
+2026-09-29) sets `AGENT_CREDENTIAL_TOKEN` in the sandbox only for an `execute` call that selects
+the credential's `service_<slug>` handle in `credentials`. Before it, every turn got the token.
+Agents often run the broker `curl` without selecting the handle, so the header is empty. On Fly,
+sandboxes reach core through the portal (`PUBLIC_API_URL` is `https://goshop-portal.fly.dev`), and
+the portal answers any `/v1/*` request without an `x-agent-capability` header with a bare
+`{"error":"not_found"}`. Agents read that as the broker or the credential being gone, retry, and
+tell people the credential broker is down. Upstream's prompt made it worse: its example `curl`
+never shows the handle, and the `use-shared-credential` seed skill said an empty
+`AGENT_CREDENTIAL_TOKEN` means no shared credentials exist. Measured 2026-10-06: about 4 in 10
+conversations since the deploy missed the handle at least once, including brand-new cron runs.
+
+**Change.**
+
+- Core answers a credential-broker route called without a token (`POST /v1/credentials/broker`
+  and `/v1/credentials/git/…`) with a 401 whose message says to select the `service_<slug>` handle
+  (`CREDENTIAL_BROKER_TOKEN_REQUIRED` in `src/auth/capability-token.ts`, used by the gate in
+  `src/api/server.ts` and by `src/api/git-http-broker.ts`). A token that is present but invalid or
+  expired still gets "invalid or expired capability token".
+- A broker call whose token does not list the requested credential (`403 not_entitled`) now says to
+  select that credential's own handle (`CREDENTIAL_NOT_ENTITLED`, used by
+  `src/api/credential-broker.ts` and `src/api/git-http-broker.ts`). The token covers only the
+  handles selected in that execute call, so selecting `service_trello` and calling the broker for
+  another credential hits this.
+- The portal forwards `POST /v1/credentials/broker` and `GET`/`POST /v1/credentials/git/…` to core
+  even without a capability header (`isCredentialBrokerCall` in `plugins/portal/src/index.ts`), so
+  the agent sees core's 401 instead of the portal's bare 404. Only the allowlisted agent API
+  headers are forwarded (no cookies, portal identity, or source-auth headers). The broker route
+  is refused by core's gate; the git route is a raw route whose handler checks the path, method,
+  and that service credentials exist before refusing, so an unauthenticated caller can tell
+  whether service credentials are configured (404 against 401). Every other unauthenticated
+  `/v1/*` request, and any other method on these paths, still gets the portal's 404.
+- The shared-credentials prompt block (`src/core/orchestrator.ts`), the agent API catalog entry
+  (`src/api/agent-api-catalog.ts`), and `skills-seed/use-shared-credential/SKILL.md` state that
+  every broker call must select the handle, show `credentials: ["service_<slug>"]`, and explain the
+  401 and 403. The skill no longer treats an empty token as "no shared credentials".
+
+Selecting the handle is still required. Nothing here restores the old always-present token.
+Published apps call the same broker with a token minted at publish; the messages say "in an agent
+turn" so they stay accurate there.
+
+Known gap, left to upstream: the `background` tool cannot select credential handles, yet its
+description says `$AGENT_CREDENTIAL_TOKEN` works from background work. A broker call from a
+background job gets the new 401.
+
+**Retirement signal.** `check-patches.sh` checks three things in the upstream ref: whether the portal
+routes `/v1/credentials/broker` itself, whether core's broker 401 mentions the `service_` handle,
+(`service_<slug>` in the gate, git broker, or capability-token files), and whether the seed skill
+still treats an empty token as "no shared credentials". If any of these has changed upstream, it
+reports a retire candidate. It does not see a fix made some other way (for example a generic
+portal change), so also read the upstream commits it lists for these files.
+
+**Retirement steps.**
+
+1. Read upstream's version of the three areas above. Keep whichever parts upstream does not yet
+   cover; in a sandbox turn on a fresh conversation, run a broker `curl` without selecting the handle
+   through the portal URL and confirm the reply tells the agent to select the handle.
+2. Take upstream's versions of the files above (keeping Patch 4's hunks in the two shared files),
+   drop the assertions added by this patch from the two test files unless upstream's code passes them,
+   and remove this section.

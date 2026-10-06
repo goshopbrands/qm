@@ -1,7 +1,13 @@
 import { externalSlackCapabilityAllowed } from "./external-slack-capability.ts";
 import { orgId as configOrgId } from "../config.ts";
 import { Readable } from "node:stream";
-import { CREDENTIAL_BROKER_AUD, verifyCapabilityToken, type CapabilityClaims } from "../auth/capability-token.ts";
+import {
+  CREDENTIAL_BROKER_AUD,
+  CREDENTIAL_BROKER_TOKEN_REQUIRED,
+  CREDENTIAL_NOT_ENTITLED,
+  verifyCapabilityToken,
+  type CapabilityClaims,
+} from "../auth/capability-token.ts";
 import { scopeId as makeScopeId } from "../types.ts";
 import { type DecryptedServiceCredential, isValidCredentialSlug, isComposioHost } from "../credentials/keychain.ts";
 import { brokerCredentialAuthHeader, brokerPathAllowed } from "./credential-broker.ts";
@@ -131,7 +137,12 @@ export async function brokerGitHttp(ctx: BaseCtx): Promise<void> {
 
   const claims = await capabilityFrom(ctx);
   if (!claims)
-    return sendJson(ctx.res, 401, { error: "unauthorized", message: "credential-broker capability token required" });
+    return sendJson(ctx.res, 401, {
+      error: "unauthorized",
+      message: headerValue(ctx.req, CAPABILITY_HEADER)
+        ? "invalid or expired capability token"
+        : CREDENTIAL_BROKER_TOKEN_REQUIRED,
+    });
   if (ctx.deps.identity) {
     await ctx.deps.identity.refresh();
     if (ctx.deps.identity.classify(claims.actorId).type !== "internal") {
@@ -159,7 +170,7 @@ export async function brokerGitHttp(ctx: BaseCtx): Promise<void> {
     return sendJson(ctx.res, 403, { error: "forbidden", message: "capability scope membership has been revoked" });
   }
   if (!Array.isArray(claims.credentials) || !claims.credentials.includes(slug)) {
-    return sendDenied(ctx, claims, 403, "not_entitled", "this session is not entitled to that credential", slug, "");
+    return sendDenied(ctx, claims, 403, "not_entitled", CREDENTIAL_NOT_ENTITLED, slug, "");
   }
 
   const orgScope = makeScopeId("org", configOrgId());

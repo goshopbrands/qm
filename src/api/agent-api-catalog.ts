@@ -782,7 +782,7 @@ const FAMILIES: AgentApiFamily[] = [
         method: "POST",
         path: "/v1/credentials/broker",
         summary:
-          "call a vended org credential's host BY PROXY — secret stays server-side (use $AGENT_CREDENTIAL_TOKEN)",
+          "call a vended org credential's host BY PROXY — secret stays server-side (use $AGENT_CREDENTIAL_TOKEN, which is set only when the execute call selects the service_<slug> handle)",
       },
     ],
   },

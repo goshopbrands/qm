@@ -118,6 +118,27 @@ else
   review=1
 fi
 
+echo "== Patch 5: a broker call without its credential handle explains itself"
+report_touches plugins/portal/src/index.ts src/api/server.ts src/api/git-http-broker.ts src/api/credential-broker.ts src/auth/capability-token.ts \
+  src/core/orchestrator.ts src/api/agent-api-catalog.ts skills-seed/use-shared-credential
+upstream_portal="$(git show "$ref:plugins/portal/src/index.ts" 2>/dev/null || true)"
+upstream_skill="$(git show "$ref:skills-seed/use-shared-credential/SKILL.md" 2>/dev/null || true)"
+if [ -z "$upstream_portal" ] || [ -z "$upstream_skill" ]; then
+  echo "  PROBE ERROR: $ref has no plugins/portal/src/index.ts or skills-seed/use-shared-credential/SKILL.md; inspect before deciding"
+  review=1
+else
+  fixed=""
+  grep -q '/v1/credentials/broker' <<<"$upstream_portal" && fixed="$fixed portal-routes-broker"
+  git grep -qF 'service_<slug>' "$ref" -- src/api/server.ts src/api/git-http-broker.ts src/auth/capability-token.ts && fixed="$fixed core-401-names-handle"
+  grep -q 'your environment has no `AGENT_CREDENTIAL_TOKEN`' <<<"$upstream_skill" || fixed="$fixed skill-reworded"
+  if [ -n "$fixed" ]; then
+    echo "  RETIRE CANDIDATE: $ref changed:$fixed; follow Patch 5's retirement steps"
+    review=1
+  else
+    echo "  still needed: $ref's portal 404s a broker call without a token, core's 401 does not name the handle, and the skill still reads an empty token as no credentials"
+  fi
+fi
+
 if [ "$review" = 1 ]; then
   echo
   echo "Review deploy/layers/goshop/PATCHES.md before merging this update."

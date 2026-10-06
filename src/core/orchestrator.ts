@@ -1715,9 +1715,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               });
               sharedCredsBlock =
                 "\n\n## Shared org credentials available to you\n" +
-                "Select the corresponding `service_<slug>` handle in execute.credentials. You CANNOT see the secret — call the " +
-                "target BY PROXY through the broker, which injects it server-side. Use exactly this (with the " +
-                "$AGENT_CREDENTIAL_TOKEN env var, NOT $AGENT_API_TOKEN):\n" +
+                "You CANNOT see the secret — call the target BY PROXY through the broker, which injects it server-side. " +
+                "Every execute call that reaches the broker must select the credential's `service_<slug>` handle in " +
+                'execute.credentials (e.g. `credentials: ["service_<slug>"]`): that selection is what sets ' +
+                "$AGENT_CREDENTIAL_TOKEN for that one call, and without it the variable is empty and the broker answers 401. " +
+                "Run exactly this inside that execute call (with $AGENT_CREDENTIAL_TOKEN, NOT $AGENT_API_TOKEN):\n" +
                 "```\n" +
                 'curl -fsS -X POST "$AGENT_API_URL/v1/credentials/broker" \\\n' +
                 '  -H "x-agent-capability: $AGENT_CREDENTIAL_TOKEN" \\\n' +
@@ -1728,7 +1730,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 "For Git smart HTTP clone/fetch/push using a shared org credential, use core as the Git remote " +
                 "so the token stays server-side: " +
                 "`$AGENT_API_URL/v1/credentials/git/<slug>/<repo-path>.git`, with " +
-                '`git -c http.extraHeader="x-agent-capability: $AGENT_CREDENTIAL_TOKEN" ...`. ' +
+                '`git -c http.extraHeader="x-agent-capability: $AGENT_CREDENTIAL_TOKEN" ...`, selecting the same handle. ' +
                 "Git through this route uses the configured org account, not automatically the requesting user's account; " +
                 "a live personal OAuth connector does not switch this route's identity. The credential name is an admin label " +
                 "and does not identify the upstream username. Choose among credentials authorized for this conversation " +

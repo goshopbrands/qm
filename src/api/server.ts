@@ -19,7 +19,13 @@ import {
   SOURCE_AUTH_REPLAY_WINDOW_MS,
   type SourceAuth,
 } from "../auth/source-auth.ts";
-import { verifyCapabilityToken, CONTROL_PLANE_AUD, type CapabilityClaims } from "../auth/capability-token.ts";
+import {
+  verifyCapabilityToken,
+  CONTROL_PLANE_AUD,
+  CREDENTIAL_BROKER_AUD,
+  CREDENTIAL_BROKER_TOKEN_REQUIRED,
+  type CapabilityClaims,
+} from "../auth/capability-token.ts";
 import { verifyPortalIdentity, PORTAL_IDENTITY_HEADER, type PortalIdentity } from "../auth/portal-identity.ts";
 import { isUserScoped, userScopedField, assertedActor, isUnclassifiedWrite } from "./user-scoped-routes.ts";
 import { errMessage } from "../util/errors.ts";
@@ -272,7 +278,13 @@ async function gate(
       return null;
     }
   } else if (requiredAud) {
-    sendJson(res, 401, { error: "unauthorized", message: `${requiredAud} capability token required` });
+    sendJson(res, 401, {
+      error: "unauthorized",
+      message:
+        requiredAud === CREDENTIAL_BROKER_AUD
+          ? CREDENTIAL_BROKER_TOKEN_REQUIRED
+          : `${requiredAud} capability token required`,
+    });
     return null;
   } else if (
     !(await verifyOrReject(
