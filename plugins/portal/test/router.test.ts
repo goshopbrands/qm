@@ -7,7 +7,12 @@ let whoamiProbes = 0;
 let lastConsentClicker: string | null = null;
 let lastImpersonateIdentity: string | null = null;
 let agentApiRequests = 0;
-const brokerRequests: Array<{ url: string; capability: string | string[] | undefined }> = [];
+const brokerRequests: Array<{
+  method: string | undefined;
+  url: string;
+  capability: string | string[] | undefined;
+  cookie: string | undefined;
+}> = [];
 const VALID_AGENT_CAPABILITY = "valid.agent.capability";
 let deploymentLayerRequests = 0;
 const VALID_SOURCE_SIGNATURE = "v0=valid-source-signature";
@@ -31,7 +36,12 @@ const upstream = createServer((req: IncomingMessage, res) => {
     });
   }
   if (req.url?.startsWith("/v1/credentials/")) {
-    brokerRequests.push({ url: req.url, capability: req.headers["x-agent-capability"] });
+    brokerRequests.push({
+      method: req.method,
+      url: req.url,
+      capability: req.headers["x-agent-capability"],
+      cookie: req.headers.cookie,
+    });
     res.writeHead(401, { "content-type": "application/json" });
     return void res.end(JSON.stringify({ error: "unauthorized", message: "core broker answer" }));
   }
@@ -272,7 +282,7 @@ test("credential broker paths reach core even without a capability, so core expl
   brokerRequests.length = 0;
   const broker = await fetch(`${base}/v1/credentials/broker`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", cookie: sessionCookie("U1") },
     body: JSON.stringify({ credential: "trello", url: "https://api.trello.com/1/members/me" }),
   });
   assert.equal(broker.status, 401);
@@ -280,12 +290,20 @@ test("credential broker paths reach core even without a capability, so core expl
   const git = await fetch(`${base}/v1/credentials/git/gh/org/repo.git/info/refs?service=git-upload-pack`);
   assert.equal(git.status, 401);
   assert.deepEqual(brokerRequests, [
-    { url: "/v1/credentials/broker", capability: undefined },
-    { url: "/v1/credentials/git/gh/org/repo.git/info/refs?service=git-upload-pack", capability: undefined },
+    { method: "POST", url: "/v1/credentials/broker", capability: undefined, cookie: undefined },
+    {
+      method: "GET",
+      url: "/v1/credentials/git/gh/org/repo.git/info/refs?service=git-upload-pack",
+      capability: undefined,
+      cookie: undefined,
+    },
   ]);
   for (const p of ["/v1/credentials", "/v1/credentials/brokerx", "/v1/credentials/broker/x"]) {
     assert.equal((await fetch(`${base}${p}`, { method: "POST" })).status, 404, `expected 404 for ${p}`);
   }
+  assert.equal((await fetch(`${base}/v1/credentials/broker`)).status, 404);
+  assert.equal((await fetch(`${base}/v1/credentials/git/gh/org/repo.git`, { method: "DELETE" })).status, 404);
+  assert.equal(brokerRequests.length, 2);
 });
 
 test("an unmatched /v1 path is a hard 404, never the SPA shell", async () => {

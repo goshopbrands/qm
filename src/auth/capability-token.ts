@@ -12,7 +12,9 @@ export const CONTROL_PLANE_AUD = "control-plane";
 export const OAUTH_CONSENT_AUD = "oauth-consent";
 export const CREDENTIAL_BROKER_AUD = "credential-broker";
 export const CREDENTIAL_BROKER_TOKEN_REQUIRED =
-  "credential-broker capability token required: $AGENT_CREDENTIAL_TOKEN is set only when the execute call selects the credential's service_<slug> handle in credentials. Run the call again with that handle selected.";
+  "credential-broker capability token required. In an agent turn, $AGENT_CREDENTIAL_TOKEN is set only when the execute call selects the credential's service_<slug> handle in credentials; run the call again with that handle selected.";
+export const CREDENTIAL_NOT_ENTITLED =
+  "this token does not cover that credential. In an agent turn, select that credential's own service_<slug> handle in this execute call's credentials; if it is already selected, the credential is not granted to this conversation.";
 export const EGRESS_PROXY_AUD = "egress-proxy";
 export const BLOB_TRANSFER_AUD = "blob-transfer";
 export const DEPLOY_RELEASE_AUD = "deploy-release";

@@ -843,8 +843,11 @@ function hasAgentCapability(req: IncomingMessage): boolean {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-function isCredentialBrokerPath(pathname: string): boolean {
-  return pathname === "/v1/credentials/broker" || pathname.startsWith("/v1/credentials/git/");
+function isCredentialBrokerCall(method: string, pathname: string): boolean {
+  return (
+    (method === "POST" && pathname === "/v1/credentials/broker") ||
+    ((method === "GET" || method === "POST") && pathname.startsWith("/v1/credentials/git/"))
+  );
 }
 
 function isDeploymentLayerPassthrough(method: string, pathname: string): boolean {
@@ -1254,7 +1257,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     );
   }
 
-  if (pathname.startsWith("/v1/") && (hasAgentCapability(req) || isCredentialBrokerPath(pathname))) {
+  if (pathname.startsWith("/v1/") && (hasAgentCapability(req) || isCredentialBrokerCall(method, pathname))) {
     return proxyToUpstream(req, res, { baseUrl: CORE, path: pathname, search: url.search }, FORWARD_AGENT_API_HEADERS);
   }
 

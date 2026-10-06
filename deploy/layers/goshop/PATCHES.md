@@ -332,37 +332,43 @@ conversations since the deploy missed the handle at least once, including brand-
 
 **Change.**
 
-- Core answers a credential-broker route without a token (`/v1/credentials/broker` and
-  `/v1/credentials/git/…`) with a 401 whose message says to select the `service_<slug>` handle
+- Core answers a credential-broker route called without a token (`POST /v1/credentials/broker`
+  and `/v1/credentials/git/…`) with a 401 whose message says to select the `service_<slug>` handle
   (`CREDENTIAL_BROKER_TOKEN_REQUIRED` in `src/auth/capability-token.ts`, used by the gate in
-  `src/api/server.ts` and by `src/api/git-http-broker.ts`).
-- The portal forwards those two paths to core even without a capability header
-  (`isCredentialBrokerPath` in `plugins/portal/src/index.ts`), so the agent sees core's 401 instead
-  of the portal's bare 404. Only the allowlisted agent API headers are forwarded, and core refuses
-  the request before any handler runs. Every other unauthenticated `/v1/*` path still gets 404.
+  `src/api/server.ts` and by `src/api/git-http-broker.ts`). A token that is present but invalid or
+  expired still gets "invalid or expired capability token".
+- A broker call whose token does not list the requested credential (`403 not_entitled`) now says to
+  select that credential's own handle (`CREDENTIAL_NOT_ENTITLED`, used by
+  `src/api/credential-broker.ts` and `src/api/git-http-broker.ts`). The token covers only the
+  handles selected in that execute call, so selecting `service_trello` and calling the broker for
+  another credential hits this.
+- The portal forwards `POST /v1/credentials/broker` and `GET`/`POST /v1/credentials/git/…` to core
+  even without a capability header (`isCredentialBrokerCall` in `plugins/portal/src/index.ts`), so
+  the agent sees core's 401 instead of the portal's bare 404. Only the allowlisted agent API
+  headers are forwarded (no cookies, portal identity, or source-auth headers). The broker route
+  is refused by core's gate; the git route is a raw route whose handler checks the path, method,
+  and that service credentials exist before refusing, so an unauthenticated caller can tell
+  whether service credentials are configured (404 against 401). Every other unauthenticated
+  `/v1/*` request, and any other method on these paths, still gets the portal's 404.
 - The shared-credentials prompt block (`src/core/orchestrator.ts`), the agent API catalog entry
   (`src/api/agent-api-catalog.ts`), and `skills-seed/use-shared-credential/SKILL.md` state that
-  every broker call must select the handle, show `credentials: ["service_<slug>"]`, and explain the 401. The skill no longer treats an empty token as "no shared credentials".
+  every broker call must select the handle, show `credentials: ["service_<slug>"]`, and explain the
+  401 and 403. The skill no longer treats an empty token as "no shared credentials".
 
 Selecting the handle is still required. Nothing here restores the old always-present token.
+Published apps call the same broker with a token minted at publish; the messages say "in an agent
+turn" so they stay accurate there.
 
-**Files.** `src/auth/capability-token.ts`, `src/api/server.ts`, `src/api/git-http-broker.ts`,
-`plugins/portal/src/index.ts`, `src/core/orchestrator.ts`, `src/api/agent-api-catalog.ts`,
-`skills-seed/use-shared-credential/SKILL.md`, and tests `test/service-credential-route.test.ts`
-(401 message on both broker routes, handle in the prompt) and `plugins/portal/test/router.test.ts`
-(broker paths forwarded without a capability, other `/v1` paths still 404).
-
-`plugins/portal/src/index.ts` and `src/core/orchestrator.ts` also carry Patch 4. A conflict in
-either file can involve both patches; keep both.
-
-**Deployment settings it relies on.** Deploy `core` and `portal` with
-`qm up --build-from=<this checkout>`. The seed skill reaches the org on core's next boot, which
-re-publishes changed seed skills.
+Known gap, left to upstream: the `background` tool cannot select credential handles, yet its
+description says `$AGENT_CREDENTIAL_TOKEN` works from background work. A broker call from a
+background job gets the new 401.
 
 **Retirement signal.** `check-patches.sh` checks three things in the upstream ref: whether the portal
 routes `/v1/credentials/broker` itself, whether core's broker 401 mentions the `service_` handle,
-and whether the seed skill still treats an empty token as "no shared credentials". If any of these
-has changed upstream, it reports a retire candidate.
+(`service_<slug>` in the gate, git broker, or capability-token files), and whether the seed skill
+still treats an empty token as "no shared credentials". If any of these has changed upstream, it
+reports a retire candidate. It does not see a fix made some other way (for example a generic
+portal change), so also read the upstream commits it lists for these files.
 
 **Retirement steps.**
 

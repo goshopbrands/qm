@@ -14,8 +14,8 @@ core stamps the secret onto the outbound call at the wire and returns the respon
 ## When this applies
 
 Your system prompt lists, under **"Shared org credentials available to you"**, any credentials
-vended to _this_ conversation — each with its slug, host, and the methods/paths you may use. If
-that section is absent, you have no shared broker credentials. A separately authorized personal login or connected app may still be
+vended to _this_ conversation — each with its slug, host, and the methods/paths you may use.
+If that section is absent, you have no shared broker credentials. A separately authorized personal login or connected app may still be
 available; use only its advertised capabilities and permissions. Never route around a denial
 or ask the user to paste a token.
 
@@ -91,7 +91,10 @@ prefixes**. The broker enforces them, so:
 - `401 unauthorized` (capability token required) — the execute call did not select the
   `service_<slug>` handle, so `AGENT_CREDENTIAL_TOKEN` was empty. Run it again with the handle
   selected. This is not an outage.
-- `403 not_entitled` — that credential isn't vended to this conversation. You can't use it here.
+- `403 not_entitled` — this call's token doesn't cover that credential. Check that this execute
+  call selected that credential's own `service_<slug>` handle (selecting a different credential's
+  handle doesn't count). If it did, the credential isn't vended to this conversation; you can't use
+  it here.
 - `404 credential_unavailable` — it was disabled/removed. Tell the user.
 
 ## Guardrails

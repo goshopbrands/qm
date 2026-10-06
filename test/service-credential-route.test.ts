@@ -849,7 +849,9 @@ test("broker route: a slug NOT in the token's set is refused (403)", async () =>
     });
     const res = await broker(srv.base, await brokerToken([]), { credential: "x-firehose", url: "https://api.x.com/x" });
     assert.equal(res.status, 403);
-    assert.match(await res.text(), /not_entitled/);
+    const denied = (await res.json()) as { error: string; message: string };
+    assert.equal(denied.error, "not_entitled");
+    assert.match(denied.message, /own service_<slug> handle/);
   } finally {
     await srv.close();
   }
@@ -882,6 +884,11 @@ test("broker route: a control-plane token is rejected (cross-onramp wall); no to
     const r3 = await fetch(`${srv.base}/v1/credentials/git/x-firehose/org/repo.git/info/refs?service=git-upload-pack`);
     assert.equal(r3.status, 401);
     assert.match(((await r3.json()) as { message: string }).message, /select.*service_<slug> handle/);
+    const r4 = await fetch(`${srv.base}/v1/credentials/git/x-firehose/org/repo.git/info/refs?service=git-upload-pack`, {
+      headers: { "x-agent-capability": "not-a-valid-token" },
+    });
+    assert.equal(r4.status, 401);
+    assert.match(((await r4.json()) as { message: string }).message, /invalid or expired/);
   } finally {
     await srv.close();
   }
