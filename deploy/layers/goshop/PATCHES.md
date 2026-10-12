@@ -82,7 +82,8 @@ now frames relayed bodies itself.
 
 **Problem.** Upstream's current Fly deploy provider has no durable app storage: apps restart
 from their code bundle and lose anything written to disk. Four GoShop apps were built on the
-earlier volume-backed provider and keep data on Fly volumes mounted at `/data`.
+earlier volume-backed provider and keep data on Fly volumes mounted at `/data`; a fifth
+(support-desk) was moved onto it later.
 
 **Change.** A second deploy provider for an explicit list of deployment IDs, keeping their
 volumes, short app names, release downloads from `/v1/deploy-releases/:id`, sleep and wake,
@@ -117,8 +118,11 @@ upstream images that lack this patch.
 | goshop-tasks            | `goshop-d-49b9c170d50542a2` | `/data/tasks.json`                                    |
 | goshop-task-tracker     | `goshop-d-11283a786d0d4dae` | `/data/tasks.json`                                    |
 | goshop-weekly-dashboard | `goshop-d-1187602d110d430b` | none; `data.json` ships in the app code               |
+| support-desk            | `goshop-d-80955314d71f4519` | SQLite `/data/app.db`                                 |
 
-The other four IDs in the list are archived test deployments.
+The other four IDs in the list are archived test deployments. support-desk was first published on
+the current provider and moved here on 2026-10-12 for durable storage; its data was copied from the
+old ephemeral app (`goshop-d-80955314-d71f-4519-93e6-22c4d46d0a58`).
 
 **Retirement signal.** Upstream v0.1.13 already has opt-in durable `/data` for its Fly provider,
 but documents it as a prototype. `check-patches.sh` reports a migrate candidate when
@@ -131,7 +135,7 @@ that provider.
 1. Snapshot every legacy volume and restore each snapshot into a separate volume first.
 2. Republish each app on the current provider, copy its `/data` contents into the new
    durable storage, and compare record counts (invoice-review `items` and `runs` tables,
-   task counts in `tasks.json`).
+   task counts in `tasks.json`, support-desk `tickets` and `messages` tables).
 3. Remove each migrated ID from `FLY_LEGACY_DEPLOYMENT_IDS`; keep the old Fly apps and volumes
    until the migrated apps are validated, then delete them explicitly.
 4. When the list is empty, take upstream's versions of the files above, delete the
