@@ -777,7 +777,10 @@ test("a history config on a different volume is not restored", async () => {
   );
   await p.apply(d, version(2, snapshot("server.js", "v2")));
   const running = fake.machines.get(APP)?.[0]?.config;
-  fake.history.set(id, [...fake.history.get(id)!.filter((config) => config.metadata?.qm_deployment_version === "1")]);
+  fake.history.set(
+    id,
+    fake.history.get(id)!.filter((config) => config.metadata?.qm_deployment_version === "1"),
+  );
   blobs.payloads.set("00000000000000000000000000000001", Buffer.from("v1"));
 
   await assert.rejects(
