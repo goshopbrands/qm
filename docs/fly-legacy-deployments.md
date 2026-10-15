@@ -6,6 +6,8 @@ Set `FLY_LEGACY_DEPLOYMENT_IDS` to a comma-separated list of existing deployment
 
 The listed deployments retain their shortened Fly app names, `/data` volumes, Git reconciliation, automatic sleep/wake, and volume-preserving archive/restore. New deployments use the current Fly provider's full UUID app names, isolated networks, bundle limits, and idle cleanup. The current provider does not provision persistent app volumes.
 
+A failed publish to a listed deployment restores the Machine to the deployment's last applied version, read from the Machine's Fly version history when the Machine is no longer running it, so a rollback that itself failed is repaired by the next failed attempt. When the app process exits during startup, the publish error names the exit code and entrypoint.
+
 ## Cutover
 
 1. Preserve the current image digests, application configuration, signing keys, database backup, Fly volume snapshots, and object-store release and Git archives. Validate recovery separately from the agent development instance.

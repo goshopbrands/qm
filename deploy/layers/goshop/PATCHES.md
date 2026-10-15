@@ -102,6 +102,18 @@ sent to the current provider. v0.1.13 added such a call in `setDeploymentAlwaysO
 sync and covered by `test/deploy-provider-selection.test.ts`. Check new `deps.provider.` calls in
 that file on every sync.
 
+A failed publish rolls the Machine back to the deployment's last applied version, looked up in
+the Machine's Fly version history (`GET /machines/:id/versions`) when the Machine is not on it,
+and the publish error names the app's exit code and entrypoint when it crashed while starting.
+Added 2026-10-15 after goshop-weekly-dashboard went down: one rollback failed, left a
+crash-looping release on the Machine, and every later failed attempt "restored" that release.
+Upstream's own Fly provider does not have the rollback problem, because it creates a new Machine
+before replacing a healthy one. Upstream main (unreleased as of 2026-10-15, after v0.1.14) added
+start-failure reporting and `logs()` for its own Fly provider ("Report app start failures,
+restarts and outages on every deploy provider"); it does not cover this provider. When a sync
+takes a release containing it, wire this provider into the same reporter and logs and drop the
+exit-code diagnosis in favour of it. `check-patches.sh` reports this as an adopt candidate.
+
 Upstream v0.1.13 added optional durable `/data` volumes for its own Fly provider
 (`FLY_DEPLOY_DATA_VOLUME_SIZE_GB`, off by default and described upstream as a prototype). Turning
 it on refuses redeploys of apps already published without a volume, so it is left off until the
