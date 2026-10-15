@@ -112,7 +112,7 @@ before replacing a healthy one. Upstream main (unreleased as of 2026-10-15, afte
 start-failure reporting and `logs()` for its own Fly provider ("Report app start failures,
 restarts and outages on every deploy provider"); it does not cover this provider. When a sync
 takes a release containing it, wire this provider into the same reporter and logs and drop the
-exit-code diagnosis in favour of it.
+exit-code diagnosis in favour of it. `check-patches.sh` reports this as an adopt candidate.
 
 Upstream v0.1.13 added optional durable `/data` volumes for its own Fly provider
 (`FLY_DEPLOY_DATA_VOLUME_SIZE_GB`, off by default and described upstream as a prototype). Turning

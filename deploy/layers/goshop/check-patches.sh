@@ -61,7 +61,7 @@ fi
 echo "== Patch 2: legacy volume-backed Fly deploy provider"
 report_touches src/deploy/fly-deploy-provider.ts src/deploy/deploy-provider.ts src/api/deps.ts \
   src/api/routes/deploy-releases.ts src/api/routes/index.ts src/auth/capability-token.ts src/config.ts \
-  src/deploy/deploy-service.ts src/tools/primitives.ts src/wiring.ts
+  src/deploy/deploy-service.ts src/deploy/shared-deploy-provider.ts src/tools/primitives.ts src/wiring.ts
 provider="$(git show "$ref:src/deploy/fly-deploy-provider.ts" 2>/dev/null || true)"
 qa="$(git show "$ref:docs/qa/fly-published-apps.md" 2>/dev/null || true)"
 if [ -z "$provider" ]; then
@@ -74,6 +74,11 @@ elif grep -q dataDir <<<"$provider"; then
   review=1
 else
   echo "  still needed: $ref's Fly deploy provider has no durable app data"
+fi
+shared="$(git show "$ref:src/deploy/shared-deploy-provider.ts" 2>/dev/null || true)"
+if grep -q "export function appReporter" <<<"$shared"; then
+  echo "  ADOPT CANDIDATE: $ref reports app start failures through appReporter and appLogs (src/deploy/shared-deploy-provider.ts) — wire the legacy provider into them and drop its exit-code diagnosis"
+  review=1
 fi
 
 echo "== Patch 3: the browse seed skill is removed"

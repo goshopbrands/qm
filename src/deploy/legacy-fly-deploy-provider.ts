@@ -19,6 +19,7 @@ const RELEASE_EXPIRY = Date.UTC(2100, 0, 1);
 const MACHINE_WAIT_SLICE_SECONDS = 60;
 const MACHINE_WAIT_ATTEMPTS = 5;
 const MACHINE_EVENT_LIMIT = 50;
+const ROLLBACK_ATTEMPTS = 3;
 const EXIT_CODE_MEANINGS: Record<number, string> = { 126: "not executable", 127: "command not found" };
 
 export interface FlyApp {
@@ -90,6 +91,7 @@ export interface FlyDeployProviderOptions {
   fetchImpl?: typeof fetch;
   probe?: (endpoint: DeployEndpoint) => Promise<void>;
   readyTimeoutMs?: number;
+  rollbackRetryDelayMs?: number;
   now?: () => number;
 }
 
@@ -258,8 +260,8 @@ function lastStartupExit(events: FlyMachineEvent[]): FlyExitEvent | undefined {
   const placements = events
     .filter((event) => event.type === "update" || event.type === "launch")
     .map((event) => event.timestamp ?? 0);
-  if (!placements.length) return undefined;
-  const placedAt = Math.max(...placements);
+  if (!placements.length && events.length < MACHINE_EVENT_LIMIT) return undefined;
+  const placedAt = Math.max(0, ...placements);
   return events
     .filter((event) => event.type === "exit" && (event.timestamp ?? 0) > placedAt)
     .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0))
@@ -274,6 +276,7 @@ function liveMachines(machines: FlyMachine[]): FlyMachine[] {
 export function createLegacyFlyDeployProvider(opts: FlyDeployProviderOptions): DeployProvider {
   const api = opts.api ?? createFlyDeployApi(opts.token, opts.fetchImpl);
   const readyTimeoutMs = opts.readyTimeoutMs ?? 60_000;
+  const rollbackRetryDelayMs = opts.rollbackRetryDelayMs ?? 5_000;
   const endpointFor = (name: string): DeployEndpoint => ({ host: `${name}.flycast`, port: 80 });
   const appName = (d: Deployment): string => {
     const suffix = d.id.replaceAll("-", "").slice(0, 16).toLowerCase();
@@ -471,20 +474,34 @@ export function createLegacyFlyDeployProvider(opts: FlyDeployProviderOptions): D
       const applied = d.appliedVersion === undefined ? undefined : String(d.appliedVersion);
       if (applied === undefined || current.metadata?.[VERSION_KEY] === applied) return current;
       const history = await api.listMachineConfigs(name, id);
-      const candidate = history.findLast((config) => config.metadata?.[VERSION_KEY] === applied);
+      const candidate = history.findLast(
+        (config) =>
+          config.metadata?.[VERSION_KEY] === applied &&
+          (config.mounts as Array<{ volume?: string }> | undefined)?.some((mount) => mount.volume === volume.id),
+      );
       return candidate && (await releaseExists(candidate.metadata?.[RELEASE_KEY])) ? candidate : current;
     };
-    const explainCrash = async (error: unknown): Promise<unknown> => {
+    const explainCrash = async (): Promise<string | null> => {
       const target = placed ?? updated;
-      if (!target) return error;
+      if (!target) return null;
       const exit = lastStartupExit(await api.listMachineEvents(name, target.id));
-      if (!exit) return error;
+      if (!exit) return null;
       const meaning = exit.oom_killed ? "out of memory" : EXIT_CODE_MEANINGS[exit.exit_code ?? -1];
-      return new Error(
+      return (
         `Fly app exited with code ${exit.exit_code ?? "unknown"}${meaning ? ` (${meaning})` : ""} while starting; ` +
-          `check the entrypoint ${JSON.stringify(version.entrypoint)}`,
-        { cause: error },
+        `boot downloads and unpacks the release, then runs the entrypoint ${JSON.stringify(version.entrypoint)}`
       );
+    };
+    const restore = async (current: FlyMachine, restored: FlyMachineConfig): Promise<void> => {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await updateAndStart(current, restored);
+          return;
+        } catch (error) {
+          if (attempt === ROLLBACK_ATTEMPTS) throw error;
+          await sleep(rollbackRetryDelayMs);
+        }
+      }
     };
     let completed = false;
     let discardFailedRelease = false;
@@ -517,9 +534,9 @@ export function createLegacyFlyDeployProvider(opts: FlyDeployProviderOptions): D
       }
       return { ...endpoint, image: opts.image };
     } catch (placeError) {
-      const error = await explainCrash(placeError).catch((diagnosisError: unknown) => {
+      const diagnosis = await explainCrash().catch((diagnosisError: unknown) => {
         swallow("legacy fly deploy: crash diagnosis failed", diagnosisError);
-        return placeError;
+        return null;
       });
       let recoveryError: unknown;
       if (machine?.config) {
@@ -528,7 +545,7 @@ export function createLegacyFlyDeployProvider(opts: FlyDeployProviderOptions): D
             swallow("legacy fly deploy: applied config lookup failed", historyError);
             return machine.config!;
           });
-          await updateAndStart(machine, restored);
+          await restore(machine, restored);
           discardFailedRelease = true;
         } catch (rollbackError) {
           recoveryError = rollbackError;
@@ -544,12 +561,14 @@ export function createLegacyFlyDeployProvider(opts: FlyDeployProviderOptions): D
       }
       if (recoveryError) {
         throw new AggregateError(
-          [error, recoveryError],
-          `Fly deployment failed and recovery failed: ${errMessage(error)}`,
+          [placeError, recoveryError],
+          `Fly deployment failed and recovery failed (${errMessage(recoveryError)})` +
+            (diagnosis ? `; ${diagnosis}` : ""),
           { cause: placeError },
         );
       }
-      throw error;
+      if (diagnosis) throw new Error(diagnosis, { cause: placeError });
+      throw placeError;
     } finally {
       if (!completed && discardFailedRelease) {
         await opts.releaseStore

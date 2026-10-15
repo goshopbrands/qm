@@ -432,6 +432,7 @@ test("failed redeploy restores the previous Machine config and removes the faile
     probe: async () => {
       throw new Error("not ready");
     },
+    rollbackRetryDelayMs: 0,
   });
 
   await assert.rejects(() => failing.apply(d, version(2, snapshot("server.js", "v2"))), /not ready/);
@@ -459,6 +460,7 @@ test("failed redeploy of a stopped Machine restarts the restored version", async
     probe: async () => {
       throw new Error("not ready");
     },
+    rollbackRetryDelayMs: 0,
   });
 
   await assert.rejects(() => failing.apply(d, version(2, snapshot("server.js", "v2"))), /not ready/);
@@ -530,11 +532,15 @@ test("rollback failure is surfaced and keeps the release needed by the accepted 
     probe: async () => {
       throw new Error("not ready");
     },
+    rollbackRetryDelayMs: 0,
   });
 
   await assert.rejects(
     () => failing.apply(d, version(2, snapshot("server.js", "v2"))),
-    /deployment failed and recovery failed/,
+    (error: Error) => {
+      assert.match(error.message, /deployment failed and recovery failed \(rollback rejected\)/);
+      return true;
+    },
   );
   assert.deepEqual(blobs.deleted, []);
 });
@@ -553,6 +559,7 @@ function failingProvider(api: FlyDeployApi, blobs: ReturnType<typeof recordingBl
     probe: async () => {
       throw new Error("not ready");
     },
+    rollbackRetryDelayMs: 0,
   });
 }
 
@@ -563,11 +570,11 @@ test("failed redeploy restores the applied version when an earlier rollback stra
   await provider(fake.api, [], blobs).apply(d, version(1, snapshot("server.js", "v1")));
   const applied = fake.machines.get(APP)?.[0]?.config;
   const update = fake.api.updateMachine.bind(fake.api);
-  let rejectRollback = true;
+  let rejectedRollbacks = 0;
   fake.api.updateMachine = async (name, id, config) => {
-    if (rejectRollback && config.metadata?.qm_deployment_version === "1") {
-      rejectRollback = false;
-      throw new Error("rollback rejected");
+    if (rejectedRollbacks < 3 && config.metadata?.qm_deployment_version === "1") {
+      rejectedRollbacks++;
+      throw new Error("machine has an automatic restart pending");
     }
     return update(name, id, config);
   };
@@ -656,7 +663,7 @@ test("an app that exits while starting is named in the deploy error", async () =
     (error: Error) => {
       assert.equal(
         error.message,
-        'Fly app exited with code 127 (command not found) while starting; check the entrypoint "server.js"',
+        'Fly app exited with code 127 (command not found) while starting; boot downloads and unpacks the release, then runs the entrypoint "server.js"',
       );
       assert.match(String((error.cause as Error).message), /not ready/);
       return true;
@@ -687,7 +694,7 @@ test("an app that never reports started is still diagnosed from its exits", asyn
   await assert.rejects(
     () =>
       failingProvider(fake.api, blobs).apply(d, version(2, snapshot("server.js", "v2"), { entrypoint: "server.js" })),
-    /exited with code 127 \(command not found\) while starting; check the entrypoint "server.js"/,
+    /exited with code 127 \(command not found\) while starting; .* entrypoint "server.js"/,
   );
 });
 
@@ -696,22 +703,88 @@ test("exits from before the latest placement are not blamed on the new entrypoin
   const blobs = recordingBlobs();
   const d = deployment();
   await provider(fake.api, [], blobs).apply(d, version(1, snapshot("server.js", "v1")));
-  fake.events.set(fake.machines.get(APP)![0]!.id, [
-    { type: "update", timestamp: 5 },
+  const id = fake.machines.get(APP)![0]!.id;
+  fake.events.set(id, [
+    { type: "start", timestamp: 30 },
+    { type: "update", timestamp: 20 },
     { type: "exit", timestamp: 10, request: { exit_event: { exit_code: 127 } } },
   ]);
-  fake.api.updateMachine = async () => {
-    throw new Error("machine has an automatic restart pending");
-  };
 
   await assert.rejects(
     () => failingProvider(fake.api, blobs).apply(d, version(2, snapshot("server.js", "v2"))),
     (error: Error) => {
-      assert.match(error.message, /automatic restart pending/);
-      assert.doesNotMatch(error.message, /exited with code/);
+      assert.equal(error.message, "not ready");
       return true;
     },
   );
+});
+
+test("a crash loop that fills the event window is still diagnosed", async () => {
+  const fake = fakeApi();
+  const blobs = recordingBlobs();
+  const d = deployment();
+  await provider(fake.api, [], blobs).apply(d, version(1, snapshot("server.js", "v1")));
+  const id = fake.machines.get(APP)![0]!.id;
+  fake.events.set(
+    id,
+    Array.from({ length: 50 }, (_, index) =>
+      index % 2
+        ? { type: "start", timestamp: 100 - index }
+        : { type: "exit", timestamp: 100 - index, request: { exit_event: { exit_code: 127 } } },
+    ),
+  );
+
+  await assert.rejects(
+    () => failingProvider(fake.api, blobs).apply(d, version(2, snapshot("server.js", "v2"))),
+    /exited with code 127 \(command not found\)/,
+  );
+});
+
+test("a rollback refused while a restart is pending is retried", async () => {
+  const fake = fakeApi();
+  const blobs = recordingBlobs();
+  const d = deployment();
+  await provider(fake.api, [], blobs).apply(d, version(1, snapshot("server.js", "v1")));
+  const prior = fake.machines.get(APP)?.[0]?.config;
+  const update = fake.api.updateMachine.bind(fake.api);
+  let refusals = 2;
+  fake.api.updateMachine = async (name, id, config) => {
+    if (refusals > 0 && config.metadata?.qm_deployment_version === "1") {
+      refusals--;
+      throw new Error("machine has an automatic restart pending");
+    }
+    return update(name, id, config);
+  };
+
+  await assert.rejects(
+    () => failingProvider(fake.api, blobs).apply(d, version(2, snapshot("server.js", "v2"))),
+    /not ready/,
+  );
+  assert.deepEqual(fake.machines.get(APP)?.[0]?.config, prior);
+  assert.deepEqual(blobs.deleted, ["00000000000000000000000000000002"]);
+});
+
+test("a history config on a different volume is not restored", async () => {
+  const fake = fakeApi();
+  const blobs = recordingBlobs();
+  const d = deployment();
+  const p = provider(fake.api, [], blobs);
+  await p.apply(d, version(1, snapshot("server.js", "v1")));
+  const id = fake.machines.get(APP)![0]!.id;
+  fake.history.set(
+    id,
+    fake.history.get(id)!.map((config) => ({ ...config, mounts: [{ volume: "vol-old", path: "/data" }] })),
+  );
+  await p.apply(d, version(2, snapshot("server.js", "v2")));
+  const running = fake.machines.get(APP)?.[0]?.config;
+  fake.history.set(id, [...fake.history.get(id)!.filter((config) => config.metadata?.qm_deployment_version === "1")]);
+  blobs.payloads.set("00000000000000000000000000000001", Buffer.from("v1"));
+
+  await assert.rejects(
+    () => failingProvider(fake.api, blobs).apply({ ...d, appliedVersion: 1 }, version(3, snapshot("server.js", "v3"))),
+    /not ready/,
+  );
+  assert.deepEqual(fake.machines.get(APP)?.[0]?.config, running);
 });
 
 test("Fly API refuses an app with a public IP address", async () => {
