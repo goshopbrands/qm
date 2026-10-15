@@ -2,7 +2,7 @@ import { pack } from "tar-stream";
 import type { Deployment, DeploymentVersion } from "./deploy-store.ts";
 import type { DeployEndpoint, DeployProvider, DeployReconcileInput } from "./deploy-provider.ts";
 import { normalizeRelPath, readTree } from "./deploy-fs.ts";
-import { swallow } from "../util/errors.ts";
+import { errMessage, swallow } from "../util/errors.ts";
 import { sleep } from "../util/async.ts";
 import { shq } from "../util/shell.ts";
 import { DEPLOY_RELEASE_AUD, mintCapabilityToken } from "../auth/capability-token.ts";
@@ -18,6 +18,8 @@ const RELEASE_KEY = "qm_deployment_release";
 const RELEASE_EXPIRY = Date.UTC(2100, 0, 1);
 const MACHINE_WAIT_SLICE_SECONDS = 60;
 const MACHINE_WAIT_ATTEMPTS = 5;
+const MACHINE_EVENT_LIMIT = 50;
+const EXIT_CODE_MEANINGS: Record<number, string> = { 126: "not executable", 127: "command not found" };
 
 export interface FlyApp {
   name: string;
@@ -30,6 +32,18 @@ export interface FlyVolume {
   state?: string;
   attached_machine_id?: string | null;
   region?: string;
+}
+
+export interface FlyExitEvent {
+  exit_code?: number;
+  oom_killed?: boolean;
+  requested_stop?: boolean;
+}
+
+export interface FlyMachineEvent {
+  type?: string;
+  timestamp?: number;
+  request?: { exit_event?: FlyExitEvent; MonitorEvent?: { exit_event?: FlyExitEvent } } | null;
 }
 
 export interface FlyMachine {
@@ -53,6 +67,8 @@ export interface FlyDeployApi {
   listVolumes(name: string): Promise<FlyVolume[]>;
   createVolume(name: string, region: string): Promise<FlyVolume>;
   listMachines(name: string): Promise<FlyMachine[]>;
+  listMachineConfigs(name: string, id: string): Promise<FlyMachineConfig[]>;
+  listMachineEvents(name: string, id: string): Promise<FlyMachineEvent[]>;
   createMachine(name: string, region: string, config: FlyMachineConfig): Promise<FlyMachine>;
   updateMachine(name: string, id: string, config: FlyMachineConfig): Promise<FlyMachine>;
   startMachine(name: string, id: string): Promise<void>;
@@ -160,6 +176,20 @@ export function createFlyDeployApi(
     listMachines(name) {
       return request<FlyMachine[]>(`/v1/apps/${encodeURIComponent(name)}/machines`);
     },
+    async listMachineConfigs(name, id) {
+      const versions = await request<Array<{ version: string; user_config?: FlyMachineConfig }>>(
+        `/v1/apps/${encodeURIComponent(name)}/machines/${encodeURIComponent(id)}/versions`,
+      );
+      return versions
+        .filter((entry) => entry.user_config)
+        .sort((a, b) => a.version.localeCompare(b.version))
+        .map((entry) => entry.user_config!);
+    },
+    listMachineEvents(name, id) {
+      return request<FlyMachineEvent[]>(
+        `/v1/apps/${encodeURIComponent(name)}/machines/${encodeURIComponent(id)}/events?limit=${MACHINE_EVENT_LIMIT}`,
+      );
+    },
     createMachine(name, region, config) {
       return request<FlyMachine>(`/v1/apps/${encodeURIComponent(name)}/machines`, {
         method: "POST",
@@ -222,6 +252,19 @@ async function tarBytes(files: Array<{ path: string; data: Uint8Array }>): Promi
   }
   archive.finalize();
   return complete;
+}
+
+function lastStartupExit(events: FlyMachineEvent[]): FlyExitEvent | undefined {
+  const placements = events
+    .filter((event) => event.type === "update" || event.type === "launch")
+    .map((event) => event.timestamp ?? 0);
+  if (!placements.length) return undefined;
+  const placedAt = Math.max(...placements);
+  return events
+    .filter((event) => event.type === "exit" && (event.timestamp ?? 0) > placedAt)
+    .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0))
+    .map((event) => event.request?.exit_event ?? event.request?.MonitorEvent?.exit_event)
+    .find((exit) => exit && !exit.requested_stop);
 }
 
 function liveMachines(machines: FlyMachine[]): FlyMachine[] {
@@ -418,15 +461,41 @@ export function createLegacyFlyDeployProvider(opts: FlyDeployProviderOptions): D
     const volume = await volumeFor(name, machine);
     const { config, blobId } = await buildConfig(d, version, volume, input);
     let placed: FlyMachine | null = null;
+    let updated: FlyMachine | null = null;
+    const releaseExists = async (releaseId: string | undefined): Promise<boolean> => {
+      const release = releaseId ? await opts.releaseStore.open(releaseId) : null;
+      release?.stream.destroy();
+      return release !== null;
+    };
+    const appliedConfig = async (id: string, current: FlyMachineConfig): Promise<FlyMachineConfig> => {
+      const applied = d.appliedVersion === undefined ? undefined : String(d.appliedVersion);
+      if (applied === undefined || current.metadata?.[VERSION_KEY] === applied) return current;
+      const history = await api.listMachineConfigs(name, id);
+      const candidate = history.findLast((config) => config.metadata?.[VERSION_KEY] === applied);
+      return candidate && (await releaseExists(candidate.metadata?.[RELEASE_KEY])) ? candidate : current;
+    };
+    const explainCrash = async (error: unknown): Promise<unknown> => {
+      const target = placed ?? updated;
+      if (!target) return error;
+      const exit = lastStartupExit(await api.listMachineEvents(name, target.id));
+      if (!exit) return error;
+      const meaning = exit.oom_killed ? "out of memory" : EXIT_CODE_MEANINGS[exit.exit_code ?? -1];
+      return new Error(
+        `Fly app exited with code ${exit.exit_code ?? "unknown"}${meaning ? ` (${meaning})` : ""} while starting; ` +
+          `check the entrypoint ${JSON.stringify(version.entrypoint)}`,
+        { cause: error },
+      );
+    };
     let completed = false;
     let discardFailedRelease = false;
     const updateAndStart = async (current: FlyMachine, nextConfig: FlyMachineConfig): Promise<FlyMachine> => {
-      const updated = await api.updateMachine(name, current.id, nextConfig);
-      if (!updated.instance_id) throw new Error(`Fly update for Machine ${updated.id} returned no instance_id`);
-      await api.waitMachineStopped(name, updated.id, updated.instance_id);
-      await api.startMachine(name, updated.id);
-      await api.waitMachine(name, updated.id);
-      return updated;
+      const result = await api.updateMachine(name, current.id, nextConfig);
+      updated = result;
+      if (!result.instance_id) throw new Error(`Fly update for Machine ${result.id} returned no instance_id`);
+      await api.waitMachineStopped(name, result.id, result.instance_id);
+      await api.startMachine(name, result.id);
+      await api.waitMachine(name, result.id);
+      return result;
     };
     try {
       if (machine) {
@@ -447,11 +516,19 @@ export function createLegacyFlyDeployProvider(opts: FlyDeployProviderOptions): D
           );
       }
       return { ...endpoint, image: opts.image };
-    } catch (error) {
+    } catch (placeError) {
+      const error = await explainCrash(placeError).catch((diagnosisError: unknown) => {
+        swallow("legacy fly deploy: crash diagnosis failed", diagnosisError);
+        return placeError;
+      });
       let recoveryError: unknown;
       if (machine?.config) {
         try {
-          await updateAndStart(machine, machine.config);
+          const restored = await appliedConfig(machine.id, machine.config).catch((historyError: unknown) => {
+            swallow("legacy fly deploy: applied config lookup failed", historyError);
+            return machine.config!;
+          });
+          await updateAndStart(machine, restored);
           discardFailedRelease = true;
         } catch (rollbackError) {
           recoveryError = rollbackError;
@@ -466,7 +543,11 @@ export function createLegacyFlyDeployProvider(opts: FlyDeployProviderOptions): D
         }
       }
       if (recoveryError) {
-        throw new AggregateError([error, recoveryError], "Fly deployment failed and recovery failed", { cause: error });
+        throw new AggregateError(
+          [error, recoveryError],
+          `Fly deployment failed and recovery failed: ${errMessage(error)}`,
+          { cause: placeError },
+        );
       }
       throw error;
     } finally {
