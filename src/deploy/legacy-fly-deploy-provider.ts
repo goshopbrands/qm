@@ -58,6 +58,7 @@ export interface FlyMachineConfig {
   image: string;
   env?: Record<string, string>;
   metadata?: Record<string, string>;
+  mounts?: Array<{ volume: string; path: string }>;
   [key: string]: unknown;
 }
 
@@ -476,8 +477,7 @@ export function createLegacyFlyDeployProvider(opts: FlyDeployProviderOptions): D
       const history = await api.listMachineConfigs(name, id);
       const candidate = history.findLast(
         (config) =>
-          config.metadata?.[VERSION_KEY] === applied &&
-          (config.mounts as Array<{ volume?: string }> | undefined)?.some((mount) => mount.volume === volume.id),
+          config.metadata?.[VERSION_KEY] === applied && config.mounts?.some((mount) => mount.volume === volume.id),
       );
       return candidate && (await releaseExists(candidate.metadata?.[RELEASE_KEY])) ? candidate : current;
     };
@@ -498,7 +498,7 @@ export function createLegacyFlyDeployProvider(opts: FlyDeployProviderOptions): D
           await updateAndStart(current, restored);
           return;
         } catch (error) {
-          if (attempt === ROLLBACK_ATTEMPTS) throw error;
+          if (attempt === ROLLBACK_ATTEMPTS || !errMessage(error).includes("automatic restart pending")) throw error;
           await sleep(rollbackRetryDelayMs);
         }
       }

@@ -764,6 +764,64 @@ test("a rollback refused while a restart is pending is retried", async () => {
   assert.deepEqual(blobs.deleted, ["00000000000000000000000000000002"]);
 });
 
+test("a rollback refused for another reason is not retried and its diagnosis is kept", async () => {
+  const fake = fakeApi();
+  const blobs = recordingBlobs();
+  const d = deployment();
+  await provider(fake.api, [], blobs).apply(d, version(1, snapshot("server.js", "v1")));
+  const id = fake.machines.get(APP)![0]!.id;
+  const update = fake.api.updateMachine.bind(fake.api);
+  let rollbacks = 0;
+  fake.api.updateMachine = async (name, machineId, config) => {
+    if (config.metadata?.qm_deployment_version === "1") {
+      rollbacks++;
+      throw new Error("Fly API POST failed (422): invalid config");
+    }
+    const result = await update(name, machineId, config);
+    fake.events.set(id, [
+      { type: "exit", timestamp: 30, request: { exit_event: { exit_code: 127 } } },
+      { type: "update", timestamp: 20 },
+    ]);
+    return result;
+  };
+
+  await assert.rejects(
+    () => failingProvider(fake.api, blobs).apply(d, version(2, snapshot("server.js", "v2"))),
+    (error: Error) => {
+      assert.match(
+        error.message,
+        /recovery failed \(Fly API POST failed \(422\): invalid config\); Fly app exited with code 127/,
+      );
+      return true;
+    },
+  );
+  assert.equal(rollbacks, 1);
+});
+
+test("a rollback whose start is refused after its update landed is retried", async () => {
+  const fake = fakeApi();
+  const blobs = recordingBlobs();
+  const d = deployment();
+  await provider(fake.api, [], blobs).apply(d, version(1, snapshot("server.js", "v1")));
+  const prior = fake.machines.get(APP)?.[0]?.config;
+  const start = fake.api.startMachine.bind(fake.api);
+  let refusals = 1;
+  fake.api.startMachine = async (name, id) => {
+    if (refusals > 0 && fake.machines.get(name)?.[0]?.config?.metadata?.qm_deployment_version === "1") {
+      refusals--;
+      throw new Error("failed to change machine state: machine has an automatic restart pending");
+    }
+    return start(name, id);
+  };
+
+  await assert.rejects(
+    () => failingProvider(fake.api, blobs).apply(d, version(2, snapshot("server.js", "v2"))),
+    /not ready/,
+  );
+  assert.deepEqual(fake.machines.get(APP)?.[0]?.config, prior);
+  assert.equal(fake.machines.get(APP)?.[0]?.state, "started");
+});
+
 test("a history config on a different volume is not restored", async () => {
   const fake = fakeApi();
   const blobs = recordingBlobs();
