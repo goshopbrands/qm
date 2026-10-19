@@ -324,17 +324,23 @@ export function createLegacyFlyDeployProvider(opts: FlyDeployProviderOptions): D
     return owned[0] ?? null;
   };
   const volumeFor = async (name: string, machine: FlyMachine | null): Promise<FlyVolume> => {
-    const volumes = (await api.listVolumes(name)).filter(
-      (volume) => volume.name === VOLUME_NAME && !DEPARTING_VOLUME_STATES.has(volume.state ?? ""),
-    );
+    const named = (await api.listVolumes(name)).filter((volume) => volume.name === VOLUME_NAME);
+    const volumes = named.filter((volume) => !DEPARTING_VOLUME_STATES.has(volume.state ?? ""));
     if (volumes.length > 1) throw new Error(`Fly app ${name} contains multiple ${VOLUME_NAME} volumes`);
+    if (!volumes.length && named.some((volume) => volume.state !== "destroyed")) {
+      throw new Error(
+        `Fly app ${name} has only ${VOLUME_NAME} volumes Fly is destroying; recover one or wait for the deletion before deploying`,
+      );
+    }
+    const mounted = machine?.config?.mounts?.find((mount) => mount.path === DATA_DIR)?.volume;
+    if (mounted && mounted !== volumes[0]?.id) {
+      throw new Error(
+        `Fly app ${name} Machine ${machine!.id} mounts volume ${mounted}, not its live ${VOLUME_NAME} volume`,
+      );
+    }
     const volume = volumes[0] ?? (await api.createVolume(name, opts.region));
     if (volume.attached_machine_id && volume.attached_machine_id !== machine?.id) {
       throw new Error(`Fly app ${name} data volume is attached to unexpected Machine ${volume.attached_machine_id}`);
-    }
-    const mounted = machine?.config?.mounts?.find((mount) => mount.path === DATA_DIR)?.volume;
-    if (mounted && mounted !== volume.id) {
-      throw new Error(`Fly app ${name} Machine ${machine!.id} mounts volume ${mounted}, not live volume ${volume.id}`);
     }
     return volume;
   };

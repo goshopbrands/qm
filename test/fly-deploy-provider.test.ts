@@ -513,19 +513,37 @@ test("durable apply retains one volume across updates, rollback, archive and rec
   assert.equal(fake.volumes.length, 1);
 });
 
-test("volumes Fly is destroying neither block durable apply nor keep a destroyed app alive", async () => {
-  const fake = fakeFly();
+test("durable apply skips volumes Fly is destroying but refuses when they are all that is left", async () => {
   const departing = ["scheduling_destroy", "pending_destroy", "destroying", "destroyed"];
-  for (const state of departing) fake.volumes.push({ id: `old-${state}`, name: "qm_data", region: "lhr", state });
-  const deploy = provider(fake.fetchImpl, { dataVolumeSizeGb: 1 });
-  await deploy.apply(deployment(ID), version(snapshot({ "server.js": "first" })));
-  assert.deepEqual(fake.configs.get("machine-1")!.mounts, [{ volume: "volume-5", path: "/data" }]);
+  const withLive = fakeFly();
+  for (const state of departing) withLive.volumes.push({ id: `old-${state}`, name: "qm_data", region: "lhr", state });
+  withLive.volumes.push({ id: "live", name: "qm_data", region: "lhr", state: "created" });
+  await provider(withLive.fetchImpl, { dataVolumeSizeGb: 1 }).apply(
+    deployment(ID),
+    version(snapshot({ "server.js": "first" })),
+  );
+  assert.deepEqual(withLive.configs.get("machine-1")!.mounts, [{ volume: "live", path: "/data" }]);
 
-  const ephemeral = fakeFly({ existingApp: OWNED_APP });
-  for (const state of departing) ephemeral.volumes.push({ id: `old-${state}`, name: "qm_data", region: "lhr", state });
-  await provider(ephemeral.fetchImpl).destroy(deployment(ID));
-  assert.equal(ephemeral.calls.at(-1)!.method, "DELETE");
-  assert.equal(ephemeral.calls.at(-1)!.path, `/v1/apps/${APP}`);
+  const onlyDeparting = fakeFly();
+  for (const state of departing) {
+    onlyDeparting.volumes.push({ id: `old-${state}`, name: "qm_data", region: "lhr", state });
+  }
+  await assert.rejects(
+    provider(onlyDeparting.fetchImpl, { dataVolumeSizeGb: 1 }).apply(
+      deployment(ID),
+      version(snapshot({ "server.js": "first" })),
+    ),
+    /only volumes Fly is destroying/,
+  );
+  assert.equal(onlyDeparting.volumes.length, departing.length);
+
+  const onlyDestroyed = fakeFly();
+  onlyDestroyed.volumes.push({ id: "gone", name: "qm_data", region: "lhr", state: "destroyed" });
+  await provider(onlyDestroyed.fetchImpl, { dataVolumeSizeGb: 1 }).apply(
+    deployment(ID),
+    version(snapshot({ "server.js": "first" })),
+  );
+  assert.deepEqual(onlyDestroyed.configs.get("machine-1")!.mounts, [{ volume: "volume-2", path: "/data" }]);
 });
 
 test("durable apply refuses to replace an existing ephemeral machine", async () => {

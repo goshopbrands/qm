@@ -401,17 +401,19 @@ portal change), so also read the upstream commits it lists for these files.
 
 **Problem.** Fly's volume list keeps returning a destroyed volume for its retention window, in
 state `pending_destroy` (`flyctl volumes list` hides it; `--all` shows it). Upstream's Fly deploy
-provider counts every listed volume: `ensureVolume` refuses to deploy ("has unexpected volumes"),
-and `hasVolumes` makes apply demand `FLY_DEPLOY_DATA_VOLUME_SIZE_GB` and makes destroy leave the
-app behind. The legacy provider (Patch 2) skipped only `destroyed` volumes, so on 2026-10-19
+provider's `ensureVolume` counts every listed volume and refuses to deploy ("has unexpected
+volumes"). The legacy provider (Patch 2) skipped only `destroyed` volumes, so on 2026-10-19
 goshop-weekly-dashboard could not publish: "contains multiple qm_data volumes", from a volume
 deleted weeks earlier.
 
-**Change.** `DEPARTING_VOLUME_STATES` in `src/deploy/fly-deploy-provider.ts` (`scheduling_destroy`,
-`pending_destroy`, `destroying`, `destroyed`) is filtered out of both of that provider's volume
-lists, and the legacy provider imports it for its `qm_data` lookup. The legacy provider also
-refuses to deploy when its Machine mounts a volume other than the live one, so a Machine whose
-only volume is being destroyed is never quietly moved onto a new, empty volume.
+**Change.** Both providers skip volumes in `DEPARTING_VOLUME_STATES` (`scheduling_destroy`,
+`pending_destroy`, `destroying`, `destroyed`, exported from `src/deploy/fly-deploy-provider.ts`)
+when picking the `qm_data` volume. When those are the only `qm_data` volumes left and one is not yet
+`destroyed`, both refuse to deploy instead of creating an empty one, so a deletion still inside
+Fly's retention window can be recovered; once Fly finishes it, the next deploy creates a new volume. The legacy provider also refuses when its
+Machine's `/data` mount is not the live volume, checked before any volume is created. Upstream's
+`hasVolumes` still counts departing volumes, so destroy keeps an app whose volume Fly is still
+deleting.
 
 **Files.** `src/deploy/fly-deploy-provider.ts`, `src/deploy/legacy-fly-deploy-provider.ts`, and
 tests `test/fly-deploy-provider.test.ts`, `test/legacy-fly-deploy-provider.test.ts`.

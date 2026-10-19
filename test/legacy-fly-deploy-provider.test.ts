@@ -310,18 +310,34 @@ test("redeploy ignores a qm_data volume Fly is still destroying", async () => {
   assert.deepEqual(fake.configs[1]!.mounts, [{ volume: "vol-1", path: "/data" }]);
 });
 
-test("redeploy refuses to move a Machine off a volume Fly is destroying", async () => {
+test("a Machine is never moved off its volume or onto an empty one while Fly destroys its volume", async () => {
   const fake = fakeApi();
   const p = provider(fake.api, []);
   const d = deployment();
   await p.apply(d, version(1, snapshot("server.js", "v1")));
   fake.volumes.get(APP)![0]!.state = "pending_destroy";
 
+  await assert.rejects(p.apply(d, version(2, snapshot("server.js", "v2"))), /only qm_data volumes Fly is destroying/);
+  fake.volumes.get(APP)!.push({ id: "vol-other", name: "qm_data", state: "created", region: "sjc" });
   await assert.rejects(
     p.apply(d, version(2, snapshot("server.js", "v2"))),
-    /Machine machine-1 mounts volume vol-1, not live volume vol-2/,
+    /Machine machine-1 mounts volume vol-1, not its live qm_data volume/,
   );
+  assert.equal(fake.calls.createVolume, 1);
   assert.equal(fake.calls.updateMachine, 0);
+});
+
+test("restore refuses to start on an empty volume while Fly destroys the retained one", async () => {
+  const fake = fakeApi();
+  const p = provider(fake.api, []);
+  const d = deployment();
+  await p.apply(d, version(1, snapshot("server.js", "v1")));
+  await p.destroy(d);
+  fake.volumes.get(APP)![0]!.state = "pending_destroy";
+
+  await assert.rejects(p.apply(d, version(1, snapshot("server.js", "v1"))), /only qm_data volumes Fly is destroying/);
+  assert.equal(fake.calls.createVolume, 1);
+  assert.equal(fake.calls.createMachine, 1);
 });
 
 test("redeploy waits for a stopped Machine update version before explicitly starting it", async () => {
