@@ -21,6 +21,9 @@ const MACHINE_START_TIMEOUT_MS = 90_000;
 const APP_READY_TIMEOUT_MS = 90_000;
 const POLL_INTERVAL_MS = 1_000;
 const API_TIMEOUT_MS = 30_000;
+export const DEPARTING_VOLUME_STATES = new Set(["scheduling_destroy", "pending_destroy", "destroying", "destroyed"]);
+const liveVolumes = <T extends { state?: string }>(volumes: T[]): T[] =>
+  volumes.filter((volume) => !DEPARTING_VOLUME_STATES.has(volume.state ?? ""));
 const APP_ALREADY_TAKEN = /already\s+(exists|been\s+taken)|name\s+is\s+taken/i;
 
 interface FlyApp {
@@ -147,15 +150,17 @@ function createFlyMachinesApi(opts: { token: string; fetchImpl?: typeof fetch })
     async hasVolumes(appName): Promise<boolean> {
       const listed = await request("GET", `${app(appName)}/volumes`);
       if (!listed.ok) throw failure(`list volumes in ${appName}`, listed);
-      return parse<unknown[]>(`list volumes in ${appName}`, listed).length > 0;
+      return liveVolumes(parse<Array<{ state?: string }>>(`list volumes in ${appName}`, listed)).length > 0;
     },
     async ensureVolume(appName, region, sizeGb, name): Promise<string> {
       const path = `${app(appName)}/volumes`;
       const listed = await request("GET", path);
       if (!listed.ok) throw failure(`list volumes in ${appName}`, listed);
-      const volumes = parse<Array<{ id: string; name: string; region: string }>>(
-        `list volumes in ${appName}`,
-        listed,
+      const volumes = liveVolumes(
+        parse<Array<{ id: string; name: string; region: string; state?: string }>>(
+          `list volumes in ${appName}`,
+          listed,
+        ),
       ).filter((volume) => name === "qm_data" || volume.name === name);
       if (volumes.length) {
         if (volumes.length !== 1 || volumes[0]!.name !== name || volumes[0]!.region !== region) {

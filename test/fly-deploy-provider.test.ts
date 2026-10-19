@@ -56,7 +56,7 @@ function fakeFly(opts: FakeFlyOptions = {}) {
   const calls: FlyCall[] = [];
   const machines = new Map<string, string>();
   const configs = new Map<string, FlyMachineConfig>();
-  const volumes: Array<{ id: string; name: string; region: string }> = [];
+  const volumes: Array<{ id: string; name: string; region: string; state?: string }> = [];
   for (const id of opts.existingMachines ?? []) machines.set(id, "started");
   const states = [...(opts.states ?? ["started"])];
   const checkStates = [...(opts.checkStates ?? ["passing"])];
@@ -511,6 +511,21 @@ test("durable apply retains one volume across updates, rollback, archive and rec
   await deploy.apply(d, first);
   assert.deepEqual(fake.configs.get("machine-2")!.mounts, original.mounts);
   assert.equal(fake.volumes.length, 1);
+});
+
+test("volumes Fly is destroying neither block durable apply nor keep a destroyed app alive", async () => {
+  const fake = fakeFly();
+  const departing = ["scheduling_destroy", "pending_destroy", "destroying", "destroyed"];
+  for (const state of departing) fake.volumes.push({ id: `old-${state}`, name: "qm_data", region: "lhr", state });
+  const deploy = provider(fake.fetchImpl, { dataVolumeSizeGb: 1 });
+  await deploy.apply(deployment(ID), version(snapshot({ "server.js": "first" })));
+  assert.deepEqual(fake.configs.get("machine-1")!.mounts, [{ volume: "volume-5", path: "/data" }]);
+
+  const ephemeral = fakeFly({ existingApp: OWNED_APP });
+  for (const state of departing) ephemeral.volumes.push({ id: `old-${state}`, name: "qm_data", region: "lhr", state });
+  await provider(ephemeral.fetchImpl).destroy(deployment(ID));
+  assert.equal(ephemeral.calls.at(-1)!.method, "DELETE");
+  assert.equal(ephemeral.calls.at(-1)!.path, `/v1/apps/${APP}`);
 });
 
 test("durable apply refuses to replace an existing ephemeral machine", async () => {

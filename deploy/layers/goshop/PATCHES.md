@@ -394,3 +394,35 @@ portal change), so also read the upstream commits it lists for these files.
 2. Take upstream's versions of the files above (keeping Patch 4's hunks in the two shared files),
    drop the assertions added by this patch from the two test files unless upstream's code passes them,
    and remove this section.
+
+## Patch 6: Fly volumes being destroyed are not counted as live
+
+**Status:** active since 2026-10-19.
+
+**Problem.** Fly's volume list keeps returning a destroyed volume for its retention window, in
+state `pending_destroy` (`flyctl volumes list` hides it; `--all` shows it). Upstream's Fly deploy
+provider counts every listed volume: `ensureVolume` refuses to deploy ("has unexpected volumes"),
+and `hasVolumes` makes apply demand `FLY_DEPLOY_DATA_VOLUME_SIZE_GB` and makes destroy leave the
+app behind. The legacy provider (Patch 2) skipped only `destroyed` volumes, so on 2026-10-19
+goshop-weekly-dashboard could not publish: "contains multiple qm_data volumes", from a volume
+deleted weeks earlier.
+
+**Change.** `DEPARTING_VOLUME_STATES` in `src/deploy/fly-deploy-provider.ts` (`scheduling_destroy`,
+`pending_destroy`, `destroying`, `destroyed`) is filtered out of both of that provider's volume
+lists, and the legacy provider imports it for its `qm_data` lookup. The legacy provider also
+refuses to deploy when its Machine mounts a volume other than the live one, so a Machine whose
+only volume is being destroyed is never quietly moved onto a new, empty volume.
+
+**Files.** `src/deploy/fly-deploy-provider.ts`, `src/deploy/legacy-fly-deploy-provider.ts`, and
+tests `test/fly-deploy-provider.test.ts`, `test/legacy-fly-deploy-provider.test.ts`.
+
+**Retirement signal.** `check-patches.sh` reports a retire candidate when upstream's
+`src/deploy/fly-deploy-provider.ts` mentions `pending_destroy`.
+
+**Retirement steps.**
+
+1. Read how upstream filters volume states. Take its version of `src/deploy/fly-deploy-provider.ts`
+   and point the legacy provider's `qm_data` lookup at upstream's equivalent, or keep a local
+   constant in the legacy provider if upstream does not export one.
+2. Keep the legacy provider's mount check and its tests; drop this patch's test from
+   `test/fly-deploy-provider.test.ts` unless upstream's code passes it, and remove this section.
