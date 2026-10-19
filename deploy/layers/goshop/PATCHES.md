@@ -394,3 +394,44 @@ portal change), so also read the upstream commits it lists for these files.
 2. Take upstream's versions of the files above (keeping Patch 4's hunks in the two shared files),
    drop the assertions added by this patch from the two test files unless upstream's code passes them,
    and remove this section.
+
+## Patch 6: Fly volumes being destroyed are not counted as live
+
+**Status:** active since 2026-10-19.
+
+**Problem.** Fly's volume list keeps returning a destroyed volume for its retention window, in
+state `pending_destroy` (`flyctl volumes list` hides it; `--all` shows it). Upstream's Fly deploy
+provider's `ensureVolume` counts every listed volume and refuses to deploy ("has unexpected
+volumes"). The legacy provider (Patch 2) skipped only `destroyed` volumes, so on 2026-10-19
+goshop-weekly-dashboard could not publish: "contains multiple qm_data volumes", from a volume
+deleted weeks earlier.
+
+**Change.** Both providers skip volumes in `DEPARTING_VOLUME_STATES` (`scheduling_destroy`,
+`pending_destroy`, `destroying`, `destroyed`, exported from `src/deploy/fly-deploy-provider.ts`)
+when picking the data volume. When no live data volume is left and a departing one is not yet
+`destroyed`, both refuse to deploy instead of starting the app on a new empty volume, so a
+deletion still inside Fly's retention window can be recovered. (The legacy provider looks only at
+`qm_data` volumes; upstream's `qm_data` mode looks at every volume in the app.) The legacy
+provider also refuses when its Machine's `/data` mount is not a live volume, checked before any
+volume is created. Upstream's `hasVolumes` still counts departing volumes, so destroy keeps an app
+whose volume Fly is still deleting.
+
+Fly can keep a deleted volume listed for weeks. To get past the refusal, check
+`flyctl volumes list -a <app> --all`, then either restore the volume from its snapshot
+(`flyctl volumes snapshots list <volume-id>`, then `flyctl volumes create qm_data -a <app>
+--snapshot-id <id>`) or wait until Fly reports it `destroyed`, after which the next deploy creates
+a new volume.
+
+**Files.** `src/deploy/fly-deploy-provider.ts`, `src/deploy/legacy-fly-deploy-provider.ts`, and
+tests `test/fly-deploy-provider.test.ts`, `test/legacy-fly-deploy-provider.test.ts`.
+
+**Retirement signal.** `check-patches.sh` reports a retire candidate when upstream's
+`src/deploy/fly-deploy-provider.ts` mentions `pending_destroy`.
+
+**Retirement steps.**
+
+1. Read how upstream filters volume states. Take its version of `src/deploy/fly-deploy-provider.ts`
+   and point the legacy provider's `qm_data` lookup at upstream's equivalent, or keep a local
+   constant in the legacy provider if upstream does not export one.
+2. Keep the legacy provider's mount check and its tests; drop this patch's test from
+   `test/fly-deploy-provider.test.ts` unless upstream's code passes it, and remove this section.

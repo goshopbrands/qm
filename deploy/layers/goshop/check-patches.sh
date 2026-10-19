@@ -144,6 +144,18 @@ else
   fi
 fi
 
+echo "== Patch 6: Fly volumes being destroyed are not counted as live"
+report_touches src/deploy/fly-deploy-provider.ts
+if [ -z "$provider" ]; then
+  echo "  PROBE ERROR: $ref has no src/deploy/fly-deploy-provider.ts — inspect before deciding"
+  review=1
+elif grep -q pending_destroy <<<"$provider"; then
+  echo "  RETIRE CANDIDATE: $ref's Fly deploy provider handles pending_destroy volumes; follow Patch 6's retirement steps"
+  review=1
+else
+  echo "  still needed: $ref's Fly deploy provider counts volumes Fly is still destroying"
+fi
+
 if [ "$review" = 1 ]; then
   echo
   echo "Review deploy/layers/goshop/PATCHES.md before merging this update."

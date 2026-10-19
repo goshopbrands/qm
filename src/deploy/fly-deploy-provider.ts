@@ -21,6 +21,7 @@ const MACHINE_START_TIMEOUT_MS = 90_000;
 const APP_READY_TIMEOUT_MS = 90_000;
 const POLL_INTERVAL_MS = 1_000;
 const API_TIMEOUT_MS = 30_000;
+export const DEPARTING_VOLUME_STATES = new Set(["scheduling_destroy", "pending_destroy", "destroying", "destroyed"]);
 const APP_ALREADY_TAKEN = /already\s+(exists|been\s+taken)|name\s+is\s+taken/i;
 
 interface FlyApp {
@@ -153,10 +154,16 @@ function createFlyMachinesApi(opts: { token: string; fetchImpl?: typeof fetch })
       const path = `${app(appName)}/volumes`;
       const listed = await request("GET", path);
       if (!listed.ok) throw failure(`list volumes in ${appName}`, listed);
-      const volumes = parse<Array<{ id: string; name: string; region: string }>>(
+      const named = parse<Array<{ id: string; name: string; region: string; state?: string }>>(
         `list volumes in ${appName}`,
         listed,
       ).filter((volume) => name === "qm_data" || volume.name === name);
+      const volumes = named.filter((volume) => !DEPARTING_VOLUME_STATES.has(volume.state ?? ""));
+      if (!volumes.length && named.some((volume) => volume.state !== "destroyed")) {
+        throw new Error(
+          `fly app ${appName} has only volumes Fly is destroying; recover one or wait for the deletion before deploying`,
+        );
+      }
       if (volumes.length) {
         if (volumes.length !== 1 || volumes[0]!.name !== name || volumes[0]!.region !== region) {
           throw new Error(`fly app ${appName} has unexpected volumes; reconcile storage before deploying`);
