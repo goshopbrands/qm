@@ -408,12 +408,19 @@ deleted weeks earlier.
 
 **Change.** Both providers skip volumes in `DEPARTING_VOLUME_STATES` (`scheduling_destroy`,
 `pending_destroy`, `destroying`, `destroyed`, exported from `src/deploy/fly-deploy-provider.ts`)
-when picking the `qm_data` volume. When those are the only `qm_data` volumes left and one is not yet
-`destroyed`, both refuse to deploy instead of creating an empty one, so a deletion still inside
-Fly's retention window can be recovered; once Fly finishes it, the next deploy creates a new volume. The legacy provider also refuses when its
-Machine's `/data` mount is not the live volume, checked before any volume is created. Upstream's
-`hasVolumes` still counts departing volumes, so destroy keeps an app whose volume Fly is still
-deleting.
+when picking the data volume. When no live data volume is left and a departing one is not yet
+`destroyed`, both refuse to deploy instead of starting the app on a new empty volume, so a
+deletion still inside Fly's retention window can be recovered. (The legacy provider looks only at
+`qm_data` volumes; upstream's `qm_data` mode looks at every volume in the app.) The legacy
+provider also refuses when its Machine's `/data` mount is not a live volume, checked before any
+volume is created. Upstream's `hasVolumes` still counts departing volumes, so destroy keeps an app
+whose volume Fly is still deleting.
+
+Fly can keep a deleted volume listed for weeks. To get past the refusal, check
+`flyctl volumes list -a <app> --all`, then either restore the volume from its snapshot
+(`flyctl volumes snapshots list <volume-id>`, then `flyctl volumes create qm_data -a <app>
+--snapshot-id <id>`) or wait until Fly reports it `destroyed`, after which the next deploy creates
+a new volume.
 
 **Files.** `src/deploy/fly-deploy-provider.ts`, `src/deploy/legacy-fly-deploy-provider.ts`, and
 tests `test/fly-deploy-provider.test.ts`, `test/legacy-fly-deploy-provider.test.ts`.

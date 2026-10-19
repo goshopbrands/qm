@@ -335,7 +335,7 @@ export function createLegacyFlyDeployProvider(opts: FlyDeployProviderOptions): D
     const mounted = machine?.config?.mounts?.find((mount) => mount.path === DATA_DIR)?.volume;
     if (mounted && mounted !== volumes[0]?.id) {
       throw new Error(
-        `Fly app ${name} Machine ${machine!.id} mounts volume ${mounted}, not its live ${VOLUME_NAME} volume`,
+        `Fly app ${name} Machine ${machine!.id} mounts volume ${mounted}, which is not a live ${VOLUME_NAME} volume`,
       );
     }
     const volume = volumes[0] ?? (await api.createVolume(name, opts.region));

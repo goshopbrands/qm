@@ -321,7 +321,7 @@ test("a Machine is never moved off its volume or onto an empty one while Fly des
   fake.volumes.get(APP)!.push({ id: "vol-other", name: "qm_data", state: "created", region: "sjc" });
   await assert.rejects(
     p.apply(d, version(2, snapshot("server.js", "v2"))),
-    /Machine machine-1 mounts volume vol-1, not its live qm_data volume/,
+    /Machine machine-1 mounts volume vol-1, which is not a live qm_data volume/,
   );
   assert.equal(fake.calls.createVolume, 1);
   assert.equal(fake.calls.updateMachine, 0);
