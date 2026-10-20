@@ -116,10 +116,20 @@ if [ -n "$new_routes" ]; then
   printf '%s\n' "$new_routes" | sed 's/^/    /'
   review=1
 fi
-new_resources="$(git diff "$base" "$ref" -- src/api/routes/admin-resources.ts 'src/api/routes/*-resource.ts' | grep -E '^\+ *id: "' || true)"
-if [ -n "$new_resources" ]; then
-  echo "  upstream added admin resources; ask whether managers should get each, then classify it in MANAGER_RESOURCES:"
-  printf '%s\n' "$new_resources" | sed 's/^/    /'
+resources_status=0
+unclassified_resources="$(node --input-type=module -e '
+const [tree, root] = process.argv.slice(1);
+const { ADMIN_RESOURCES } = await import(`${tree}/src/api/routes/admin-resources.ts`);
+const { MANAGER_RESOURCES } = await import(`${root}/src/admin/manager-access.ts`);
+for (const r of ADMIN_RESOURCES) if (!MANAGER_RESOURCES.has(r.id)) console.log(r.id);
+' "$tree" "$root" 2>&1)" || resources_status=$?
+if [ "$resources_status" != 0 ]; then
+  echo "  PROBE ERROR: could not load $ref's admin resources — inspect before deciding:"
+  printf '%s\n' "$unclassified_resources" | tail -10 | sed 's/^/    /'
+  review=1
+elif [ -n "$unclassified_resources" ]; then
+  echo "  $ref has admin resources missing from MANAGER_RESOURCES; ask whether managers should get each, then classify it:"
+  printf '%s\n' "$unclassified_resources" | sed 's/^/    /'
   review=1
 fi
 new_checks="$(git diff "$base" "$ref" -- src plugins | grep -E '^\+.*(adminStatusOf|adminStatusFromGrants|canAdminister|\.isAdmin\b|org_admin|actorIsOrgAdmin|adminProbe|authorizeAdmin|requireScopedAdmin)' || true)"

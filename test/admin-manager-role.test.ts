@@ -340,11 +340,13 @@ test("a manager must re-enter a stored secret to change where it is sent", async
       oauthAuthorizeUrl: `https://auth.${credentialHost}/authorize`,
       oauthTokenUrl: `https://auth.${credentialHost}/token`,
     });
-    for (const credentialHost of ["acme.com", "ACME.com", "tools.acme.com"]) {
+    for (const credentialHost of ["acme.com", "ACME.com", "acme.com.", "tools.acme.com"]) {
       assert.equal((await s.asManager("PUT", "/v1/admin/mcp-servers/corp", other(credentialHost))).status, 400);
       assert.equal((await s.asAdmin("PUT", "/v1/admin/mcp-servers/corp", other(credentialHost))).status, 400);
     }
     assert.equal((await s.asManager("PUT", "/v1/admin/mcp-servers/corp", other("example.org"))).status, 200);
+    assert.equal((await s.asManager("PUT", "/v1/admin/mcp-servers/mixed", other("Example.NET"))).status, 200);
+    assert.equal((await s.asAdmin("PUT", "/v1/admin/mcp-servers/gh-copy", other("GitHub.com"))).status, 400);
   } finally {
     await s.close();
   }

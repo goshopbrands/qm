@@ -300,8 +300,10 @@ upstream in v0.1.15) holds no shared secret, so a manager may edit one without r
 URL and its OAuth authorize and token endpoints must all be on its credential host: every user's
 refresh token goes to the token endpoint. For every writer, not only managers, an `oauth-user`
 server's credential host may not equal, contain, or sit inside another `oauth-user` server's
-(compared case-insensitively), because refreshes are routed to the first server whose host
-matches by suffix; this extends upstream's own collision check against built-in connectors. A manager
+because refreshes are routed to the first server whose host matches by suffix; this extends
+upstream's own collision check against built-in connectors. Credential hosts are stored
+lowercased without a trailing dot, so every host comparison in that handler agrees with the
+keychain's. A manager
 cannot change team membership (the `teams` admin resource, behind upstream's `team_scopes` flag),
 because a team's members read its conversations, and cannot change decision rules (the
 `decisions` resource, added upstream in v0.1.15), because a `turn_start` rule sends every turn's
@@ -337,9 +339,11 @@ same rule: an upstream resource added later is refused to managers until classif
 `test/admin-manager-role.test.ts` fails while any route or resource is unclassified, and while any
 rule names a route that no longer exists, so a removed route cannot return pre-classified.
 
-The orchestrator keeps two flags: managers count as admins for upstream's native admin tool,
-whose every call goes through `authorizeAdmin`, while the "Acting for an org admin" prompt and
-the org-memory self-write need `role === "org_admin"`.
+The orchestrator's `actorIsOrgAdmin` requires `role === "org_admin"`. It gates the "Acting for
+an org admin" prompt, the org-memory self-write, and upstream's native `admin` tool (added in
+v0.1.15), whose guardrails live in that prompt. A manager's live turn keeps the self-API admin
+access it had before (fenced per route by `authorizeAdmin`) and the tool's `whoami` action; a
+cron the manager granted `admin.*` scopes still gets the tool through those grants.
 
 **Files.** `src/admin/manager-access.ts` (new), `src/admin/admin-grant-store.ts`,
 `src/admin/admin-service.ts`, `src/api/routes/shared.ts`, `src/api/routes/admin/common.ts`,
@@ -348,7 +352,7 @@ the org-memory self-write need `role === "org_admin"`.
 `src/api/routes/admin/users.ts`, `src/api/routes/admin/sessions.ts` (no raw model requests for
 managers), `src/api/routes/skill-packs.ts` (readable import targets; pack source changes by its
 creator only), `src/api/app-sessions.ts` (promotion from readable scopes), `src/core/orchestrator.ts` (admin
-prompt for org admins only; native admin tool for every admin), `src/api/routes/admin-resources.ts`
+prompt, org-memory self-write, and native admin tool for org admins only), `src/api/routes/admin-resources.ts`
 (secret re-entry), `src/api/routes/admin/custom-providers.ts`, and `src/api/routes/admin/mcp-servers.ts` (secret
 re-entry; `oauth-user` endpoints on the credential host; no overlapping `oauth-user` credential
 hosts), `src/api/routes/admin/principal-links.ts` (an org admin sign-in cannot be linked onto a

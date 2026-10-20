@@ -11,6 +11,9 @@ import { sendJson } from "../../http.ts";
 import type { ApiCtx } from "../route.ts";
 import { actsAsManager, audit, authorizeAdmin, orgScope } from "../shared.ts";
 
+const normalizeHost = (host: string): string => host.toLowerCase().replace(/\.$/, "");
+const hostsOverlap = (a: string, b: string): boolean => a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
+
 const AUTH_MODES: McpServerAuthMode[] = ["none", "bearer", "client-credentials", "oauth-user"];
 
 async function actor(ctx: ApiCtx) {
@@ -89,29 +92,27 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
   if (credentialScope !== "shared" && credentialScope !== "per-user") {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "credentialScope must be shared or per-user" });
   }
-  const credentialHost = b.credentialHost ?? existing?.credentialHost ?? (oauthUser ? parsed.hostname : undefined);
+  const requestedHost = b.credentialHost ?? existing?.credentialHost ?? (oauthUser ? parsed.hostname : undefined);
+  const credentialHost = typeof requestedHost === "string" ? normalizeHost(requestedHost) : requestedHost;
   if (
     oauthUser &&
     typeof credentialHost === "string" &&
-    Object.values(PROVIDERS).some((p) =>
-      p.hosts.some((h) => credentialHost === h || credentialHost.endsWith(`.${h}`) || h.endsWith(`.${credentialHost}`)),
-    )
+    Object.values(PROVIDERS).some((p) => p.hosts.some((h) => hostsOverlap(credentialHost, h)))
   ) {
     return sendJson(ctx.res, 400, {
       error: "bad_request",
       message: "credentialHost is already used by another connector",
     });
   }
-  const sharesTokenHost = (other: McpServer): boolean => {
-    if (typeof credentialHost !== "string" || typeof other.credentialHost !== "string") return false;
-    const mine = credentialHost.toLowerCase();
-    const theirs = other.credentialHost.toLowerCase();
-    return mine === theirs || mine.endsWith(`.${theirs}`) || theirs.endsWith(`.${mine}`);
-  };
   if (
     oauthUser &&
+    typeof credentialHost === "string" &&
     (await ctx.deps.mcpServers.list()).some(
-      (other) => other.id !== id && other.auth === "oauth-user" && sharesTokenHost(other),
+      (other) =>
+        other.id !== id &&
+        other.auth === "oauth-user" &&
+        typeof other.credentialHost === "string" &&
+        hostsOverlap(credentialHost, normalizeHost(other.credentialHost)),
     )
   ) {
     return sendJson(ctx.res, 400, {
@@ -171,7 +172,7 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
       return sendJson(ctx.res, 403, { error: "forbidden", message: "re-enter the secret to change this server" });
     const onCredentialHost = (target: string): boolean => {
       if (typeof credentialHost !== "string" || !credentialHost.includes(".")) return false;
-      const host = new URL(target).hostname.toLowerCase();
+      const host = normalizeHost(new URL(target).hostname);
       return host === credentialHost || host.endsWith(`.${credentialHost}`);
     };
     if (credentialScope === "per-user" && !onCredentialHost(url))
