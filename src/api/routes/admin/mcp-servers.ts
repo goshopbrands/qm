@@ -102,6 +102,23 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
       message: "credentialHost is already used by another connector",
     });
   }
+  const sharesTokenHost = (other: McpServer): boolean => {
+    if (typeof credentialHost !== "string" || typeof other.credentialHost !== "string") return false;
+    const mine = credentialHost.toLowerCase();
+    const theirs = other.credentialHost.toLowerCase();
+    return mine === theirs || mine.endsWith(`.${theirs}`) || theirs.endsWith(`.${mine}`);
+  };
+  if (
+    oauthUser &&
+    (await ctx.deps.mcpServers.list()).some(
+      (other) => other.id !== id && other.auth === "oauth-user" && sharesTokenHost(other),
+    )
+  ) {
+    return sendJson(ctx.res, 400, {
+      error: "bad_request",
+      message: "credentialHost overlaps another oauth-user server's",
+    });
+  }
   for (const field of ["oauthAuthorizeUrl", "oauthTokenUrl"] as const) {
     if (oauthUser && b[field] !== undefined && !httpsUrl(b[field])) {
       return sendJson(ctx.res, 400, { error: "bad_request", message: `${field} must be an HTTPS URL` });
@@ -166,22 +183,6 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
       return sendJson(ctx.res, 403, {
         error: "forbidden",
         message: "an oauth-user server's OAuth endpoints must be on its credential host",
-      });
-    const overlaps = (other: McpServer): boolean =>
-      typeof credentialHost === "string" &&
-      typeof other.credentialHost === "string" &&
-      (other.credentialHost === credentialHost ||
-        other.credentialHost.endsWith(`.${credentialHost}`) ||
-        credentialHost.endsWith(`.${other.credentialHost}`));
-    if (
-      oauthUser &&
-      (await ctx.deps.mcpServers.list()).some(
-        (other) => other.id !== id && other.auth === "oauth-user" && overlaps(other),
-      )
-    )
-      return sendJson(ctx.res, 403, {
-        error: "forbidden",
-        message: "an oauth-user server's credential host must not overlap another oauth-user server's",
       });
   }
   const server: McpServer = {

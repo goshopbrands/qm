@@ -298,8 +298,10 @@ cannot redirect a secret someone else entered; a per-user MCP server they set mu
 credential host, since it receives each caller's own token. An `oauth-user` MCP server (added
 upstream in v0.1.15) holds no shared secret, so a manager may edit one without re-entry, but its
 URL and its OAuth authorize and token endpoints must all be on its credential host: every user's
-refresh token goes to the token endpoint, and its credential host may not equal, contain, or sit
-inside another `oauth-user` server's, because refreshes are routed by host suffix. A manager
+refresh token goes to the token endpoint. For every writer, not only managers, an `oauth-user`
+server's credential host may not equal, contain, or sit inside another `oauth-user` server's
+(compared case-insensitively), because refreshes are routed to the first server whose host
+matches by suffix; this extends upstream's own collision check against built-in connectors. A manager
 cannot change team membership (the `teams` admin resource, behind upstream's `team_scopes` flag),
 because a team's members read its conversations, and cannot change decision rules (the
 `decisions` resource, added upstream in v0.1.15), because a `turn_start` rule sends every turn's
@@ -348,7 +350,8 @@ managers), `src/api/routes/skill-packs.ts` (readable import targets; pack source
 creator only), `src/api/app-sessions.ts` (promotion from readable scopes), `src/core/orchestrator.ts` (admin
 prompt for org admins only; native admin tool for every admin), `src/api/routes/admin-resources.ts`
 (secret re-entry), `src/api/routes/admin/custom-providers.ts`, and `src/api/routes/admin/mcp-servers.ts` (secret
-re-entry; `oauth-user` endpoints on the credential host), `src/api/routes/admin/principal-links.ts` (an org admin sign-in cannot be linked onto a
+re-entry; `oauth-user` endpoints on the credential host; no overlapping `oauth-user` credential
+hosts), `src/api/routes/admin/principal-links.ts` (an org admin sign-in cannot be linked onto a
 non-admin identity), `src/wiring.ts` (`canUseSandboxScope` bypass is org admin only),
 `plugins/portal/src/index.ts` (impersonation needs `org_admin`; the admin-login link checks
 `isAdmin` on the probe result), `plugins/admin/public/index.html` (role from whoami; managers get

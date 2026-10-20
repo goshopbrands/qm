@@ -340,8 +340,10 @@ test("a manager must re-enter a stored secret to change where it is sent", async
       oauthAuthorizeUrl: `https://auth.${credentialHost}/authorize`,
       oauthTokenUrl: `https://auth.${credentialHost}/token`,
     });
-    for (const credentialHost of ["acme.com", "tools.acme.com"])
-      assert.equal((await s.asManager("PUT", "/v1/admin/mcp-servers/corp", other(credentialHost))).status, 403);
+    for (const credentialHost of ["acme.com", "ACME.com", "tools.acme.com"]) {
+      assert.equal((await s.asManager("PUT", "/v1/admin/mcp-servers/corp", other(credentialHost))).status, 400);
+      assert.equal((await s.asAdmin("PUT", "/v1/admin/mcp-servers/corp", other(credentialHost))).status, 400);
+    }
     assert.equal((await s.asManager("PUT", "/v1/admin/mcp-servers/corp", other("example.org"))).status, 200);
   } finally {
     await s.close();
@@ -689,7 +691,7 @@ test("a manager cannot add decision rules, which see every turn's latest message
     const rules = `/v1/admin/scopes/${q(ORG)}/decisions`;
     const refused = await s.asManager("PUT", rules, { providers: [], rules: [] });
     assert.equal(refused.status, 403);
-    assert.notEqual((await s.asAdmin("PUT", rules, { providers: [], rules: [] })).status, 403);
+    assert.match(((await refused.json()) as any).message ?? "", /limited to org admins/);
   } finally {
     await s.close();
   }
