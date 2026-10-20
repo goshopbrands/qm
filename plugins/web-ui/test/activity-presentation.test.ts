@@ -90,10 +90,10 @@ test("thinking titles become disclosure labels without repeating the heading", (
     });
   }
   assert.deepEqual(thinkingPresentation("A thought without a heading"), {
-    title: "Thought process",
+    title: "Thinking",
     body: "A thought without a heading",
   });
-  assert.equal(thinkingPresentation("**Bold** inside a sentence").title, "Thought process");
+  assert.equal(thinkingPresentation("**Bold** inside a sentence").title, "Thinking");
 });
 
 test("session actions identify their recipient and retain failure state", () => {
@@ -116,6 +116,11 @@ test("session actions identify their recipient and retain failure state", () => 
   assert.equal(sessionPresentation(tool, "complete")?.target, "Named worker");
   tool.call!.payload = { tool: "sessions", action: "open", name: "worker" };
   assert.equal(sessionPresentation(tool, "complete")?.target, "Named worker");
+  tool.call!.payload = { tool: "subagents", action: "open", name: "worker" };
+  assert.equal(sessionPresentation(tool, "complete")?.target, "Named worker");
+  tool.call!.payload = { tool: "sessions", action: "list" };
+  tool.result!.payload = {};
+  assert.equal(sessionPresentation(tool, "complete")?.target, "sessions");
 });
 
 test("activity grouping preserves speech boundaries and chronological item identity", () => {
@@ -182,10 +187,7 @@ test("ordinary command exits stay neutral while tool errors retain failure label
 
 test("historical completed nonzero exits do not inherit the old error flag", () => {
   for (const identity of [{ tool: "execute" }, { tool: "sandbox", action: "exec" }]) {
-    for (const output of [
-      { stdout: "", stderr: "" },
-      { unscreened: true, result: "[NOT security-screened]\n[exit 1]" },
-    ]) {
+    for (const output of [{ result: "[exit 1]" }, { result: "[NOT security-screened]\n[exit 1]" }]) {
       const tool = row("[ -d dir ]", { ...identity, ...output, code: 1, timedOut: false, isError: true });
       tool.call!.payload = { ...identity, command: "[ -d dir ]", purpose: "Check directory" };
       assert.equal(activityLabel(tool, "complete"), "Check directory · exit 1");

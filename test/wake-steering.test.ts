@@ -206,7 +206,7 @@ test("Auto blocks a prompt-injection attempt from an unprompted mid-turn coworke
   assert.equal(
     (await built.signals.takePending(liveRunId)).length,
     0,
-    "tainted steer data never reaches the live harness",
+    "flagged steer data never reaches the live harness",
   );
   assert.ok((await built.auditLog.events()).some((event) => event.action === "security_posture.steer_block"));
 });
@@ -230,7 +230,6 @@ test("the proxy receives ambient provenance for an unprompted mid-turn coworker 
   const metadata: Array<Readonly<Record<string, unknown>> | undefined> = [];
   const built = freshApp({
     provider: "example-screen",
-    shadow: true,
     async classify(input) {
       metadata.push(input.metadata);
       return {
@@ -835,7 +834,7 @@ test("reverse race: a sanitized mention follows its fresh run after the ambient 
 });
 
 test("screening off delivers ambient updates to the existing run without a classifier", async () => {
-  const built = buildApp(testConfig({ securityScreenBackend: "off" }));
+  const built = buildApp(testConfig({ securityScreen: "off" }));
   const first = await built.app.turn(mention("start work", "C-off", "100.1"));
   const follow = await built.app.turn(overheard("build finished", "C-off", "100.1"));
   assert.equal(follow.runId, first.runId);

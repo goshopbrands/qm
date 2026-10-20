@@ -22,6 +22,9 @@ interface AgentApiFamily {
 
 const onPath = (m: string, p: string) => (method: string, pathname: string) => method === m && pathname === p;
 
+const CONVERSATION_UPDATE =
+  "update one of the asking person's conversations — body {archived?, pinned?, title?, color?}; archive/unarchive, pin/unpin, rename (null title clears), or set the sidebar color (#rrggbb; null clears). These are per-person.";
+
 const FAMILIES: AgentApiFamily[] = [
   {
     match: (method, path) =>
@@ -60,7 +63,7 @@ const FAMILIES: AgentApiFamily[] = [
     match: (method, path) => path === "/v1/swarm" && (method === "GET" || method === "POST"),
     when: (view) => view.swarmsEnabled,
     guidance:
-      "Swarm workers are ordinary sessions with private blank computers. Inspect peers and their context, then send to chosen IDs or all; shared history is visible to every member. Notifications queue unattended turns. An optional forumSandboxId names an existing shared computer, selected explicitly per command with execute's sandbox_id.",
+      "Swarm workers are ordinary sessions with private blank computers. Inspect peers and their context, then send to chosen IDs or all; shared history is visible to every member. Notifications queue unattended turns. Each swarm gets one shared board computer (inspect returns board.sandboxId) that the root and every worker reach with execute's sandbox_id; pass forumSandboxId at creation to use an existing shared computer instead. Spawn accepts model, effort and fastMode to choose the runtime for the workers it creates; children inherit it unless they choose again. POST action control with memberId and state active, paused or stopped pauses delivery to, resumes, or stops a descendant worker.",
     routes: [
       {
         method: "GET",
@@ -72,7 +75,7 @@ const FAMILIES: AgentApiFamily[] = [
         method: "POST",
         path: "/v1/swarm",
         summary:
-          "{action:'spawn',requestId,text,count?,context?,contexts?,forumSandboxId?,settings?,backend?} spawns one or an initial pool; {action:'context',context} updates own JSON; {action:'send',requestId,text,audience,replyTo?,notify?} sends to explicit peer ids or all. Retry the same requestId and payload for idempotency.",
+          "{action:'spawn',requestId,text,count?,context?,contexts?,forumSandboxId?,settings?,backend?} spawns one or an initial pool; {action:'context',context} updates own JSON; {action:'send',requestId,text,audience,replyTo?,notify?} sends to explicit peer ids or all; {action:'control',memberId,state:'active'|'paused'|'stopped'} controls a descendant worker. Retry the same requestId and payload for idempotency.",
       },
     ],
   },
@@ -319,7 +322,7 @@ const FAMILIES: AgentApiFamily[] = [
         method: "POST",
         path: "/v1/crons",
         summary:
-          'schedule future or recurring work — a 2-5 word `title` naming what the cron is for (distinctive in a list, not the command) plus `task` (re-run at fire time) or exact `text`, optionally addressed by name to a teammate (`recipient`), a channel (`channel`), or a group DM (`participants`: its other members, which must already exist as a group DM — reach it once first, which opens it; same venue rule as /v1/reach — narrowest audience, a channel only when explicitly requested or genuinely room-wide), or run privately for whoever asked at their own scope (`scope:"personal"`, even from a channel); pass `unfurlLinks:false` to suppress Slack previews (to send now instead, use /v1/reach)',
+          'schedule future or recurring work — a 2-5 word `title` naming what the cron is for (distinctive in a list, not the command) plus `task` (re-run at fire time) or exact `text`, optionally addressed by name to a teammate (`recipient`), a channel (`channel`), or a group DM (`participants`: its other members, which must already exist as a group DM — reach it once first, which opens it; same venue rule as /v1/reach — narrowest audience, a channel only when explicitly requested or genuinely room-wide), or run privately for whoever asked at their own scope (`scope:"personal"`, even from a channel); pass `unfurlLinks:false` to suppress Slack previews; the cron is tied to this conversation so it shows as ongoing work here unless `session:false` (to send now instead, use /v1/reach)',
       },
       { method: "GET", path: "/v1/crons", summary: "list your crons" },
       {
@@ -374,6 +377,17 @@ const FAMILIES: AgentApiFamily[] = [
     ],
   },
   {
+    match: (m, p) =>
+      (p === "/v1/ui/canvas" && ["GET", "POST", "DELETE"].includes(m)) || (m === "POST" && p === "/v1/ui/observe"),
+    when: () => false,
+    routes: [
+      { method: "GET", path: "/v1/ui/canvas", summary: "read this conversation's web UI canvas" },
+      { method: "POST", path: "/v1/ui/canvas", summary: "write, update, replace or pin the canvas (ui-canvas skill)" },
+      { method: "DELETE", path: "/v1/ui/canvas", summary: "dismiss the canvas" },
+      { method: "POST", path: "/v1/ui/observe", summary: "snapshot the person's open web UI (ui-state skill)" },
+    ],
+  },
+  {
     match: onPath("POST", "/v1/share"),
     when: () => false,
     routes: [
@@ -388,21 +402,15 @@ const FAMILIES: AgentApiFamily[] = [
   {
     match: (m, p) =>
       (m === "GET" && (p === "/v1/conversations" || /^\/v1\/conversations\/[^/]+$/.test(p))) ||
-      (m === "POST" && (p === "/v1/conversations" || /^\/v1\/conversations\/[^/]+(?:\/fork)?$/.test(p))),
+      (m === "POST" && /^\/v1\/conversations\/[^/]+$/.test(p)),
     guidance:
-      "These act on the ASKING PERSON's own conversation list (the web UI sidebar) — archiving, pinning, or renaming is a per-person view change, never a deletion, and never touches anyone else's list. Confirm before bulk-archiving. When handing off a newly started conversation, share the exact webUrl returned by POST /v1/conversations; never guess or reconstruct its route.",
+      "These act on the ASKING PERSON's own conversation list (the web UI sidebar) — archiving, pinning, or renaming is a per-person view change, never a deletion, and never touches anyone else's list. Confirm before bulk-archiving.",
     routes: [
       {
         method: "GET",
         path: "/v1/conversations",
         summary:
-          "list the asking person's own conversations (id, title, status, archived, pinned, lastActivityAt) — the same list their web sidebar shows",
-      },
-      {
-        method: "POST",
-        path: "/v1/conversations/:id",
-        summary:
-          "update one of the asking person's conversations — body {archived?, pinned?, title?, color?, status?}; archive/unarchive, pin/unpin, rename (null title clears), or set the sidebar color (#rrggbb; null clears). Title, archive, pin, and color are per-person. Status is shared by everyone in the session: {emoji: one Unicode emoji, text: 1–200 characters}, or null to clear. Use it for verified milestones, e.g. ✅ PR merged or 🚀 Live in production, and replace it as work progresses. 404 for a conversation not on their list",
+          "list the asking person's own conversations (id, title, archived, pinned, unread, lastActivityAt) — the same list their web sidebar shows",
       },
       {
         method: "GET",
@@ -410,17 +418,15 @@ const FAMILIES: AgentApiFamily[] = [
         summary:
           "read the bounded transcript of one of the asking person's conversations; defaults to the last 20 turns and supports older paging with tailTurns and beforeSeq; returns 404 for a conversation they cannot see",
       },
+    ],
+  },
+  {
+    match: () => false,
+    routes: [
       {
         method: "POST",
-        path: "/v1/conversations",
-        summary:
-          "start a FRESH conversation in this scope (no inherited transcript) — body {text, title?}; text becomes its first message and a run begins there asynchronously. Returns {session, turn, webUrl?}; share webUrl verbatim when present (it is omitted without a valid configured public web URL). Unlike /fork, the new session starts with only what you put in text. Human-attended turns only — refused (403) from crons and other automations",
-      },
-      {
-        method: "POST",
-        path: "/v1/conversations/:id/fork",
-        summary:
-          "fork one of the asking person's conversations into a new conversation — body optionally {upToSeq}; returns 404 for a conversation they cannot see",
+        path: "/v1/conversations/:id",
+        summary: `${CONVERSATION_UPDATE} 404 for a conversation not on their list`,
       },
     ],
   },
@@ -449,7 +455,7 @@ const FAMILIES: AgentApiFamily[] = [
         method: "POST",
         path: "/v1/reach",
         summary:
-          "send a teammate a DM, post to a channel, or post to a group DM RIGHT NOW — `text` plus `recipient`, `channel`, or `participants` (the group DM's other members — the group is opened for you if it doesn't exist yet, so never ask someone to create one), optionally with `files` (workspace-relative paths, attached to the message all-or-nothing). EXTREMELY IMPORTANT: a `channel` post broadcasts to everyone there — pick the narrowest audience that can act; a question or errand for one person goes to their DM (`recipient`), NEVER a public channel, unless the person you're helping explicitly named that channel as the destination or the message genuinely concerns the whole room; pass `threadTs` (the parent message's ts) with a `recipient`/`channel`/`participants` post to reply inside that thread instead of top-level; or react to a message instead of posting with `react:{ts,emoji}` plus a `channel`/`participants`; or retract one of your own messages with `delete:{ts}` (no target = this conversation, or name a `channel`/`participants` to delete elsewhere) — find a message's `ts` via /v1/surface-context; pass `unfurlLinks:false` to suppress Slack previews (no schedule; for later/recurring use /v1/crons)",
+          "send a teammate a DM, post to a channel, or post to a group DM RIGHT NOW — `text` plus `recipient`, `channel`, or `participants` (the group DM's other members — the group is opened for you if it doesn't exist yet, so never ask someone to create one), optionally with `files` (workspace paths or {file_id: \"stored Files ID\"}, sent all-or-nothing); `sandbox_id` selects the sandbox for paths, omitted means default, ignored for stored IDs. EXTREMELY IMPORTANT: a `channel` post broadcasts to everyone there — pick the narrowest audience that can act; a question or errand for one person goes to their DM (`recipient`), NEVER a public channel, unless the person you're helping explicitly named that channel as the destination or the message genuinely concerns the whole room; pass `threadTs` (the parent message's ts) with a `recipient`/`channel`/`participants` post to reply inside that thread instead of top-level; or react to a message instead of posting with `react:{ts,emoji}` plus a `channel`/`participants`; or retract one of your own messages with `delete:{ts}` (no target = this conversation, or name a `channel`/`participants` to delete elsewhere) — find a message's `ts` via /v1/surface-context; pass `unfurlLinks:false` to suppress Slack previews (no schedule; for later/recurring use /v1/crons)",
       },
     ],
   },
@@ -463,7 +469,7 @@ const FAMILIES: AgentApiFamily[] = [
       (m === "POST" &&
         /^\/v1\/deployments\/[^/]+\/(share|archive|restore|name|display-name|always-on|embed-ancestors)$/.test(p)),
     guidance:
-      'To see the published apps you can reach across scopes, GET /v1/deployments (each row carries your permission and a clone/push gitUrl). Read what an app renders as the asking person with GET /v1/deployments/:id/fetch. A published app (`apps` action `publish`) is reachable only by its owner plus whoever the owner shares it with. For authenticated access, POST /v1/deployments/:id/share with `scope:"org"`, `recipient:"<name>"`, or an exact `email:"person@example.com"` with `access:"view"`; external email grants are view-only and send an invitation with the app link. Check `invitation.emailSent` and surface `emailProblem` if delivery fails. This does not make the recipient an instance member. To make the app reachable without sign-in, POST the same endpoint with `{public:true}`; `{public:false}` restricts it again. Public access is never the default and only the owner may change it. POST /v1/deployments/:id/embed-ancestors with `{embedAncestors:["https://tools.example.com", ...]}` lets those sites embed the app; pass `[]` to forbid embedding again. To rename, archive, restore, or change always-on behavior, use the corresponding endpoint.',
+      'To see the published apps you can reach across scopes, GET /v1/deployments (each row carries your permission and a clone/push gitUrl). Read what an app renders as the asking person with GET /v1/deployments/:id/fetch. A published app (`apps` action `publish`) is reachable only by its owner plus whoever the owner shares it with. For authenticated access, POST /v1/deployments/:id/share with `scope:"org"`, `recipient:"<name>"`, or an exact `email:"person@example.com"` with `access:"view"`; email grants to people outside the organization are view-only, send an invitation with the app link, and are refused unless an org admin has enabled external app sharing (off by default). Check `invitation.emailSent` and surface `emailProblem` if delivery fails. This does not make the recipient an instance member. To make the app reachable without sign-in, POST the same endpoint with `{public:true}`; `{public:false}` restricts it again. Public access is never the default, only the owner may change it, and it is refused (and existing public links require sign-in) unless an org admin has enabled external app sharing. POST /v1/deployments/:id/embed-ancestors with `{embedAncestors:["https://tools.example.com", ...]}` lets those sites embed the app; pass `[]` to forbid embedding again. To rename, archive, restore, or change always-on behavior, use the corresponding endpoint.',
     routes: [
       {
         method: "GET",
@@ -544,7 +550,7 @@ const FAMILIES: AgentApiFamily[] = [
     match: (m, p) =>
       (p === "/v1/webhooks" && (m === "POST" || m === "GET")) ||
       (m === "GET" && /^\/v1\/webhooks\/[^/]+\/events$/.test(p)) ||
-      (m === "POST" && /^\/v1\/webhooks\/[^/]+\/(disable|enable)$/.test(p)),
+      (m === "POST" && /^\/v1\/webhooks\/[^/]+\/(disable|enable|update)$/.test(p)),
     when: () => false,
     routes: [
       {
@@ -555,7 +561,24 @@ const FAMILIES: AgentApiFamily[] = [
       { method: "GET", path: "/v1/webhooks", summary: "list your webhooks" },
       { method: "GET", path: "/v1/webhooks/:id/events", summary: "recent webhook payloads and sessions" },
       { method: "POST", path: "/v1/webhooks/:id/disable", summary: "disable a webhook" },
+      {
+        method: "POST",
+        path: "/v1/webhooks/:id/update",
+        summary: "update a webhook task in place (URL and secret unchanged)",
+      },
       { method: "POST", path: "/v1/webhooks/:id/enable", summary: "re-enable a webhook" },
+    ],
+  },
+  {
+    match: (m, p) => p === "/v1/pinned-skills" && (m === "GET" || m === "PUT"),
+    routes: [
+      { method: "GET", path: "/v1/pinned-skills", summary: "list the skills pinned to this conversation's scope" },
+      {
+        method: "PUT",
+        path: "/v1/pinned-skills",
+        summary:
+          "replace this scope's pinned skills — body {names: string[]} in display order (max 6; [] clears); they always lead the per-turn skills shortlist. Personal pins apply to that person's DMs, channel pins to that channel. Live person turns only",
+      },
     ],
   },
   {
@@ -568,25 +591,23 @@ const FAMILIES: AgentApiFamily[] = [
   },
   {
     match: (m, p) =>
-      (p === "/v1/memory/self" && (m === "GET" || m === "PUT")) ||
-      (p === "/v1/memory/history" && m === "GET") ||
-      (p === "/v1/memory/restore" && m === "POST") ||
+      (p === "/v1/memory/self" && m === "GET") ||
+      (p === "/v1/memory/facts" && (m === "PATCH" || m === "DELETE")) ||
       (m === "POST" && (p === "/v1/memory/search" || p === "/v1/memory/facts")),
     when: (v) => !!v.claims.memory,
     guidance: "Memory bodies and curation rules are documented in the memory skill.",
     routes: [
-      { method: "POST", path: "/v1/memory/search", summary: "search every notebook this conversation may read" },
-      { method: "POST", path: "/v1/memory/facts", summary: "append durable facts to this conversation's notebook now" },
-      {
-        method: "GET|PUT",
-        path: "/v1/memory/self",
-        summary: "read or rewrite (curate) this conversation's whole notebook; rewriting is destructive",
-      },
-      { method: "GET", path: "/v1/memory/history", summary: "list notebook versions available to undo a rewrite" },
       {
         method: "POST",
-        path: "/v1/memory/restore",
-        summary: "restore a prior notebook version using revision and expectedRevision; use scope: org for org memory",
+        path: "/v1/memory/search",
+        summary: "search authorized notebooks; optional scope selects one notebook",
+      },
+      { method: "POST", path: "/v1/memory/facts", summary: "append durable facts to this conversation's notebook now" },
+      { method: "GET", path: "/v1/memory/self", summary: "list this conversation's notebook facts with their ids" },
+      {
+        method: "PATCH|DELETE",
+        path: "/v1/memory/facts",
+        summary: "edit facts ({facts:[{id,text}]}) or forget them ({ids}); any unknown id fails the whole call",
       },
     ],
   },
@@ -595,8 +616,8 @@ const FAMILIES: AgentApiFamily[] = [
     when: (v) => !!v.claims.memory?.orgWrite,
     routes: [
       {
-        method: "POST|PUT",
-        path: "/v1/memory/facts | /v1/memory/self",
+        method: "POST|PATCH|DELETE",
+        path: "/v1/memory/facts",
         summary:
           'add "scope":"org" (?scope=org on GET) to target the org-wide notebook every conversation recalls — admin only, confirm wording first',
       },
@@ -607,13 +628,12 @@ const FAMILIES: AgentApiFamily[] = [
       (p === "/v1/keychain/credentials" && (m === "POST" || m === "GET")) ||
       (p === "/v1/keychain/overview" && m === "GET") ||
       (m === "DELETE" && p.startsWith("/v1/keychain/credentials/")) ||
-      (p === "/v1/keychain/grants" && (m === "POST" || m === "GET")) ||
+      (p === "/v1/keychain/grants" && m === "GET") ||
       (m === "POST" && p.startsWith("/v1/keychain/grants/") && p.endsWith("/revoke")) ||
       (p === "/v1/keychain/asks" && (m === "POST" || m === "GET")) ||
-      (m === "POST" && p.startsWith("/v1/keychain/asks/") && p.endsWith("/decline")) ||
-      (m === "POST" && p === "/v1/keychain/drops") ||
-      (m === "POST" && p === "/v1/keychain/use"),
-    guidance: "The keychain ask→approve→use protocol is documented in your keychain manifest when one renders.",
+      (m === "POST" && p === "/v1/keychain/drops"),
+    guidance:
+      "The keychain ask→card approval→execute.credentials protocol is documented in your keychain manifest when one renders.",
     routes: [
       {
         method: "POST|GET",
@@ -627,12 +647,7 @@ const FAMILIES: AgentApiFamily[] = [
         summary: "list this user's credential metadata, grants, and pending asks (never secret values)",
       },
       { method: "DELETE", path: "/v1/keychain/credentials/:id", summary: "remove a registered login" },
-      {
-        method: "POST|GET",
-        path: "/v1/keychain/grants",
-        summary:
-          "request a purpose-bound grant to use someone's login here (when the owner authorized it mid-conversation rather than on their own turn, pass onBehalfOf with their id) / list grants",
-      },
+      { method: "GET", path: "/v1/keychain/grants", summary: "list grants for this conversation" },
       { method: "POST", path: "/v1/keychain/grants/:id/revoke", summary: "revoke a grant" },
       {
         method: "POST|GET",
@@ -640,18 +655,11 @@ const FAMILIES: AgentApiFamily[] = [
         summary:
           "ask a credential's owner for access, including scheduled turns in personal or shared conversations for discoverable credentials (no access until owner approval) / list asks",
       },
-      { method: "POST", path: "/v1/keychain/asks/:id/decline", summary: "decline an ask" },
       {
         method: "POST",
         path: "/v1/keychain/drops",
         summary:
-          'mint a single-use, expiring link for someone to drop a credential into the keychain via a browser (no secret in chat; hand the returned url over VERBATIM — it carries a link-bound token, so a reconstructed url will not work; declare the form inputs with fields[], e.g. [{key:"X_EMAIL",label:"Email",secret:false},{key:"X_PASSWORD",label:"Password"}] for a login, or omit for a single token; the link binds to the person who will paste the secret — pass onBehalfOf with their id when that is a teammate who spoke in this conversation rather than the person whose turn this is; refused on trigger-fired turns)',
-      },
-      {
-        method: "POST",
-        path: "/v1/keychain/use",
-        summary:
-          "materialize an approved grant ({grant}) — or, in the owner's personal conversation, their own credential ({credential}) — into env vars for this turn",
+          "mint a single-use, expiring link for someone to enter a new credential into their keychain — follow the `secret-drop` skill",
       },
     ],
   },
@@ -782,7 +790,7 @@ const FAMILIES: AgentApiFamily[] = [
         method: "POST",
         path: "/v1/credentials/broker",
         summary:
-          "call a vended org credential's host BY PROXY — secret stays server-side (use $AGENT_CREDENTIAL_TOKEN, which is set only when the execute call selects the service_<slug> handle)",
+          "call a vended org credential's host BY PROXY — secret stays server-side (use $AGENT_CREDENTIAL_TOKEN, which is set only when the execute call selects the credential's handle, its slug)",
       },
     ],
   },
@@ -811,10 +819,10 @@ const FAMILIES: AgentApiFamily[] = [
           "govern a scope: soul | security-posture | command-policy | egress | connectors | service-credentials | runtime ({ harnessId, modelId }) | approved-harnesses ({ ids })",
       },
       {
-        method: "GET|PUT",
+        method: "GET|POST|PATCH|DELETE",
         path: "/v1/admin/memory?scope=",
         summary:
-          "read or rewrite any scope's memory notebook (e.g. fix poisoned memory; non-org reads: DM or effective Open sharing)",
+          "read any scope's notebook facts, add ({facts:[text]}), edit ({facts:[{id,text}]}) or forget ({ids}) them (e.g. fix poisoned memory; non-org reads: DM or effective Open sharing)",
       },
       {
         method: "GET",

@@ -1,6 +1,6 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ModelMetadata } from "./pi-models.ts";
-import { EFFORT_LEVELS, type EffortLevel, type ModelOption } from "./model-options.ts";
+import { EFFORT_LEVELS, harnessSupportsFastMode, type EffortLevel, type ModelOption } from "./model-options.ts";
 
 export interface LoadoutEntry {
   value: string;
@@ -15,10 +15,31 @@ export function loadoutModelId(value: string): string {
   return separator < 0 ? value : value.slice(separator + 1);
 }
 
+const ULTRAFAST_BASE_MODELS = new Map([
+  ["gpt-6-astra-ultrafast", "gpt-6-astra"],
+  ["gpt-6.1-sol-ultrafast", "gpt-6.1-sol"],
+]);
+
+export function isUltrafastModel(modelId: string): boolean {
+  return ULTRAFAST_BASE_MODELS.has(modelId);
+}
+
+export function presetModelId(value: string): string {
+  const id = loadoutModelId(value);
+  return ULTRAFAST_BASE_MODELS.get(id) ?? id;
+}
+
+export function ultrafastChoice(options: readonly ModelOption[], selected: ModelOption): ModelOption | undefined {
+  if (selected.harnessId !== "pi") return undefined;
+  const id = selected.model.id;
+  const target = ULTRAFAST_BASE_MODELS.get(id) ?? [...ULTRAFAST_BASE_MODELS].find(([, base]) => base === id)?.[0];
+  return options.find((option) => option.harnessId === selected.harnessId && option.model.id === target);
+}
+
 function uniqueLoadout(entries: readonly LoadoutEntry[]): LoadoutEntry[] {
   const seen = new Set<string>();
   return entries.filter(({ value }) => {
-    const modelId = loadoutModelId(value);
+    const modelId = presetModelId(value);
     if (seen.has(modelId)) return false;
     seen.add(modelId);
     return true;
@@ -49,7 +70,7 @@ export function parseLoadout(raw: string | null): LoadoutEntry[] {
 
 export function upsertLoadout(entries: readonly LoadoutEntry[], entry: LoadoutEntry): LoadoutEntry[] {
   const next = uniqueLoadout(entries).slice(0, LOADOUT_CAP);
-  const index = next.findIndex(({ value }) => loadoutModelId(value) === loadoutModelId(entry.value));
+  const index = next.findIndex(({ value }) => presetModelId(value) === presetModelId(entry.value));
   if (index >= 0) next[index] = { ...entry };
   else if (next.length === LOADOUT_CAP) next[LOADOUT_CAP - 1] = { ...entry };
   else next.push({ ...entry });
@@ -73,7 +94,6 @@ export function reconcileLoadout(
 export function effortLevelsForHarness(
   harnessId: string,
   model?: Model<Api>,
-  selectedEffort?: string,
 ): Array<{ value: EffortLevel; label: string }> {
   const advertised = (model as ModelMetadata | undefined)?.effortLevelsByHarness?.[harnessId];
   const levels = EFFORT_LEVELS.filter(({ value }) => {
@@ -82,12 +102,9 @@ export function effortLevelsForHarness(
     if (value === "adaptive" || value === "default") return false;
     if (harnessId === "pi") return true;
     if (harnessId === "claude") return value !== "ultracode";
-    if (harnessId === "codex") return value !== "max" && value !== "ultracode";
     return false;
   });
-  return selectedEffort === "auto" || !levels.length
-    ? [EFFORT_LEVELS.find(({ value }) => value === "auto")!, ...levels]
-    : levels;
+  return [EFFORT_LEVELS.find(({ value }) => value === "auto")!, ...levels];
 }
 
 export function compatibleHarnessOptions<T extends { harnessId: string; model: { id: string } }>(
@@ -107,12 +124,13 @@ export function modelLoadoutOptions(
   entries: readonly LoadoutEntry[],
   preferredHarnessId?: string,
 ): ModelOption[] {
-  const saved = new Map(uniqueLoadout(entries).map((entry) => [loadoutModelId(entry.value), entry.value]));
-  return [...new Set(options.map(({ model }) => model.id))].flatMap((modelId) => {
-    const compatible = compatibleHarnessOptions(options, modelId);
+  const saved = new Map(uniqueLoadout(entries).map((entry) => [presetModelId(entry.value), entry.value]));
+  return [...new Set(options.map((option) => presetModelId(option.value)))].flatMap((modelId) => {
+    const compatible = options.filter((option) => presetModelId(option.value) === modelId);
     const preferred =
       compatible.find(({ value }) => value === saved.get(modelId)) ??
-      compatible.find(({ harnessId }) => harnessId === preferredHarnessId) ??
+      compatible.find(({ harnessId, model }) => harnessId === preferredHarnessId && model.id === modelId) ??
+      compatible.find(({ model }) => model.id === modelId) ??
       compatible[0];
     return preferred ? [preferred] : [];
   });
@@ -134,4 +152,37 @@ export function saveLoadout(entries: LoadoutEntry[], key = LOADOUT_STORAGE_KEY):
   } catch {
     return;
   }
+}
+
+export function loadoutActions(
+  options: () => readonly ModelOption[],
+  current: () => LoadoutEntry,
+  choose: (option: ModelOption, entry: LoadoutEntry) => void,
+  supportsFast: (modelId: string) => boolean,
+) {
+  const apply = (entry: LoadoutEntry) => {
+    const option = options().find((candidate) => candidate.value === entry.value);
+    if (!option) return;
+    const levels = effortLevelsForHarness(option.harnessId, option.model);
+    choose(option, {
+      value: option.value,
+      effort: levels.some((level) => level.value === entry.effort) ? entry.effort : levels[0]!.value,
+      fast: entry.fast && harnessSupportsFastMode(option.harnessId) && supportsFast(option.model.id),
+    });
+  };
+  const selected = () => options().find((option) => option.value === current().value);
+  return {
+    apply,
+    selectEffort: (effort: EffortLevel) => apply({ ...current(), effort }),
+    selectHarness: (harnessId: string) => {
+      const model = selected()?.model.id;
+      const target = model && compatibleHarnessOptions(options(), model).find((o) => o.harnessId === harnessId);
+      if (target) apply({ ...current(), value: target.value });
+    },
+    toggleFastMode: () => {
+      const option = selected();
+      const target = option && isUltrafastModel(option.model.id) ? ultrafastChoice(options(), option) : undefined;
+      apply({ ...current(), ...(target ? { value: target.value } : {}), fast: !current().fast });
+    },
+  };
 }

@@ -27,8 +27,9 @@ export function preserveTranscriptScroll(root: HTMLElement): () => void {
 }
 
 const CONDENSED_LINES = 2;
+const NEAR_TOP = 400;
 
-export function createTranscriptViewport() {
+export function createTranscriptViewport(options: { pinPrompt?: () => boolean } = {}) {
   let scroller: HTMLElement | null = null;
   let pins: HTMLElement | null = null;
   let prompt: HTMLElement | null = null;
@@ -49,6 +50,7 @@ export function createTranscriptViewport() {
   let contentMax = "";
   let collapseDistance = 0;
   let geometryDistance: number | null = null;
+  let filledAtSize: number | null = null;
   const contentUpdates = new Set<Promise<void>>();
 
   function setFollowing(value: boolean): void {
@@ -212,11 +214,25 @@ export function createTranscriptViewport() {
     if (movingUp) loadEarlier();
   }
 
+  function earlierButton(): HTMLButtonElement | null {
+    return scroller?.querySelector<HTMLButtonElement>(".earlier-messages-btn:not(:disabled)") ?? null;
+  }
+
   function loadEarlier(): void {
-    if (!scroller || scroller.scrollTop > 400) return;
-    const button = scroller.querySelector<HTMLButtonElement>(".earlier-messages-btn:not(:disabled)");
+    if (!scroller || scroller.scrollTop > NEAR_TOP) return;
+    const button = earlierButton();
     if (!button) return;
     cancelFollow();
+    button.click();
+  }
+
+  function fillViewport(): void {
+    const button = earlierButton();
+    if (!button || !scroller || scroller.clientHeight === 0) return;
+    if (scroller.scrollHeight - scroller.clientHeight > NEAR_TOP) return;
+    const size = (stack ?? scroller).getElementsByTagName("*").length;
+    if (size === filledAtSize) return;
+    filledAtSize = size;
     button.click();
   }
 
@@ -271,6 +287,7 @@ export function createTranscriptViewport() {
     scroller = pins = prompt = stack = content = null;
     lastTop = 0;
     following = false;
+    filledAtSize = null;
     contentUpdates.clear();
   }
 
@@ -293,6 +310,7 @@ export function createTranscriptViewport() {
           beforeRender();
           syncSticky();
           follow();
+          fillViewport();
         });
         if (scroller) observer.observe(scroller);
       }
@@ -300,13 +318,15 @@ export function createTranscriptViewport() {
     const nextStack = scroller?.querySelector<HTMLElement>(".message-stack") ?? null;
     if (stack !== nextStack) {
       changed = true;
+      filledAtSize = null;
       if (stack) observer?.unobserve(stack);
       stack = nextStack;
       if (stack) observer?.observe(stack);
     }
     const nextPins = scroller?.querySelector<HTMLElement>(".pinned-strip") ?? null;
     const prompts = stack?.querySelectorAll<HTMLElement>(":scope > .user-row");
-    const nextPrompt = prompts?.item(prompts.length - 1) ?? null;
+    const pinPrompt = options.pinPrompt?.() ?? true;
+    const nextPrompt = pinPrompt ? (prompts?.item(prompts.length - 1) ?? null) : null;
     if (pins !== nextPins) {
       changed = true;
       if (pins) observer?.unobserve(pins);
@@ -331,6 +351,7 @@ export function createTranscriptViewport() {
       if (content) observer?.observe(content);
     }
     if (changed) syncSticky();
+    fillViewport();
   }
 
   function follow(force = false): void {
@@ -354,5 +375,9 @@ export function createTranscriptViewport() {
     });
   }
 
-  return { sync, follow, cancelFollow, beforeRender, afterRender, dispose };
+  function refresh(): void {
+    if (scroller) sync(scroller);
+  }
+
+  return { sync, refresh, follow, cancelFollow, beforeRender, afterRender, dispose };
 }

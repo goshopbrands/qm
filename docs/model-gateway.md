@@ -15,3 +15,59 @@ For LiteLLM deployments, allow the two authenticated GET endpoints alongside inf
 The metadata endpoint returns `{"data": [...]}` with one object per model group. QM uses `model_group`, `mode`, `supports_function_calling`, `max_input_tokens`, `max_output_tokens`, `input_cost_per_token`, and `output_cost_per_token`. Optional fields include `providers`, `supports_vision`, `supports_reasoning`, `supports_adaptive_thinking`, `supported_openai_params`, `cache_read_input_token_cost`, and `cache_creation_input_token_cost`. Prices are per token and converted to per-million-token prices for QM. Missing cache prices use the input rate. Input capacity is used conservatively as the context budget; output capacity must be smaller.
 
 LiteLLM group metadata may combine capabilities and maximum limits from multiple deployments. It is a gateway contract, not a guarantee that every backing deployment has identical capabilities.
+
+## Browser agent
+
+The browse skill follows the user's saved AI access and default model. Company
+access uses the configured model gateway, or the deployment's default provider
+credentials when no gateway is configured; ChatGPT access uses the user's connected
+OpenAI account, including refreshed subscription access; Claude access supports
+API keys. Claude subscription access is unavailable for the inner browser agent
+and returns an actionable error. No account silently falls back to another.
+Kernel, Anchor, Browserbase and Browser Use still use their own credentials for browser sessions.
+
+Core gives internal, non-strict turns a one-hour capability bound to the account,
+model and conversation scope. The sandbox sends OpenAI-compatible, non-streaming
+chat completions to `/v1/browser-model/chat/completions`; core reloads the saved
+selection and credentials for each request. Changing the account or model requires
+a fresh turn. Credentials stay on core. Without a gateway, company inference reloads the same provider credentials as normal
+agent inference, including administrator changes and configured provider endpoints.
+No separate browser model key is needed. Missing credentials fail closed.
+Personal inference uses native provider
+transports, bypassing organization endpoint overrides, and converts structured
+browser responses and screenshots through the existing model runtime.
+
+Company browser inference uses the same gateway key permissions and budgets as
+other company model calls. The selected model must be in the gateway catalog or
+configured aliases. Private gateways need no public listener. The endpoint accepts
+up to 16 MiB for screenshot history, rejects provider overrides, and rechecks scope
+membership, strict posture and gateway availability. Gateway budget exhaustion is
+returned as HTTP 429; missing or retired models fail closed.
+
+The managed browse runner needs browser-use 0.12.9 with
+`ChatOpenAI.default_headers` support. It never requests separate browser model
+credentials or falls back to them on account or gateway errors.
+
+## Ultrafast
+
+Pi offers `gpt-6-astra-ultrafast` and `gpt-6.1-sol-ultrafast`, each labeled
+**Ultrafast (6× cost)**. These are QM selection identifiers: requests use the
+corresponding base model (`gpt-6-astra` or `gpt-6.1-sol`) with
+`service_tier: "ultrafast"` through the Responses API. Standard models and their
+Fast switches retain their existing behavior. Ultrafast has its own pricing card,
+including cached input, cache writes, and long-context rates.
+
+Use an OpenAI API key or explicitly map the Ultrafast model ID to your gateway's
+corresponding base-model group in `MODEL_GATEWAY_MODELS`. The gateway must support Responses and
+forward `service_tier`. The choice is supported in Pi only, and is unavailable
+with ChatGPT subscription authentication. It is never selected as the default
+merely by enabling Fast.
+
+OpenAI supports Ultrafast for Astra and Sol 6.1 with separate rate limits.
+See [Ultrafast availability](https://developers.openai.com/api/docs/guides/ultrafast-mode)
+and [pricing](https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast).
+
+In the web picker, select Astra or Sol 6.1 and use the Ultrafast switch. The picker shows a
+distinct active badge and the 6× cost before enabling it. Fast and Ultrafast are
+mutually exclusive, and both speeds share one preset per base model. The internal model
+IDs above preserve routing, authorization, pricing, and saved selections.

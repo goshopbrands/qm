@@ -1,4 +1,6 @@
 import { externalSlackCapabilityAllowed } from "./external-slack-capability.ts";
+import { MemoryDisclosureDenied } from "../memory/disclosure.ts";
+import { MemoryFactsMissing } from "../memory/facts.ts";
 import { reportBackendError, startTiming } from "../../plugins/chassis/src/error-reporting.ts";
 import { traceStatus } from "../../plugins/chassis/src/timing.ts";
 import {
@@ -30,14 +32,8 @@ import { verifyPortalIdentity, PORTAL_IDENTITY_HEADER, type PortalIdentity } fro
 import { isUserScoped, userScopedField, assertedActor, isUnclassifiedWrite } from "./user-scoped-routes.ts";
 import { errMessage } from "../util/errors.ts";
 import { parseScopeId, scopeId } from "../types.ts";
-import {
-  armBodyDeadline,
-  canonicalPayload,
-  PayloadTooLargeError,
-  readRawBody,
-  sendJson,
-  verifyOrReject,
-} from "./http.ts";
+import { canonicalPayload } from "../../plugins/chassis/src/source-auth-sign.ts";
+import { armBodyDeadline, PayloadTooLargeError, readRawBody, sendJson, verifyOrReject } from "./http.ts";
 import { findRoute, run, type ApiCtx, type BaseCtx, type Route, type RouteAuth } from "./routes/route.ts";
 import { apiRoutes, rawRoutes } from "./routes/index.ts";
 import { proxyDeploymentSubdomain } from "./routes/deployments.ts";
@@ -110,7 +106,7 @@ function unattendedAdminReadAllowed(method: string, pathname: string, claims: Ca
 }
 
 function isAdminContentRead(pathname: string): boolean {
-  if (pathname === "/v1/admin/memory") return true;
+  if (pathname === "/v1/admin/memory" || pathname === "/v1/admin/scopes") return true;
   if (pathname === "/v1/admin/keychain") return true;
   if (pathname === "/v1/admin/volumes") return true;
   if (pathname.startsWith("/v1/admin/scopes/")) return true;
@@ -139,12 +135,9 @@ function strictPostAllowed(pathname: string, body: unknown): boolean {
   if (
     pathname === "/v1/surface-context" ||
     pathname === "/v1/projects" ||
-    pathname === "/v1/conversations" ||
     pathname === "/v1/memory/search" ||
     pathname === "/v1/search" ||
-    pathname === "/v1/memory/restore" ||
-    pathname.startsWith("/v1/run-signals/") ||
-    /^\/v1\/conversations\/[^/]+\/fork$/.test(pathname)
+    pathname.startsWith("/v1/run-signals/")
   )
     return true;
   if (/^\/v1\/projects\/[^/]+(?:\/members(?:\/[^/]+)?)?$/.test(pathname)) return true;
@@ -185,83 +178,110 @@ declare module "fastify" {
 
 const rawBodies = new WeakMap<IncomingMessage, string>();
 
+async function verifyCapability(
+  req: IncomingMessage,
+  res: ServerResponse,
+  { app, deps, secret }: Wiring,
+  method: string,
+  pathname: string,
+  requiredAud: string | null,
+): Promise<CapabilityClaims | null> {
+  const capToken = capabilityFromHeaders(req);
+  if (!capToken) {
+    sendJson(res, 401, {
+      error: "unauthorized",
+      message:
+        requiredAud === CREDENTIAL_BROKER_AUD
+          ? CREDENTIAL_BROKER_TOKEN_REQUIRED
+          : `${requiredAud} capability token required`,
+    });
+    return null;
+  }
+  const capSecret = deps.capabilitySecret ?? secret;
+  const capability = capSecret ? await verifyCapabilityToken(capToken, capSecret) : null;
+  if (!capability) {
+    sendJson(res, 401, { error: "unauthorized", message: "invalid or expired capability token" });
+    return null;
+  }
+  if (
+    capability.externalSlack &&
+    !(
+      capability.aud === "credential-broker" &&
+      ((method === "POST" && pathname === "/v1/credentials/broker") ||
+        ((method === "GET" || method === "POST") && pathname.startsWith("/v1/credentials/git/")))
+    )
+  ) {
+    sendJson(res, 403, { error: "forbidden", message: "This operation requires a private conversation." });
+    return null;
+  }
+  if (deps.identity) {
+    await deps.identity.refresh();
+    if (deps.identity.classify(capability.actorId).type !== "internal") {
+      sendJson(res, 401, { error: "unauthorized", message: "principal is no longer active" });
+      return null;
+    }
+  }
+  if (capability.deployment !== undefined) {
+    const deployment = await app.getDeployment(capability.deployment);
+    if (
+      !deployment ||
+      deployment.id !== capability.deployment ||
+      deployment.status !== "running" ||
+      deployment.createdBy !== capability.actorId
+    ) {
+      sendJson(res, 401, { error: "unauthorized", message: "the published app behind this token is not running" });
+      return null;
+    }
+  }
+  if (
+    !(capability.externalSlack
+      ? await externalSlackCapabilityAllowed(capability, deps)
+      : await app.authorizesCapabilityScope({
+          actorId: capability.actorId,
+          scopeId: capability.scopeId,
+          ...(capability.scopeVersion ? { scopeVersion: capability.scopeVersion } : {}),
+          ...(capability.botActor ? { botActor: true } : {}),
+          ...(capability.liveActor ? { liveActor: true } : {}),
+          ...(capability.members ? { members: capability.members } : {}),
+        }))
+  ) {
+    sendJson(res, 403, {
+      error: "forbidden",
+      message: "the acting user is not currently authorized for this conversation",
+    });
+    return null;
+  }
+  if (requiredAud && capability.aud !== requiredAud) {
+    sendJson(res, 403, {
+      error: "forbidden",
+      message: `this route requires a capability token with audience "${requiredAud}"`,
+    });
+    return null;
+  }
+  return capability;
+}
+
 async function gate(
   req: IncomingMessage,
   res: ServerResponse,
-  { app, deps, secret, auth, requirePortalIdentity, allowUnsignedSourceAuth }: Wiring,
+  wiring: Wiring,
   method: string,
   pathname: string,
   url: URL,
   raw: string,
   routeAuth: RouteAuth | undefined,
 ): Promise<GateResult | null> {
+  const { deps, secret, auth, requirePortalIdentity, allowUnsignedSourceAuth } = wiring;
   const isPublicRoute = routeAuth === "public";
   const requiredAud = typeof routeAuth === "object" ? routeAuth.aud : null;
   let capability: CapabilityClaims | null = null;
   const capToken = capabilityFromHeaders(req);
   if (isPublicRoute) {
     void isPublicRoute;
-  } else if (capToken) {
-    const capSecret = deps.capabilitySecret ?? secret;
-    capability = capSecret ? await verifyCapabilityToken(capToken, capSecret) : null;
-    if (!capability) {
-      sendJson(res, 401, { error: "unauthorized", message: "invalid or expired capability token" });
-      return null;
-    }
-    if (
-      capability.externalSlack &&
-      !(
-        capability.aud === "credential-broker" &&
-        ((method === "POST" && pathname === "/v1/credentials/broker") ||
-          ((method === "GET" || method === "POST") && pathname.startsWith("/v1/credentials/git/")))
-      )
-    ) {
-      sendJson(res, 403, { error: "forbidden", message: "This operation requires a private conversation." });
-      return null;
-    }
-    if (deps.identity) {
-      await deps.identity.refresh();
-      if (deps.identity.classify(capability.actorId).type !== "internal") {
-        sendJson(res, 401, { error: "unauthorized", message: "principal is no longer active" });
-        return null;
-      }
-    }
-    if (capability.deployment !== undefined) {
-      const deployment = await app.getDeployment(capability.deployment);
-      if (
-        !deployment ||
-        deployment.id !== capability.deployment ||
-        deployment.status !== "running" ||
-        deployment.createdBy !== capability.actorId
-      ) {
-        sendJson(res, 401, { error: "unauthorized", message: "the published app behind this token is not running" });
-        return null;
-      }
-    }
-    if (
-      !(capability.externalSlack
-        ? await externalSlackCapabilityAllowed(capability, deps)
-        : await app.authorizesCapabilityScope({
-            actorId: capability.actorId,
-            scopeId: capability.scopeId,
-            ...(capability.scopeVersion ? { scopeVersion: capability.scopeVersion } : {}),
-            ...(capability.botActor ? { botActor: true } : {}),
-            ...(capability.liveActor ? { liveActor: true } : {}),
-            ...(capability.members ? { members: capability.members } : {}),
-          }))
-    ) {
-      sendJson(res, 403, { error: "forbidden", message: "capability scope membership has been revoked" });
-      return null;
-    }
-    if (requiredAud) {
-      if (capability.aud !== requiredAud) {
-        sendJson(res, 403, {
-          error: "forbidden",
-          message: `this route requires a capability token with audience "${requiredAud}"`,
-        });
-        return null;
-      }
-    } else if (routeAuth === "either") {
+  } else if (requiredAud || capToken) {
+    capability = await verifyCapability(req, res, wiring, method, pathname, requiredAud);
+    if (!capability) return null;
+    if (routeAuth === "either") {
       if (capability.aud !== undefined && capability.aud !== CONTROL_PLANE_AUD) {
         sendJson(res, 403, { error: "forbidden", message: "capability token audience not valid for this route" });
         return null;
@@ -273,19 +293,10 @@ async function gate(
           return null;
         }
       }
-    } else {
+    } else if (!requiredAud) {
       sendJson(res, 403, { error: "forbidden", message: "capability token not valid for this route" });
       return null;
     }
-  } else if (requiredAud) {
-    sendJson(res, 401, {
-      error: "unauthorized",
-      message:
-        requiredAud === CREDENTIAL_BROKER_AUD
-          ? CREDENTIAL_BROKER_TOKEN_REQUIRED
-          : `${requiredAud} capability token required`,
-    });
-    return null;
   } else if (
     !(await verifyOrReject(
       req,
@@ -377,13 +388,20 @@ function baseCtx(req: IncomingMessage, res: ServerResponse, wiring: Wiring): Bas
 }
 
 function respondError(req: IncomingMessage, res: ServerResponse, err: unknown): void {
+  if (err instanceof MemoryDisclosureDenied || err instanceof MemoryFactsMissing) {
+    const status = err instanceof MemoryFactsMissing ? 404 : 403;
+    if (!res.headersSent)
+      sendJson(res, status, { error: status === 404 ? "not_found" : "forbidden", message: err.message });
+    else res.destroy();
+    return;
+  }
   if (err instanceof PayloadTooLargeError) {
     if (!res.headersSent) sendJson(res, 413, { error: "payload_too_large", message: errMessage(err) });
     else res.destroy();
     return;
   }
   reportBackendError(err);
-  console.error("[server] 500 %s %s: %s", req.method ?? "?", req.url ?? "?", errMessage(err));
+  console.error("[server] 500 %s %s: %s", req.method ?? "?", loggablePath(req.url), errMessage(err));
   if (!res.headersSent) sendJson(res, 500, { error: "internal_error", message: "internal server error" });
   else res.destroy();
 }
@@ -453,7 +471,7 @@ function buildFastify(wiring: Wiring, server: Server): { fastify: FastifyInstanc
 
   fastify.setErrorHandler((err, request, reply) => {
     reportBackendError(err);
-    console.error("%s", `[server] 500 ${request.raw.method ?? "?"} ${request.raw.url ?? "?"}:`, errMessage(err));
+    console.error("%s", `[server] 500 ${request.raw.method ?? "?"} ${loggablePath(request.raw.url)}:`, errMessage(err));
     return reply.code(500).send({ error: "internal_error", message: "internal server error" });
   });
 
@@ -540,7 +558,7 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
         finishTiming({
           name: `${req.method ?? "GET"} ${requestNames.get(req) ?? "/*"}`,
           status: res.writableFinished ? traceStatus(res.statusCode) : "cancelled",
-          data: { http_status: res.writableFinished ? String(res.statusCode) : undefined },
+          data: { url: req.url, http_status: res.writableFinished ? String(res.statusCode) : undefined },
         }),
       );
     req.on("error", () => res.destroy());
@@ -565,6 +583,11 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
     const raw = findRoute(rawRoutes, base.method, base.pathname);
     if (raw) {
       if ("path" in raw.route) requestNames.set(req, raw.route.path);
+      const routeAuth = raw.route.auth;
+      if (typeof routeAuth === "object") {
+        base.capability = await verifyCapability(req, res, wiring, base.method, base.pathname, routeAuth.aud);
+        if (!base.capability) return void req.resume();
+      }
       await run(raw.route, raw.params, base);
       return;
     }
@@ -579,15 +602,24 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
         Math.abs(Date.now() - timestamp * 1000) > SOURCE_AUTH_REPLAY_WINDOW_MS ||
         typeof req.headers["x-signature"] !== "string"
       ) {
-        sendJson(res, 401, { error: "unauthorized", message: "missing, invalid, or stale source-auth headers" });
+        sendJson(res, 401, {
+          error: "unauthorized",
+          message: `missing, invalid, or stale source-auth headers; agent calls must send the capability token as ${CAPABILITY_HEADER}: $AGENT_API_TOKEN`,
+        });
         return;
       }
     }
-    rawBodies.set(req, await readRawBody(req));
+    rawBodies.set(req, await readRawBody(req, matched?.route.maxBodyBytes));
     await ready;
     routing(req, res);
   }
   return server;
+}
+
+export function loggablePath(url: string | undefined): string {
+  if (!url) return "?";
+  const query = url.indexOf("?");
+  return query < 0 ? url : `${url.slice(0, query)}?<query omitted>`;
 }
 
 export function createServer(app: App, deps: ServerOptions = {}): Server {

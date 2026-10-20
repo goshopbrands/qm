@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { createServer } from "../src/api/server.ts";
 import { buildApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
-import { DEPLOY_RELEASE_AUD, mintCapabilityToken } from "../src/auth/capability-token.ts";
+import { CREDENTIAL_BROKER_AUD, DEPLOY_RELEASE_AUD, mintCapabilityToken } from "../src/auth/capability-token.ts";
 import { CAPABILITY_HEADER } from "../src/api/contract.ts";
 import { scopeId } from "../src/types.ts";
 
@@ -45,6 +45,21 @@ test("deploy release endpoint serves only the release pinned by its capability",
       headers: { [CAPABILITY_HEADER]: token },
     });
     assert.equal(denied.status, 403);
+    assert.equal((await fetch(`${base}/v1/deploy-releases/${stored.blobId}`)).status, 403);
+    const otherAudience = await mintCapabilityToken(
+      {
+        actorId: "publisher",
+        scopeId: scopeId("group", "project-that-may-change"),
+        aud: CREDENTIAL_BROKER_AUD,
+        blob: { dir: "read", id: stored.blobId },
+        exp: Date.now() + 60_000,
+      },
+      SECRET,
+    );
+    const misused = await fetch(`${base}/v1/deploy-releases/${stored.blobId}`, {
+      headers: { [CAPABILITY_HEADER]: otherAudience },
+    });
+    assert.equal(misused.status, 403);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

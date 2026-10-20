@@ -14,7 +14,6 @@ import {
   parseSecurityScreenVerdict,
   SECURITY_SCREEN_SYSTEM_PROMPT,
   securityScreenSystemPrompt,
-  renderSecurityPolicyPrompt,
   resolveSecurityPolicy,
   securityScreenChunks,
   securityScreenPayload,
@@ -35,33 +34,21 @@ test("narrower scopes may tighten but cannot weaken the org posture", () => {
 });
 
 test("each posture resolves to exactly one mechanism", () => {
-  assert.deepEqual(resolveSecurityPolicy("dangerous"), {
-    inboundScreening: "off",
+  assert.deepEqual(resolveSecurityPolicy("dangerous", "enforce"), {
+    screening: "observe",
     denyPrivateNetworks: false,
     toolApprovals: "none",
   });
-  assert.deepEqual(resolveSecurityPolicy("auto"), {
-    inboundScreening: "external",
+  assert.deepEqual(resolveSecurityPolicy("auto", "enforce"), {
+    screening: "enforce",
     denyPrivateNetworks: true,
     toolApprovals: "none",
   });
   assert.deepEqual(resolveSecurityPolicy("strict"), {
-    inboundScreening: "off",
+    screening: "off",
     denyPrivateNetworks: false,
     toolApprovals: "all",
   });
-});
-
-test("the posture prompt names the active mechanism", () => {
-  assert.match(renderSecurityPolicyPrompt(resolveSecurityPolicy("dangerous")), /Dangerous/);
-  assert.match(renderSecurityPolicyPrompt(resolveSecurityPolicy("dangerous")), /Predeclared command approvals/);
-  assert.match(renderSecurityPolicyPrompt(resolveSecurityPolicy("auto")), /External-content screening/);
-  assert.match(renderSecurityPolicyPrompt(resolveSecurityPolicy("strict")), /Strict/);
-  assert.match(renderSecurityPolicyPrompt(resolveSecurityPolicy("strict")), /Every harness tool except the no-effect/);
-  assert.match(
-    renderSecurityPolicyPrompt(resolveSecurityPolicy("strict")),
-    /Direct capability-token HTTP mutations are blocked/,
-  );
 });
 
 test("a custom Auto rubric cannot replace the fixed boundary or verdict contract", () => {

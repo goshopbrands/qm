@@ -13,18 +13,17 @@ core stamps the secret onto the outbound call at the wire and returns the respon
 
 ## When this applies
 
-Your system prompt lists, under **"Shared org credentials available to you"**, any credentials
-vended to _this_ conversation — each with its slug, host, and the methods/paths you may use.
-If that section is absent, you have no shared broker credentials. A separately authorized personal login or connected app may still be
-available; use only its advertised capabilities and permissions. Never route around a denial
-or ask the user to paste a token.
+The **Credentials** inventory groups available credentials by owner. Organization rows marked
+`proxy` give the host and allowed methods/paths. Select that credential's handle (e.g. `gitlab`) in
+`execute.credentials` for the command making the request, with an explicit `sandbox_id`. Core supplies
+`AGENT_CREDENTIAL_TOKEN` only to that command; its absence before selection does not mean
+access is missing. Use that token, not `AGENT_API_TOKEN`, for broker requests.
+
+Only listed credentials are available. A separately authorized personal login or connected
+app may also be available; use only its advertised capabilities and permissions. Never
+route around a denial or ask the user to paste a token.
 
 ## How to call it
-
-Select the credential's `service_<slug>` handle in the execute call's `credentials` (for example
-`credentials: ["service_<slug>"]`). That selection is what puts `AGENT_CREDENTIAL_TOKEN` in the
-environment, for that call only. An unselected call has an empty token and the broker refuses it,
-so select the handle on every call that uses the broker, including Git and retries.
 
 ```bash
 curl -fsS -X POST "$AGENT_API_URL/v1/credentials/broker" \
@@ -44,6 +43,7 @@ The reply is an envelope — the upstream status + body, never the secret:
 { "status": 200, "contentType": "application/json", "body": "<the upstream response text>" }
 ```
 
+A non-2xx `status` is the upstream service’s response, not a broker failure.
 Parse `body` as the upstream returned it (e.g. JSON). For a write (when the credential allows a
 non-GET method), put the request payload in the `body` field of your POST.
 
@@ -89,12 +89,11 @@ prefixes**. The broker enforces them, so:
 - `403 path_not_allowed` / `403 method_not_allowed` — outside what the admin allowed. Don't retry
   variations to get around it; if the task genuinely needs more, tell the user it's not permitted.
 - `401 unauthorized` (capability token required) — the execute call did not select the
-  `service_<slug>` handle, so `AGENT_CREDENTIAL_TOKEN` was empty. Run it again with the handle
+  credential's handle, so `AGENT_CREDENTIAL_TOKEN` was empty. Run it again with the handle
   selected. This is not an outage.
 - `403 not_entitled` — this call's token doesn't cover that credential. Check that this execute
-  call selected that credential's own `service_<slug>` handle (selecting a different credential's
-  handle doesn't count). If it did, the credential isn't vended to this conversation; you can't use
-  it here.
+  call selected that credential's own handle (selecting a different credential's handle doesn't
+  count). If it did, the credential isn't vended to this conversation; you can't use it here.
 - `404 credential_unavailable` — it was disabled/removed. Tell the user.
 
 ## Guardrails

@@ -16,6 +16,7 @@ function fakeRes() {
   const out = { status: 0, body: undefined as unknown };
   return {
     res: {
+      getHeader() {},
       writeHead(status: number) {
         out.status = status;
         return this;
@@ -186,6 +187,7 @@ test("create validates the essentials", async () => {
 test("create and patch reject invalid operational numbers and accept their boundaries", async () => {
   const invalid = [
     ["caps", "maxItemsPerFire", 1.5],
+    ["caps", "maxConcurrentItems", 0],
     ["caps", "maxOpenOutputs", 0],
     ["caps", "maxItemAttempts", Number.POSITIVE_INFINITY],
     ["governor", "maxConsecutiveFailedFires", 0],
@@ -206,7 +208,7 @@ test("create and patch reject invalid operational numbers and accept their bound
   const deps = services();
   const created = await call(deps, "POST", "/v1/loops", {
     ...CREATE,
-    caps: { maxItemsPerFire: 1, maxOpenOutputs: 1, maxItemAttempts: 1 },
+    caps: { maxItemsPerFire: 1, maxConcurrentItems: 1, maxOpenOutputs: 1, maxItemAttempts: 1 },
     governor: {
       maxConsecutiveFailedFires: 1,
       returnRateMinDecisions: 1,
@@ -218,6 +220,12 @@ test("create and patch reject invalid operational numbers and accept their bound
   });
   assert.equal(created.status, 200);
   const id = (created.body as { loop: { id: string } }).loop.id;
+  assert.equal((created.body as { loop: Loop }).loop.caps?.maxConcurrentItems, 1);
+  const patchedCap = await call(deps, "PATCH", `/v1/loops/${id}`, {
+    caps: { maxItemsPerFire: 1, maxConcurrentItems: 2 },
+  });
+  assert.equal(patchedCap.status, 200);
+  assert.equal((patchedCap.body as { loop: Loop }).loop.caps?.maxConcurrentItems, 2);
   const patched = await call(deps, "PATCH", `/v1/loops/${id}`, {
     caps: { maxItemsPerFire: 1 },
     governor: { maxReturnRate: Number.NEGATIVE_INFINITY },
@@ -356,6 +364,18 @@ test("a playbook edit through PATCH versions the playbook", async () => {
   assert.equal(loop.playbook, "triage harder");
 });
 
+test("without the loop_triage flag, triage can be turned off but not on", async () => {
+  const deps = services();
+  const created = await call(deps, "POST", "/v1/loops", CREATE);
+  const id = (created.body as { loop: { id: string } }).loop.id;
+  const on = await call(deps, "PATCH", `/v1/loops/${id}`, { triage: { prioritize: { enabled: true } } });
+  assert.equal(on.status, 403);
+  const off = await call(deps, "PATCH", `/v1/loops/${id}`, { triage: { consolidate: { enabled: false } } });
+  assert.equal(off.status, 200);
+  const read = await call(deps, "GET", `/v1/loops/${id}`);
+  assert.equal((read.body as { triageAvailable: boolean }).triageAvailable, false);
+});
+
 test("deleting a loop deletes its child cron and grants", async () => {
   const deps = services();
   const created = await call(deps, "POST", "/v1/loops", { ...CREATE, schedule: { everyMs: 3_600_000 } });
@@ -388,6 +408,7 @@ test("decisions and grants require verified live-human evidence", async () => {
     sweepStale: async () => {},
     followUp: async () => null,
     itemAction: async () => ({ ok: true }),
+    previewTriage: async () => [],
   };
   const created = await call(deps, "POST", "/v1/loops", CREATE);
   const id = (created.body as { loop: { id: string } }).loop.id;
@@ -596,6 +617,7 @@ test("deciding an output ships or returns through the fire service", async () =>
     sweepStale: async () => {},
     followUp: async () => null,
     itemAction: async () => ({ ok: true }),
+    previewTriage: async () => [],
   };
   const created = await call(deps, "POST", "/v1/loops", CREATE);
   const id = (created.body as { loop: { id: string } }).loop.id;
@@ -617,6 +639,7 @@ test("deciding an output reports an active item decision lease", async () => {
     sweepStale: async () => {},
     followUp: async () => null,
     itemAction: async () => ({ ok: true }),
+    previewTriage: async () => [],
   };
   const created = await call(deps, "POST", "/v1/loops", CREATE);
   const loopId = (created.body as { loop: { id: string } }).loop.id;
@@ -752,15 +775,6 @@ test("privileged loop config and manual fires use the cron live-owner-admin gate
   );
 });
 
-test("loop mutation and manual fire reject a drifted native binding", async () => {
-  const deps = services();
-  const loop = await privilegedLoop(deps);
-  await deps.crons!.update(loop.cronId!, { runAs: "scopeFloor" });
-  assert.equal((await call(deps, "PATCH", `/v1/loops/${loop.id}`, { playbook: "revision" })).status, 409);
-  assert.equal((await call(deps, "POST", `/v1/loops/${loop.id}/fire`, {})).status, 409);
-  assert.equal((await deps.store.get(loop.id))?.playbook, loop.playbook);
-});
-
 test("a legacy inbox sync cron cannot be re-enabled through an autonomous Loop patch", async () => {
   const deps = services();
   const { loop } = await deps.store.create({
@@ -825,4 +839,27 @@ test("loop icons can be set and reset by their owner, reject invalid input and r
     );
   }
   assert.equal((await call(deps, "PATCH", `/v1/loops/${loop.id}`, { icon: "shield" }, "mallory")).status, 403);
+});
+
+test("agent loop reads omit avatar metadata even when source is only in the payload", async () => {
+  const deps = services();
+  const created = await call(deps, "POST", "/v1/loops", CREATE);
+  const loop = (created.body as { loop: Loop }).loop;
+  const payload = {
+    source: "slack",
+    participants: [{ id: "U1", name: "Alex", avatarUrl: "https://example.com/avatar.png" }],
+    slackAvatarsRefreshAt: 12345,
+  };
+  await deps.items.ingest([{ loopId: loop.id, dedupeKey: "D1", sourcePayload: payload }]);
+  for (const mode of ["source", "capability"] as const) {
+    const response = await call(deps, "GET", `/v1/loops/${loop.id}`, undefined, "josh", mode);
+    assert.equal(response.status, 200);
+    const text = JSON.stringify(response.body);
+    if (mode === "source") assert.match(text, /avatar.png/);
+    else {
+      assert.doesNotMatch(text, /avatarUrl|slackAvatarsRefreshAt/);
+      assert.match(text, /Alex/);
+    }
+  }
+  assert.deepEqual((await deps.items.byLoop(loop.id))[0]!.sourcePayload, payload);
 });

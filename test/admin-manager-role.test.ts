@@ -8,6 +8,7 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer, createServer } from "../src/api/server.ts";
 import { buildApp, serverDeps } from "../src/wiring.ts";
+import type { ServerDeps } from "../src/api/deps.ts";
 import { testConfig } from "./support/test-config.ts";
 import { adminStatusFromGrants, parseAdminGrants } from "../src/admin/admin-service.ts";
 import { managerAccessFor, managerRefusal } from "../src/admin/manager-access.ts";
@@ -22,7 +23,7 @@ const ALICE = { id: "admin-alice", type: "internal" as const };
 const MANAGER = "mgr-mia";
 const OTHER = "user-uma";
 
-async function start() {
+async function start(extraDeps: Partial<ServerDeps> = {}) {
   const config = testConfig({ dataDir: mkdtempSync(join(tmpdir(), "admin-manager-")) });
   const built = buildApp(config);
   await built.admin.createGrant(ALICE, { principalId: MANAGER, role: "org_manager", scopeId: ORG });
@@ -66,7 +67,7 @@ async function start() {
     await built.sessions.releaseLease(lease!);
     sessionIds[scope] = session.id;
   }
-  await built.memory.replace(`personal:${OTHER}`, "a private note", OTHER);
+  await built.memory.capture(`personal:${OTHER}`, ["a private note"], Date.now(), OTHER, { mode: "explicit" });
   for (const scope of [`personal:${OTHER}`, "channel:CPUB", "group:GTHEIRS"]) {
     await built.app.createCron({
       ownerScopeId: scope,
@@ -76,7 +77,7 @@ async function start() {
       action: `ping ${scope}`,
     });
   }
-  const server = createInsecureTestServer(built.app, serverDeps(config, built));
+  const server = createInsecureTestServer(built.app, { ...serverDeps(config, built), ...extraDeps });
   server.listen(0);
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;
   const call = (actor: string, method: string, path: string, body?: unknown) =>
@@ -118,6 +119,24 @@ test("whoami reports the manager role", async () => {
     const body: any = await r.json();
     assert.equal(body.isAdmin, true);
     assert.equal(body.role, "org_manager");
+  } finally {
+    await s.close();
+  }
+});
+
+test("a manager cannot change team membership, which decides who reads a team's conversations", async () => {
+  const changed: unknown[] = [];
+  const teamStore = { list: async () => [], apply: async (change: unknown) => void changed.push(change) };
+  const s = await start({ teams: teamStore as unknown as ServerDeps["teams"] });
+  try {
+    const teams = `/v1/admin/scopes/${q(ORG)}/teams`;
+    const join = { id: "leadership", addMembers: [MANAGER] };
+    const refused = await s.asManager("PUT", teams, join);
+    assert.equal(refused.status, 403);
+    assert.match(((await refused.json()) as any).message ?? "", /org admin/);
+    assert.equal(changed.length, 0);
+    assert.equal((await s.asAdmin("PUT", teams, join)).status, 200);
+    assert.equal(changed.length, 1);
   } finally {
     await s.close();
   }
@@ -292,6 +311,27 @@ test("a manager must re-enter a stored secret to change where it is sent", async
       (await s.asManager("PUT", perUserServer, { ...perUser, url: "https://api.github.com/mcp" })).status,
       200,
     );
+    const oauthServer = "/v1/admin/mcp-servers/acme";
+    const oauth = {
+      url: "https://mcp.acme.com/mcp",
+      auth: "oauth-user",
+      credentialHost: "acme.com",
+      clientId: "acme-client",
+      oauthAuthorizeUrl: "https://auth.acme.com/authorize",
+      oauthTokenUrl: "https://auth.acme.com/token",
+    };
+    assert.equal((await s.asAdmin("PUT", oauthServer, oauth)).status, 200);
+    assert.equal((await s.asManager("PUT", oauthServer, { ...oauth, name: "Acme tools" })).status, 200);
+    for (const field of ["oauthAuthorizeUrl", "oauthTokenUrl"])
+      assert.equal(
+        (await s.asManager("PUT", oauthServer, { ...oauth, [field]: "https://evil.example.com/oauth" })).status,
+        403,
+        field,
+      );
+    assert.equal(
+      (await s.asManager("PUT", oauthServer, { ...oauth, url: "https://evil.example.com/mcp" })).status,
+      403,
+    );
   } finally {
     await s.close();
   }
@@ -361,8 +401,12 @@ test("a manager's agent has the manager's dashboard powers and no way to raise i
     });
   try {
     const memory = `/v1/admin/memory?scope=${q(ORG)}`;
-    const put = await asAgentOf(MANAGER, "PUT", memory, { content: "# Memory\n\n- standup is 9:30" });
-    assert.equal(put.status, 200);
+    const added = await asAgentOf(MANAGER, "POST", memory, { facts: ["standup is 9:30"] });
+    assert.equal(added.status, 200);
+    const fact = ((await added.json()) as any).facts.find((f: any) => f.text === "standup is 9:30");
+    const edit = { facts: [{ id: fact.id, text: "standup is 10:00" }] };
+    assert.equal((await asAgentOf(MANAGER, "PATCH", memory, edit)).status, 200);
+    assert.equal((await asAgentOf(MANAGER, "DELETE", memory, { ids: [fact.id] })).status, 200);
     assert.equal((await asAgentOf(MANAGER, "GET", "/v1/admin/users")).status, 200);
     for (const role of ["org_admin", "org_manager"]) {
       const grant = await asAgentOf(MANAGER, "POST", "/v1/admin/grants", { principalId: OTHER, role, scopeId: ORG });
@@ -487,10 +531,20 @@ test("a manager reads conversations only in spaces they belong to or that are pu
       for (const path of ["runs", "errors", "audit", "egress", "metrics", "deliveries/shadow", "memory", "files"]) {
         assert.equal((await s.asManager("GET", `/v1/admin/${path}?scope=${q(scope)}`)).status, 403, `${path} ${scope}`);
       }
-      assert.equal((await s.asManager("PUT", `/v1/admin/memory?scope=${q(scope)}`, { content: "x" })).status, 403);
+      const [note] = (await s.built.memory.facts!(`personal:${OTHER}`)).map((f) => f.id);
+      for (const [method, body] of [
+        ["POST", { facts: ["x"] }],
+        ["PATCH", { facts: [{ id: note, text: "x" }] }],
+        ["DELETE", { ids: [note] }],
+      ] as const) {
+        assert.equal((await s.asManager(method, `/v1/admin/memory?scope=${q(scope)}`, body)).status, 403, method);
+      }
       assert.equal((await s.asManager("GET", `/v1/admin/scopes/${q(scope)}`)).status, 403, scope);
     }
-    assert.equal((await s.built.memory.read(`personal:${OTHER}`)).trim(), "a private note");
+    assert.deepEqual(
+      (await s.built.memory.facts!(`personal:${OTHER}`)).map((f) => f.text),
+      ["a private note"],
+    );
     for (const path of ["sessions", "runs", "errors", "audit", "egress", "metrics", "deliveries/shadow"]) {
       assert.equal((await s.asManager("GET", `/v1/admin/${path}?scope=${q(ORG)}`)).status, 403, `${path} org-wide`);
     }
@@ -500,7 +554,10 @@ test("a manager reads conversations only in spaces they belong to or that are pu
       (await s.asManager("PUT", `/v1/admin/users/${OTHER}/onboarding`, { status: "completed" })).status,
       403,
     );
-    assert.equal((await s.built.memory.read(`personal:${OTHER}`)).trim(), "a private note");
+    assert.deepEqual(
+      (await s.built.memory.facts!(`personal:${OTHER}`)).map((f) => f.text),
+      ["a private note"],
+    );
     assert.ok(await s.built.sessions.get(s.sessionIds[`personal:${OTHER}`]!), "the DM survives");
     const publicId = s.sessionIds["channel:CPUB"]!;
     assert.equal((await s.asManager("GET", `/v1/admin/sessions/${publicId}/llm?scope=${q(ORG)}`)).status, 403);
@@ -533,7 +590,7 @@ test("org-wide lists shown to a manager leave out spaces they cannot read", asyn
       "admins still see every scope",
     );
     const adminCrons: any = await (await s.asAdmin("GET", `/v1/admin/crons?scope=${q(ORG)}`)).json();
-    assert.equal(adminCrons.crons.length, 3);
+    assert.equal(adminCrons.crons.filter((c: any) => c.action.startsWith("ping ")).length, 3);
   } finally {
     await s.close();
   }

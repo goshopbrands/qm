@@ -1,5 +1,6 @@
+import { disclosedMemory } from "./disclosure.ts";
 import { parseScopeId, type ScopeId, type ScopeKind } from "../types.ts";
-import type { MemoryRevision, MemoryService } from "./memory-service.ts";
+import type { MemoryService } from "./memory-service.ts";
 
 export type MemoryCapturePolicy = "off" | "explicit" | "automatic";
 
@@ -40,26 +41,32 @@ export function createRoutedMemoryService(opts: {
   };
 
   return {
+    withDisclosure(access) {
+      return createRoutedMemoryService({
+        ...opts,
+        providers: Object.fromEntries(
+          Object.entries(opts.providers).map(([name, provider]) => [name, disclosedMemory(provider, access)]),
+        ),
+      });
+    },
     async recall(scopeId, context) {
       const routes = routesFor(scopeId).filter((route) => route.recall !== false);
-      const recalled = await Promise.all(
+      const batches = await Promise.all(
         routes.map(async (route) => {
           try {
-            return { route, body: (await providerFor(route).recall(scopeId, context)).trim() };
+            return { route, rows: await providerFor(route).recall(scopeId, context) };
           } catch (error) {
             if (!route.failOpen) throw error;
             opts.onError?.(error, route.provider, "recall");
-            return { route, body: "" };
+            return { route, rows: [] };
           }
         }),
       );
-      const present = recalled.filter(({ body }) => body);
-      if (present.length === 0) return "";
-      if (present.length === 1) {
-        const { route, body } = present[0]!;
-        return route.label ? `### ${route.label}\n${body}` : body;
-      }
-      return present.map(({ route, body }) => `### ${route.label ?? route.provider}\n${body}`).join("\n\n");
+      const present = batches.filter(({ rows }) => rows.length);
+      return present.flatMap(({ route, rows }) => {
+        const label = route.label ?? (present.length > 1 ? route.provider : undefined);
+        return rows.map((row) => (label && row.id === undefined ? { ...row, text: `### ${label}\n${row.text}` } : row));
+      });
     },
 
     async capture(scopeId, facts, at, author, context) {
@@ -68,7 +75,9 @@ export function createRoutedMemoryService(opts: {
       const counts = await Promise.all(
         routes.map(async (route) => {
           try {
-            return await providerFor(route).capture(scopeId, facts, at, author, context);
+            const provider = providerFor(route);
+            if (context?.conversationScopeId && context.conversationScopeId !== scopeId && !provider.facts) return 0;
+            return await provider.capture(scopeId, facts, at, author, context);
           } catch (error) {
             if (!route.failOpen) throw error;
             opts.onError?.(error, route.provider, "capture");
@@ -100,35 +109,20 @@ export function createRoutedMemoryService(opts: {
       return manager ? manager.read(scopeId) : "";
     },
 
-    async replace(scopeId, content, author) {
+    async facts(scopeId) {
+      return (await managerFor(scopeId)?.facts?.(scopeId)) ?? [];
+    },
+
+    async edit(scopeId, edits, author, context) {
       const manager = managerFor(scopeId);
-      if (!manager) throw new Error(`memory for ${scopeId} is not directly editable`);
-      await manager.replace(scopeId, content, author);
+      if (!manager?.edit) throw new Error(`memory for ${scopeId} is not directly editable`);
+      await manager.edit(scopeId, edits, author, context);
     },
 
-    async readHead(scopeId) {
+    async delete(scopeId, ids, author) {
       const manager = managerFor(scopeId);
-      if (!manager) return { content: "", revision: "" };
-      if (manager.readHead) return manager.readHead(scopeId);
-      return { content: await manager.read(scopeId), revision: "" };
-    },
-
-    async replaceIfRevision(scopeId, content, revision, author) {
-      const manager = managerFor(scopeId);
-      if (!manager?.replaceIfRevision) return false;
-      return manager.replaceIfRevision(scopeId, content, revision, author);
-    },
-
-    async history(scopeId, limit): Promise<MemoryRevision[]> {
-      return (await managerFor(scopeId)?.history?.(scopeId, limit)) ?? [];
-    },
-
-    async restore(scopeId, revision, expectedRevision, author) {
-      return (await managerFor(scopeId)?.restore?.(scopeId, revision, expectedRevision, author)) ?? false;
-    },
-
-    async updatedAt(scopeId) {
-      return managerFor(scopeId)?.updatedAt?.(scopeId);
+      if (!manager?.delete) throw new Error(`memory for ${scopeId} is not directly editable`);
+      await manager.delete(scopeId, ids, author);
     },
 
     async metadata() {

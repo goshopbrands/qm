@@ -42,6 +42,7 @@ function service(
     turnResult?: TurnResult;
     grants?: ReturnType<typeof createShipGrantStore>;
     samePerson?: (a: string, b: string) => Promise<boolean>;
+    triageEnabledFor?: (owner: string) => Promise<boolean>;
   },
 ) {
   const loops = createLoopStore();
@@ -56,6 +57,7 @@ function service(
     admittedWork: overrides?.admittedWork,
     crons,
     samePerson: overrides?.samePerson,
+    triageEnabledFor: overrides?.triageEnabledFor ?? (async () => true),
     loops,
     items,
     outputs,
@@ -577,7 +579,6 @@ async function bindCron(
     schedule: { everyMs: 60_000 },
     action: "fire loop",
     loopId: loop.id,
-    ...(loop.runAs ? { runAs: loop.runAs } : {}),
     ...over,
   });
   await s.loops.update(loop.id, { cronId: cron.id });
@@ -634,27 +635,25 @@ test("bound loop stages reread grants after revocation", async () => {
   assert.deepEqual(s.turns.at(-1)?.unattendedGrants, []);
 });
 
-for (const runAs of ["scopeShared", "scopeFloor"] as const) {
-  test(`bound loop preserves ${runAs} exclusions and member snapshot`, async () => {
-    const s = service(HAPPY);
-    const loop = await makeLoop(s.loops, { runAs, ownerScopeId: scopeId("channel", "C1") });
-    await bindCron(s, loop, { unattendedGrants: ["admin.sessions.read"], members: [{ id: "josh", type: "internal" }] });
-    const result = await s.fire.fire(loop.id, "shared");
-    assert.equal(result.status, "ok");
-    assert.equal(s.turns.length, 3);
-    for (const turn of s.turns) {
-      assert.equal(turn.unattendedGrants, undefined);
-      assert.equal(turn.ownerKeychainUnion, runAs === "scopeShared" ? true : undefined);
-      assert.equal(turn.conversation.kind, "channel");
-    }
-  });
-}
+test("a channel loop fires as its owner with their keychain and no unattended grants", async () => {
+  const s = service(HAPPY);
+  const loop = await makeLoop(s.loops, { ownerScopeId: scopeId("channel", "C1") });
+  await bindCron(s, loop, { unattendedGrants: ["admin.sessions.read"] });
+  const result = await s.fire.fire(loop.id, "shared");
+  assert.equal(result.status, "ok");
+  assert.equal(s.turns.length, 3);
+  for (const turn of s.turns) {
+    assert.equal(turn.unattendedGrants, undefined);
+    assert.equal(turn.ownerKeychainUnion, true);
+    assert.equal(turn.actor.externalId, loop.owner);
+    assert.equal(turn.conversation.kind, "channel");
+  }
+});
 
 test("bound loops reject missing crons, foreign scheduler bindings, and authority drift", async () => {
   for (const over of [
     { owner: "mallory" },
     { ownerScopeId: scopeId("personal", "mallory") },
-    { runAs: "scopeFloor" as const },
     { loopId: "another-loop" },
   ]) {
     const s = service(HAPPY);
@@ -979,4 +978,152 @@ test("a failed followup rejects so the composer can retain uploaded attachments"
   );
   assert.equal(s.turns[0]?.attachments?.[0]?.blobId, "test-blob");
   assert.equal((await s.items.get(item.id))?.thread?.at(-1)?.role, "system");
+});
+
+test("triage groups a flood read-only so only the representative is worked, with the rest as evidence", async () => {
+  const s = service((req) => {
+    const text = req.text ?? "";
+    if (text.startsWith("[Loop triage]")) {
+      const ids = [...text.matchAll(/"id":"([^"]+)"/g)].map((match) => match[1]!);
+      return `\`\`\`json\n${JSON.stringify({
+        items: ids.map((id, index) => ({
+          id,
+          priority: index === 0 ? "urgent" : "low",
+          reason: "checkout is down",
+          ...(index > 0 ? { groupWith: ids[0] } : {}),
+        })),
+      })}\n\`\`\``;
+    }
+    if (stage(req) === "intake")
+      return '```json\n[{"sourceKey": "SENTRY-1", "sourceSummary": "TypeError"}, {"sourceKey": "SENTRY-2", "sourceSummary": "TypeError"}, {"sourceKey": "SENTRY-3", "sourceSummary": "TypeError"}]\n```';
+    return HAPPY(req);
+  });
+  const loop = await makeLoop(s.loops);
+  await s.loops.update(loop.id, {
+    triage: {
+      prioritize: { enabled: true, instructions: "production incidents first" },
+      consolidate: { enabled: true },
+    },
+  });
+  await s.fire.fire(loop.id, "f1");
+  const triageTurn = s.turns.find((turn) => turn.text?.startsWith("[Loop triage]"));
+  assert.equal(triageTurn?.readOnly, true);
+  assert.match(triageTurn?.text ?? "", /production incidents first/);
+  const workTurns = s.turns.filter((turn) => stage(turn) === "work");
+  assert.equal(workTurns.length, 1);
+  assert.match(workTurns[0]!.text ?? "", /similarItems/);
+  const items = await s.items.byLoop(loop.id);
+  const representative = items.find((item) => item.status === "ready")!;
+  assert.equal(representative.triage?.priority, "urgent");
+  assert.deepEqual(
+    items.filter((item) => item.id !== representative.id).map((item) => [item.status, item.triage?.groupId]),
+    [
+      ["queued", representative.id],
+      ["queued", representative.id],
+    ],
+  );
+});
+
+test("triage does not run for a loop whose owner lacks the loop_triage flag", async () => {
+  const s = service(HAPPY, { triageEnabledFor: async () => false });
+  const loop = await makeLoop(s.loops);
+  await s.loops.update(loop.id, { triage: { prioritize: { enabled: true }, consolidate: { enabled: true } } });
+  await s.fire.fire(loop.id, "f1");
+  assert.equal(
+    s.turns.some((turn) => turn.text?.startsWith("[Loop triage]")),
+    false,
+  );
+});
+
+test("a triage dry run regroups every open item with draft instructions and writes nothing", async () => {
+  const s = service((req) => {
+    const text = req.text ?? "";
+    if (text.startsWith("[Loop triage]")) {
+      const ids = [...text.matchAll(/"id":"([^"]+)"/g)].map((match) => match[1]!);
+      return `\`\`\`json\n${JSON.stringify({
+        items: ids.map((id, index) => ({
+          id,
+          priority: "high",
+          reason: "draft",
+          ...(index > 0 ? { groupWith: ids[0] } : {}),
+        })),
+      })}\n\`\`\``;
+    }
+    if (stage(req) === "intake")
+      return '```json\n[{"sourceKey": "SENTRY-1", "sourceSummary": "TypeError"}, {"sourceKey": "SENTRY-2", "sourceSummary": "TypeError"}]\n```';
+    return HAPPY(req);
+  });
+  const loop = await makeLoop(s.loops);
+  await s.fire.fire(loop.id, "f1");
+  const before = await s.items.byLoop(loop.id);
+  const preview = await s.fire.previewTriage(loop, {
+    prioritize: { enabled: true, instructions: "outages first" },
+    consolidate: { enabled: true },
+  });
+  const turn = s.turns.findLast((t) => t.text?.startsWith("[Loop triage]"));
+  assert.equal(turn?.readOnly, true);
+  assert.match(turn?.text ?? "", /outages first/);
+  assert.equal(preview.length, 2);
+  assert.ok(preview.every((entry) => entry.priority === "high" && entry.groupId));
+  assert.deepEqual(await s.items.byLoop(loop.id), before);
+});
+
+test("parallel items stage work and judge on their own conversation, never colliding", async () => {
+  const active = new Set<string>();
+  const busy: string[] = [];
+  const s = service(async (req) => {
+    const ref = req.conversation.threadRef!;
+    if (active.has(ref)) busy.push(ref);
+    active.add(ref);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    active.delete(ref);
+    if (stage(req) === "intake")
+      return '```json\n[{"sourceKey": "A", "sourceSummary": "a"}, {"sourceKey": "B", "sourceSummary": "b"}]\n```';
+    return HAPPY(req);
+  });
+  const loop = await makeLoop(s.loops, { caps: { maxConcurrentItems: 2 } });
+  const result = await s.fire.fire(loop.id, "f1");
+  assert.equal(result.status, "ok");
+  assert.deepEqual(busy, []);
+  const refs = (kind: string) => s.turns.filter((t) => stage(t) === kind).map((t) => t.conversation.threadRef);
+  assert.equal(new Set(refs("work")).size, 2);
+  assert.deepEqual(new Set(refs("judge")), new Set(refs("work")));
+  assert.ok(!refs("work").includes(refs("intake")[0]!));
+});
+
+test("Slack work and follow-up prompts preserve message images without repeating profile cosmetics", async () => {
+  const s = service((req) => {
+    if (stage(req) === "work") return '```json\n{"proposal":{"body":"Draft reply"},"outputs":[]}\n```';
+    return '```json\n{"outcome":"met","reason":"Ready"}\n```';
+  });
+  const loop = await makeLoop(s.loops, { sources: ["slack"], shipActions: [{ action: "send", gate: "hold" }] });
+  await s.items.ingest([
+    {
+      loopId: loop.id,
+      dedupeKey: "D1",
+      source: "slack",
+      sourcePayload: {
+        participants: [{ id: "U1", name: "Alex", avatarUrl: "https://example.com/avatar.png" }],
+        context: [
+          {
+            authorId: "U1",
+            author: "Alex",
+            text: "Review this image",
+            images: ["https://example.com/task.png"],
+            avatarUrl: "https://example.com/avatar.png",
+          },
+        ],
+        slackAvatarsRefreshAt: 12345,
+      },
+    },
+  ]);
+  await s.fire.fire(loop.id, "push:1", undefined, { enumerate: false });
+  const [item] = await s.items.byLoop(loop.id);
+  await s.fire.followUp(loop, item!, "Please revise", loop.owner);
+  for (const req of s.turns.filter((req) => stage(req) === "work" || req.text?.startsWith("[Loop item chat]"))) {
+    assert.doesNotMatch(req.text ?? "", /avatarUrl|slackAvatarsRefreshAt/);
+    assert.match(req.text ?? "", /task.png/);
+    assert.match(req.text ?? "", /Alex/);
+  }
+  assert.match(JSON.stringify((await s.items.get(item!.id))!.sourcePayload), /avatar.png/);
 });

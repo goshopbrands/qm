@@ -1,16 +1,26 @@
+import { memoryRecallLabels } from "../memory/recall-labels.ts";
+import type { DirectoryStore } from "../directory/directory-store.ts";
+import type { ProjectStore } from "../projects/project-store.ts";
+import { isProjectGroupRef } from "../projects/project-store.ts";
+import { buildMemoryContextSnapshot } from "../memory/context-boundary.ts";
+import { disclosedMemory, type MemoryDisclosure } from "../memory/disclosure.ts";
+import { readNotebook, recallAcrossScopes, searchNotebooks } from "../memory/cross-scope.ts";
+import { shownFacts } from "../memory/recall-delta.ts";
+import { RECALL_MAX_CHARS } from "../memory/notebook.ts";
 import type { AclStore } from "../acl/acl-store.ts";
 import { parseRef } from "../acl/resource-ref.ts";
 import { principalEntitledToScope } from "./context-filter.ts";
 import { swallowAs } from "../util/errors.ts";
 import { readContextFile } from "./context-files.ts";
 import type { FileArtifactStore } from "../files/file-artifact-store.ts";
-import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import type { AuditLog } from "../audit/audit-log.ts";
 import type { MemoryService } from "../memory/memory-service.ts";
 import { recallMemoryScopes, writableMemoryScope, type MemoryPolicy } from "../memory/policy.ts";
 import type { SkillStore, GrantedSkillRef } from "../skills/skill-store.ts";
-import type { Resolution, ScopeId, Principal } from "../types.ts";
+import { parseScopeId, type Resolution, type ScopeId, type Principal } from "../types.ts";
 import { carriedFileHandles, sharingSourcesForTurn } from "./sharing-access.ts";
+
+import type { CurrentScopeMembers } from "./scope-membership.ts";
 
 type ContextInput = Omit<Parameters<typeof sharingSourcesForTurn>[0], "posture"> & {
   resolution: Resolution;
@@ -20,42 +30,13 @@ type ContextInput = Omit<Parameters<typeof sharingSourcesForTurn>[0], "posture">
   memoryPolicy: MemoryPolicy;
   useMemory: boolean;
   memory: MemoryService;
-  workspace: WorkspaceStore;
   files: FileArtifactStore;
   skills?: SkillStore;
   auditLog?: AuditLog;
+  currentScopeMembers?: CurrentScopeMembers;
+  directory?: DirectoryStore;
+  projects?: Pick<ProjectStore, "recognizes" | "name">;
 };
-
-interface MemoryReaderInput {
-  memory: MemoryService;
-  scopes: readonly ScopeId[];
-  actorId: string;
-  onRead?: (scope: ScopeId) => void;
-}
-
-export function contextMemory({ memory, scopes, actorId, onRead }: MemoryReaderInput) {
-  return {
-    async recall(): Promise<string> {
-      const sections: string[] = [];
-      for (const scope of scopes) {
-        const body = (await memory.read(scope)).trim();
-        onRead?.(scope);
-        if (body) sections.push(`### ${scope}\n${body}`);
-      }
-      return sections.join("\n\n");
-    },
-    async search(query: string, limit = 20): Promise<string[] | null> {
-      if (!scopes.length) return null;
-      const hits: string[] = [];
-      for (const scope of scopes) {
-        const facts = await memory.query(scope, query, limit, { actorId });
-        onRead?.(scope);
-        hits.push(...facts.map((fact) => (scopes.length > 1 ? `[${scope}] ${fact}` : fact)));
-      }
-      return hits.slice(0, limit);
-    },
-  };
-}
 
 // A turn-local view, never a reusable capability or a cross-turn cache.
 export async function resolveTurnContext(input: ContextInput) {
@@ -72,16 +53,6 @@ export async function resolveTurnContext(input: ContextInput) {
     (useMemory && memoryPolicy.capture !== "off") || read.length
       ? { ...(useMemory && memoryPolicy.capture !== "off" ? { write: memoryScopeId } : {}), read }
       : undefined;
-  const skillScopes = [
-    ...new Set([
-      memoryScopeId,
-      ...resolution.layers
-        .filter((layer) => layer.mode === "ro" && layer.scopeId !== resolution.orgScopeId)
-        .map((layer) => layer.scopeId),
-      ...sharingSources,
-      ...(!input.external ? [resolution.orgScopeId] : []),
-    ]),
-  ];
   const recordRead = (scope: ScopeId, resource: string) => {
     if (!sharingSources.includes(scope)) return;
     input.auditLog?.record({
@@ -93,41 +64,96 @@ export async function resolveTurnContext(input: ContextInput) {
       detail: JSON.stringify({ actor: input.actor.id, source: scope, target: input.targetScope }),
     });
   };
-  const memories = contextMemory({
-    memory: input.memory,
-    scopes: read,
-    actorId: input.actor.id,
-    onRead: (scope) => recordRead(scope, "memory"),
-  });
-  const handles = [
-    ...resolution.grantedHandles,
-    ...(await carriedFileHandles(sharingSources, input.workspace, input.files)),
-  ];
-  const grantedSkills: GrantedSkillRef[] = input.external
-    ? []
-    : (
-        await input.acl
-          .sharedOfKindForAudience(
-            "skill",
-            input.audience,
-            input.targetScope,
-            resolution.orgScopeId,
-            principalEntitledToScope,
-          )
-          .catch(swallowAs("context: skill grants for audience", []))
-      ).map((grant) => ({ id: parseRef(grant.ref).id, ownerScopeId: grant.ownerScopeId }));
+  const disclosure: MemoryDisclosure = {
+    actor: input.actor,
+    targetScope: input.targetScope,
+    nativeScopes: baseRecallScopes,
+    audience: input.audience,
+    open: resolution.sharingPosture === "open",
+    config: input.config,
+    isCurrentSharedScopeMember: input.isCurrentSharedScopeMember,
+    currentScopeMembers: input.currentScopeMembers,
+  };
+  const memory = disclosedMemory(input.memory, disclosure);
+  const handles = [...resolution.grantedHandles, ...(await carriedFileHandles(sharingSources, input.files))];
+  const memoryLabels = await memoryRecallLabels(read, input.directory, input.projects);
   return {
     sharingSources,
     memoryScopeId,
     baseRecallScopes,
     memoryAccess,
-    recall: memories.recall,
-    searchMemory: memories.search,
+    memory,
+    memoryLabels,
+    memorySnapshot: async (auditReads = true) => {
+      const notebooks = await Promise.all(read.map(async (scope) => ({ scope, facts: await memory.facts?.(scope) })));
+      if (auditReads) for (const { scope } of notebooks) recordRead(scope, "memory");
+      return {
+        held: new Map(notebooks.map(({ scope, facts }) => [scope, shownFacts(facts ?? [])])),
+        facts: notebooks.flatMap(({ facts }) => facts ?? []),
+        complete: notebooks.every(({ facts }) => !!facts),
+        snapshot: buildMemoryContextSnapshot({
+          targetScope: input.targetScope,
+          audience: isProjectGroupRef(parseScopeId(input.targetScope).ref ?? "")
+            ? []
+            : ((await input.currentScopeMembers?.(input.targetScope)) ??
+              (parseScopeId(input.targetScope).kind === "channel" ? [] : input.audience)),
+        }),
+      };
+    },
+    recallMemory: (query: string) =>
+      recallAcrossScopes(memory, read, { query, actorId: input.actor.id, maxChars: RECALL_MAX_CHARS }, memoryLabels),
+    searchMemory: async (query: string, limit = 20, scope?: ScopeId): Promise<string[] | null> => {
+      const hits = await searchNotebooks(memory, read, query, limit, scope, input.actor.id);
+      if (hits) for (const source of scope === undefined ? read : [scope]) recordRead(source, "memory");
+      return hits;
+    },
+    readMemory: async (scope: ScopeId): Promise<string | null> => {
+      if (!read.includes(scope)) return null;
+      const body = await readNotebook(memory, scope);
+      recordRead(scope, "memory");
+      return body;
+    },
     listFiles: () => handles,
-    listSkills: async () => (await input.skills?.visibleFor(skillScopes, grantedSkills)) ?? [],
+    listSkills: async (sources?: readonly string[]) => {
+      const sharingSources = input.external
+        ? []
+        : await sharingSourcesForTurn({ ...input, posture: resolution.sharingPosture });
+      const skillScopes = [
+        ...new Set([
+          memoryScopeId,
+          ...resolution.layers
+            .filter((layer) => layer.mode === "ro" && layer.scopeId !== resolution.orgScopeId)
+            .map((layer) => layer.scopeId),
+          ...sharingSources,
+          ...(!input.external ? [resolution.orgScopeId] : []),
+        ]),
+      ];
+      const grantedSkills: GrantedSkillRef[] = input.external
+        ? []
+        : (
+            await input.acl
+              .sharedOfKindForAudience(
+                "skill",
+                input.audience,
+                input.targetScope,
+                resolution.orgScopeId,
+                principalEntitledToScope,
+              )
+              .catch(swallowAs("context: skill grants for audience", []))
+          ).map((grant) => ({ id: parseRef(grant.ref).id, ownerScopeId: grant.ownerScopeId }));
+      return {
+        skills:
+          (await input.skills?.visibleFor(
+            sources ? skillScopes.filter((scope) => sources.includes(scope)) : skillScopes,
+            sources ? grantedSkills.filter((grant) => sources.includes(grant.ownerScopeId)) : grantedSkills,
+          )) ?? [],
+        sharingSources,
+        skillSources: [...new Set([...skillScopes, ...grantedSkills.map((grant) => grant.ownerScopeId)])],
+      };
+    },
     readFile: (path: string) =>
-      readContextFile(path, handles, input.workspace, input.files, (grant) => {
-        if (grant.carried) recordRead(grant.ownerScopeId, grant.ownerPath);
+      readContextFile(path, handles, input.files, (grant) => {
+        if (grant.carried) recordRead(grant.ownerScopeId, grant.fileId);
       }),
   };
 }

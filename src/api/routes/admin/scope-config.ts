@@ -3,15 +3,15 @@ import { encodeRef, serviceCredRef } from "../../../acl/resource-ref.ts";
 import { computeRetention } from "../../../admin/retention.ts";
 import {
   FAST_MODE_MODEL_IDS,
-  harnessSupportsFastMode,
+  modelCatalogFor,
   HARNESS_IDS,
   selectableBaseModels,
+  embeddingModelCatalog,
   defaultModelForHarness,
   modelProviderAvailabilityFor,
   modelServiceable,
   ALL_PROVIDERS_AVAILABLE,
   resolveModel,
-  thinkingLevelsForHarness,
 } from "../../../model/pi-models.ts";
 import {
   builtInModelCatalog,
@@ -52,6 +52,7 @@ export async function putScopeConfig(ctx: ApiCtx): Promise<void> {
       "runtime",
       "cron-runtime",
       "subagent-runtime",
+      "fallback-runtime",
       "webui-models",
       "browse-model",
       "auto-flagger",
@@ -272,17 +273,19 @@ const SETTINGS_RESOURCES = {
     "egress",
     "orgAmbient",
   ],
-  customize: ["soul", "branding", "featureFlags"],
+  customize: ["soul", "branding", "featureFlags", "decisions"],
   "slack-settings": ["externalSlackParticipants", "internalMemberOverrides", "channelHeaderPinDefault", "ackEmoji"],
   models: [
     "baseModel",
     "runtime",
     "cronRuntime",
     "subagentRuntime",
+    "fallbackRuntime",
     "approvedHarnesses",
     "webuiModels",
     "interactiveFastMode",
     "individualModelAuth",
+    "memoryEmbeddingModel",
     "browseModel",
     "browseMaxSteps",
   ],
@@ -379,7 +382,7 @@ async function scopeModelOptions(deps: ApiCtx["deps"], values: Record<string, un
     name: resolvedCurrent?.name ?? currentId + " (configured)",
     provider: resolvedCurrent?.provider ?? (currentId.includes("/") ? "openrouter" : ""),
   };
-  const purposeRuntimes = [values.cronRuntime, values.subagentRuntime].filter(
+  const purposeRuntimes = [values.cronRuntime, values.subagentRuntime, values.fallbackRuntime].filter(
     (value): value is { harnessId: string; modelId: string } =>
       !!value &&
       typeof (value as { harnessId?: unknown }).harnessId === "string" &&
@@ -405,6 +408,7 @@ async function scopeModelOptions(deps: ApiCtx["deps"], values: Record<string, un
         configured.some((runtime) => runtime.modelId === model.id),
     );
   };
+  const modelsByHarness = Object.fromEntries(HARNESS_IDS.map((id) => [id, modelsFor(id)]));
   return {
     ...(cached?.refreshing ? { modelCatalogRefreshing: true } : {}),
     baseModelDefault: defaultModelForHarness(deps.harnessId ?? "pi", deps.baseModelDefault),
@@ -417,18 +421,15 @@ async function scopeModelOptions(deps: ApiCtx["deps"], values: Record<string, un
           runtime?.harnessId === id ||
           purposeRuntimes.some((runtime) => runtime.harnessId === id)),
     ),
-    modelsByHarness: Object.fromEntries(
-      HARNESS_IDS.map((id) => [
-        id,
-        modelsFor(id).map((model) => ({ ...model, effortLevels: thinkingLevelsForHarness(id, model.id) })),
-      ]),
-    ),
-    thinkingLevelsByHarness: Object.fromEntries(
-      HARNESS_IDS.filter((id) => id !== "mock").map((id) => [id, thinkingLevelsForHarness(id)]),
+    modelsByHarness,
+    modelCatalog: modelCatalogFor(
+      Object.values(modelsByHarness)
+        .flat()
+        .map((model) => model.id),
     ),
     fastModeModelIds: FAST_MODE_MODEL_IDS,
-    fastModeHarnessIds: HARNESS_IDS.filter(harnessSupportsFastMode),
     autoFlaggerDefault: defaultAutoFlaggerConfig(deps),
+    memoryEmbeddingOptions: embeddingModelCatalog(),
     browseModelOptions: selectableBaseModels().filter((m) =>
       modelServiceable(m.id, providersFor(deps.harnessId ?? "pi")),
     ),

@@ -1,4 +1,4 @@
-import { isPrincipalType, PRINCIPAL_TYPES, type PrincipalType } from "../../types.ts";
+import { isPrincipalType, PRINCIPAL_TYPES } from "../../types.ts";
 import type { DirectoryMember } from "../../directory/directory-store.ts";
 import { canonicalPerson } from "../../directory/person.ts";
 import { sendJson } from "../http.ts";
@@ -49,12 +49,26 @@ async function pushDirectory(ctx: ApiCtx): Promise<void> {
     workspaceUrl?: unknown;
     membersSyncedAt?: unknown;
     channelsSyncedAt?: unknown;
+    partialChannels?: unknown;
     groupsSyncedAt?: unknown;
   };
   if (!Array.isArray(b.members) && !Array.isArray(b.channels) && !Array.isArray(b.groupMembers)) {
     return sendJson(res, 400, {
       error: "bad_request",
       message: "members[], channels[], and/or groupMembers[] required",
+    });
+  }
+  if (
+    b.partialChannels !== undefined &&
+    (typeof b.partialChannels !== "boolean" ||
+      (b.partialChannels &&
+        (!Array.isArray(b.channels) ||
+          !Array.isArray(b.channelMembers) ||
+          numOrUndef(b.channelsSyncedAt) === undefined)))
+  ) {
+    return sendJson(res, 400, {
+      error: "bad_request",
+      message: "partial channels require channels[], channelMembers[] and channelsSyncedAt",
     });
   }
   if (Array.isArray(b.members) && b.members.some((m) => isObj(m) && !isPrincipalType(m.type))) {
@@ -70,7 +84,7 @@ async function pushDirectory(ctx: ApiCtx): Promise<void> {
   if (Array.isArray(b.members)) {
     const members = b.members
       .filter(
-        (m): m is { principalId: string; displayName: string; type: PrincipalType; slackId?: string } =>
+        (m): m is DirectoryMember =>
           isObj(m) && typeof m.principalId === "string" && typeof m.displayName === "string" && isPrincipalType(m.type),
       )
       .map((m) => ({
@@ -78,6 +92,7 @@ async function pushDirectory(ctx: ApiCtx): Promise<void> {
         displayName: m.displayName,
         type: m.type,
         ...(typeof m.slackId === "string" && m.slackId ? { slackId: m.slackId } : {}),
+        ...(typeof m.avatarUrl === "string" && m.avatarUrl.startsWith("https://") ? { avatarUrl: m.avatarUrl } : {}),
       }));
     await app.upsertDirectory(members, numOrUndef(b.membersSyncedAt));
     memberCount = members.length;
@@ -103,13 +118,15 @@ async function pushDirectory(ctx: ApiCtx): Promise<void> {
             isObj(m) && typeof m.channelId === "string" && typeof m.principalId === "string",
         )
       : undefined;
-    await app.upsertChannels(
+    const applied = await app.upsertChannels(
       channels,
       channelMembers,
       numOrUndef(b.channelsSyncedAt),
       channelRosterIds,
       channelRevocations,
+      b.partialChannels === true,
     );
+    if (b.partialChannels && !applied) return sendJson(res, 409, { error: "stale_directory_observation" });
     channelCount = channels.length;
   }
   let groupMemberCount: number | undefined;

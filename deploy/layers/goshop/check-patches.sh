@@ -75,6 +75,12 @@ elif grep -q dataDir <<<"$provider"; then
 else
   echo "  still needed: $ref's Fly deploy provider has no durable app data"
 fi
+direct_calls="$(git diff "$base" "$ref" -- src/deploy/deploy-service.ts | grep -E '^\+.*deps\.provider\.' || true)"
+if [ -n "$direct_calls" ]; then
+  echo "  upstream added deploy provider calls that bypass providerFor; route each through providerFor(d):"
+  printf '%s\n' "$direct_calls" | sed 's/^/    /'
+  review=1
+fi
 shared="$(git show "$ref:src/deploy/shared-deploy-provider.ts" 2>/dev/null || true)"
 if grep -q "export function appReporter" <<<"$shared"; then
   echo "  ADOPT CANDIDATE: $ref reports app start failures through appReporter and appLogs (src/deploy/shared-deploy-provider.ts) — wire the legacy provider into them and drop its exit-code diagnosis"
@@ -92,6 +98,9 @@ elif grep -q "do not pip install" <<<"$skill" && grep -q "/opt/browser-engine/ve
 else
   echo "  RETIRE CANDIDATE: $ref no longer makes the unconditional pre-baked-runtime claim — check whether it now gates by backend or bootstraps the runtime, and verify on a fresh sprite"
   review=1
+fi
+if git show "$ref:src/skills/seed.ts" 2>/dev/null | grep -q respectArchived; then
+  echo "  RETIRE OPTION: $ref keeps admin-archived seed skills archived — restoring the directory is safe once production's browse record is confirmed archived"
 fi
 
 echo "== Patch 4: org manager role"
@@ -124,8 +133,8 @@ else
 fi
 
 echo "== Patch 5: a broker call without its credential handle explains itself"
-report_touches plugins/portal/src/index.ts src/api/server.ts src/api/git-http-broker.ts src/api/credential-broker.ts src/auth/capability-token.ts \
-  src/core/orchestrator.ts src/api/agent-api-catalog.ts skills-seed/use-shared-credential
+report_touches plugins/portal/src/index.ts src/api/server.ts src/api/git-http-broker.ts src/api/credential-broker.ts \
+  src/auth/capability-token.ts src/api/agent-api-catalog.ts skills-seed/use-shared-credential
 upstream_portal="$(git show "$ref:plugins/portal/src/index.ts" 2>/dev/null || true)"
 upstream_skill="$(git show "$ref:skills-seed/use-shared-credential/SKILL.md" 2>/dev/null || true)"
 if [ -z "$upstream_portal" ] || [ -z "$upstream_skill" ]; then
@@ -134,13 +143,14 @@ if [ -z "$upstream_portal" ] || [ -z "$upstream_skill" ]; then
 else
   fixed=""
   grep -q '/v1/credentials/broker' <<<"$upstream_portal" && fixed="$fixed portal-routes-broker"
-  git grep -qF 'service_<slug>' "$ref" -- src/api/server.ts src/api/git-http-broker.ts src/auth/capability-token.ts && fixed="$fixed core-401-names-handle"
-  grep -q 'your environment has no `AGENT_CREDENTIAL_TOKEN`' <<<"$upstream_skill" || fixed="$fixed skill-reworded"
+  git grep -qiE 'capability token required.*handle' "$ref" -- src/api/server.ts src/auth/capability-token.ts && fixed="$fixed core-401-names-handle"
+  git grep -qF 'this session is not entitled to that credential' "$ref" -- src/api/credential-broker.ts || fixed="$fixed not-entitled-reworded"
+  grep -q '401' <<<"$upstream_skill" && fixed="$fixed skill-explains-401"
   if [ -n "$fixed" ]; then
-    echo "  RETIRE CANDIDATE: $ref changed:$fixed; follow Patch 5's retirement steps"
+    echo "  RETIRE CANDIDATE: $ref changed:$fixed; follow Patch 5's retirement steps for those parts"
     review=1
   else
-    echo "  still needed: $ref's portal 404s a broker call without a token, core's 401 does not name the handle, and the skill still reads an empty token as no credentials"
+    echo "  still needed: $ref's portal 404s a broker call without a token, core's 401 and 403 do not name the handle, and the skill does not explain a 401"
   fi
 fi
 

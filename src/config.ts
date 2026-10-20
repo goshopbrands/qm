@@ -1,7 +1,15 @@
+import { codexAuthFileForEnv, loadCodexAuthFile } from "./model/chatgpt-auth-file.ts";
+import {
+  deploymentBrokerCredentialsFromEnv,
+  type DeploymentBrokerCredential,
+} from "./credentials/deployment-credentials.ts";
+import { errMessage } from "./util/errors.ts";
 import type { ExternalSlackPolicies } from "./resolution/external-slack.ts";
-import { isStrongSigningSecret } from "./auth/source-auth.ts";
+import { isBearerSecret, isStrongSigningSecret } from "./auth/source-auth.ts";
+import { parseSandboxCapabilityTtlMs } from "./auth/capability-token.ts";
 import { parseScopeId } from "./types.ts";
-import type { SandboxScopeDefaults } from "./sandbox/sandbox-routing.ts";
+import type { LegacySandboxScopeDefaults } from "./sandbox/sandbox-resource-upgrade.ts";
+import type { SandboxBackendName } from "./sandbox/sandbox-routing.ts";
 import { existsSync, readdirSync } from "node:fs";
 import {
   parseProviderBaseUrl,
@@ -22,7 +30,12 @@ import { sanitizeBranding } from "./resolution/branding.ts";
 import type { OrgBranding } from "./resolution/config-store.ts";
 import { validateCoreSecretEnv } from "./deployment/secret-schema.ts";
 import { DEFAULT_CAPTURE_QUIET_MS } from "./memory/strategies/per-turn.ts";
-import { parseSecurityPosture, type SecurityPosture } from "./security/security-posture.ts";
+import {
+  parseSecurityPosture,
+  SECURITY_SCREEN_MODES,
+  type SecurityPosture,
+  type SecurityScreenMode,
+} from "./security/security-posture.ts";
 import { parseSharingPosture, type SharingPosture } from "./resolution/sharing-posture.ts";
 import {
   parseSlackContextSource,
@@ -31,8 +44,8 @@ import {
   slackAccountConfigsFromEnv,
   type SlackPluginConfig,
 } from "./slack/config.ts";
-import { codexAuthFileForEnv, readCodexOAuthAuthFile } from "./harness/codex-auth-file.ts";
 import {
+  DEFAULT_CODEX_MODEL_ID,
   MODEL_PROVIDERS,
   defaultModelForProvider,
   isModelProvider,
@@ -63,27 +76,21 @@ export interface Config {
   databasePoolCaCert?: string;
   databasePoolMax?: number;
   databaseDirectPoolMax?: number;
-  harness: "mock" | "pi" | "opencode" | "codex" | "claude";
+  harness: "mock" | "pi" | "claude";
   securityPosture: SecurityPosture;
-  sandboxResourcesEnabled: boolean;
   sharingPosture: SharingPosture;
-  sandboxScopeDefaults?: SandboxScopeDefaults;
-  sandboxBackend: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37" | "superserve";
-  sandboxSecondaryBackend?:
-    "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37" | "superserve";
-  deployProvider: "docker" | "aws" | "fly" | "porter";
+  legacySandboxScopeDefaults?: LegacySandboxScopeDefaults;
+  sandboxBackend: SandboxBackendName;
+  sandboxSecondaryBackend?: SandboxBackendName;
+  deployProvider: "docker" | "aws" | "fly" | "porter" | "e2b";
   egressServiceHosts?: string[];
   brandingDefault?: OrgBranding;
   modelId?: string;
-  opencodeModel?: string;
-  codexModel?: string;
-  codexBinPath?: string;
   codexAuthFile?: string;
   /** Keychain credential id holding the Codex ChatGPT OAuth auth.json (production path). */
   codexAuthCredential?: string;
   /** Keychain credential id holding a Claude Code subscription token (production path). */
   claudeAuthCredential?: string;
-  codexProcessEnv: NodeJS.ProcessEnv;
   claudeModel?: string;
   claudeBinPath?: string;
   claudeProcessEnv: NodeJS.ProcessEnv;
@@ -96,9 +103,9 @@ export interface Config {
   modelProvider?: ModelProvider;
   providerBaseUrls: ProviderBaseUrls;
   modelGateway?: ModelGatewayTransportConfig;
+  brokerCredentials?: DeploymentBrokerCredential[];
   piCaptureRequests: boolean;
   piSystemCacheSplit: boolean;
-  sessionTapeMode: "shadow" | "serve";
   adminGrants?: string;
   trustedOidcAdminIssuer?: string;
   emailAuthPrincipals?: string[];
@@ -117,13 +124,13 @@ export interface Config {
   runMaxAgeMs: number;
   runWaitMs: number;
   backgroundJobTtlMs: number;
+  sandboxCapabilityTtlMs: number;
   backgroundJobTtlMaxMs: number;
   backgroundWorkEnabled: boolean;
   backgroundDeploymentId?: string;
   deploymentControlSecret?: string;
+  spendExportToken?: string;
   buildSha?: string;
-  ecsTaskProtection: boolean;
-  ecsAgentUri?: string;
   monitorPollMs: number;
   skillSyncPollMs: number;
   monitorHeartbeatMs: number;
@@ -169,7 +176,6 @@ export interface Config {
   memoryCapture: MemoryCaptureMode;
   memoryStrategy: MemoryStrategyKind;
   memoryProviderConfig?: MemoryProviderConfig;
-  memoryConsolidateAfter?: number;
   memoryCaptureQuietMs: number;
   memoryCaptureMaxTurns?: number;
   workers: number;
@@ -183,13 +189,12 @@ export interface Config {
   approvalSummaryTimeoutMs: number;
   turnLeaseWaitMs: number;
   securityScreenTimeoutMs: number;
-  securityScreenBackend: "off" | "model" | "proxy";
-  securityScreenAllPostures: boolean;
+  securityScreen: SecurityScreenMode;
+  securityScreenClassifier: "model" | "proxy";
   securityScreenProxy?: {
     provider: string;
     endpoint: string;
     token: string;
-    shadow: boolean;
   };
   scratchExecEnabled: boolean;
   reachExecEnabled: boolean;
@@ -202,6 +207,7 @@ export interface Config {
   agent37Sandbox: Agent37SandboxEnv;
   superserveSandbox: SuperserveSandboxEnv;
   e2bSandbox: E2bSandboxEnv;
+  managedAgentsSandbox: ManagedAgentsSandboxEnv;
   modalSandbox: ModalSandboxEnv;
   porterSandbox: PorterSandboxEnv;
   porterDeploy: PorterDeployEnv;
@@ -212,9 +218,15 @@ export interface Config {
 }
 
 export function configuredModelForHarness(config: Config, harness: string): string | undefined {
-  if (harness === "codex") return config.codexModel;
   if (harness === "claude") return config.claudeModel;
-  if (harness === "opencode") return config.opencodeModel;
+  if (
+    harness === "pi" &&
+    !config.modelId &&
+    !config.anthropicApiKey &&
+    !config.modelProvider &&
+    harnessCarriedModelAuth(config) === "openai"
+  )
+    return DEFAULT_CODEX_MODEL_ID;
   return config.modelId;
 }
 
@@ -223,7 +235,7 @@ export function providerKeysPresent(config: Config): ModelProviderAvailability {
     anthropic: Boolean(config.anthropicApiKey),
     openai: Boolean(config.openaiApiKey),
     openrouter: Boolean(config.openrouterApiKey),
-    ...(config.harness === "codex" && (config.codexAuthFile || config.codexAuthCredential) ? { codexOAuth: true } : {}),
+    ...(config.codexAuthCredential || config.codexAuthFile ? { codexOAuth: true } : {}),
   };
 }
 
@@ -239,11 +251,7 @@ export function harnessCarriedModelAuth(config: Config): ModelProvider | undefin
       config.claudeProcessEnv.ANTHROPIC_AUTH_TOKEN)
   )
     return "anthropic";
-  if (
-    config.harness === "codex" &&
-    (config.codexAuthCredential || config.codexAuthFile || config.codexProcessEnv.CODEX_ACCESS_TOKEN)
-  )
-    return "openai";
+  if (config.codexAuthCredential || config.codexAuthFile) return "openai";
   return undefined;
 }
 
@@ -429,6 +437,40 @@ function e2bSandboxEnv(env: NodeJS.ProcessEnv): E2bSandboxEnv {
   };
 }
 
+interface ManagedAgentsSandboxEnv {
+  apiToken?: string;
+  apiBaseUrl?: string;
+  template?: string;
+  namePrefix?: string;
+  sizeSlug?: string;
+  idleTimeoutSec?: number;
+  egressProxyUrl?: string;
+  snapshotS3Bucket?: string;
+  snapshotIntervalSec?: number;
+  defaultTimeoutSec?: number;
+}
+
+function managedAgentsSandboxEnv(env: NodeJS.ProcessEnv): ManagedAgentsSandboxEnv {
+  return {
+    ...(env.DO_AGENTS_API_TOKEN ? { apiToken: env.DO_AGENTS_API_TOKEN } : {}),
+    ...(env.DO_AGENTS_API_BASE_URL ? { apiBaseUrl: env.DO_AGENTS_API_BASE_URL } : {}),
+    ...(env.DO_AGENTS_TEMPLATE ? { template: env.DO_AGENTS_TEMPLATE } : {}),
+    ...(env.DO_AGENTS_NAME_PREFIX ? { namePrefix: env.DO_AGENTS_NAME_PREFIX } : {}),
+    ...(env.DO_AGENTS_SIZE_SLUG ? { sizeSlug: env.DO_AGENTS_SIZE_SLUG } : {}),
+    ...(numEnvStrict("DO_AGENTS_IDLE_TIMEOUT_SEC", env.DO_AGENTS_IDLE_TIMEOUT_SEC) !== undefined
+      ? { idleTimeoutSec: numEnvStrict("DO_AGENTS_IDLE_TIMEOUT_SEC", env.DO_AGENTS_IDLE_TIMEOUT_SEC) }
+      : {}),
+    ...(env.DO_AGENTS_EGRESS_PROXY_URL ? { egressProxyUrl: env.DO_AGENTS_EGRESS_PROXY_URL } : {}),
+    ...(env.DO_AGENTS_SNAPSHOT_S3_BUCKET ? { snapshotS3Bucket: env.DO_AGENTS_SNAPSHOT_S3_BUCKET } : {}),
+    ...(numEnvStrict("DO_AGENTS_SNAPSHOT_INTERVAL_SEC", env.DO_AGENTS_SNAPSHOT_INTERVAL_SEC) !== undefined
+      ? { snapshotIntervalSec: numEnvStrict("DO_AGENTS_SNAPSHOT_INTERVAL_SEC", env.DO_AGENTS_SNAPSHOT_INTERVAL_SEC) }
+      : {}),
+    ...(numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) !== undefined
+      ? { defaultTimeoutSec: numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) }
+      : {}),
+  };
+}
+
 interface ModalSandboxEnv {
   nativeSnapshotsEnabled?: boolean;
   nativeSnapshotIntervalSec?: number;
@@ -554,7 +596,7 @@ interface PorterDeployEnv {
   baseUrl?: string;
   runnerImage?: string;
   appsDomain?: string;
-  visibility?: "public" | "private";
+  visibility?: "public" | "private" | "internal";
   namePrefix?: string;
   ttlSec?: number;
 }
@@ -575,9 +617,9 @@ const porterLocatorPresent = (env: NodeJS.ProcessEnv): boolean =>
 function porterDeployVisibilityStrict(value: string | undefined): PorterDeployEnv["visibility"] {
   if (value === undefined || value.trim() === "") return undefined;
   const visibility = value.trim();
-  if (visibility === "public" || visibility === "private") return visibility;
+  if (visibility === "public" || visibility === "private" || visibility === "internal") return visibility;
   throw new Error(
-    `PORTER_DEPLOY_VISIBILITY=${JSON.stringify(value)} is not recognized — use public or private, or unset it.`,
+    `PORTER_DEPLOY_VISIBILITY=${JSON.stringify(value)} is not recognized — use public, private, or internal, or unset it.`,
   );
 }
 
@@ -585,6 +627,11 @@ function porterDeployEnv(env: NodeJS.ProcessEnv): PorterDeployEnv {
   const token = env.PORTER_DEPLOY_API_TOKEN;
   const baseUrl = porterApiBaseUrl(env);
   const visibility = porterDeployVisibilityStrict(env.PORTER_DEPLOY_VISIBILITY);
+  if (visibility === "internal" && env.PORTER_DEPLOY_APPS_DOMAIN) {
+    throw new Error(
+      "PORTER_DEPLOY_VISIBILITY=internal serves apps inside the cluster only, so it takes no PORTER_DEPLOY_APPS_DOMAIN — unset one of them.",
+    );
+  }
   const ttlSec = numEnvStrict("PORTER_DEPLOY_TTL_SEC", env.PORTER_DEPLOY_TTL_SEC);
   const runnerImage = env.PORTER_DEPLOY_RUNNER_IMAGE ?? env.PORTER_SANDBOX_IMAGE;
   return {
@@ -773,6 +820,7 @@ const SHARED_PLATFORM_SUFFIXES = [
   "github.io",
   "pages.dev",
   "workers.dev",
+  "e2b.app",
 ];
 
 function sharedPlatformSuffixOf(domain: string): string | undefined {
@@ -913,8 +961,6 @@ export function orgScope(): string {
   return `org:${orgId()}`;
 }
 
-export const OPENCODE_RUNTIME_VERSION = "1.18.31";
-
 export const CONFIG_DEFAULTS = {
   port: 8080,
   rateLimitPerWindow: 60,
@@ -941,7 +987,7 @@ export const CONFIG_DEFAULTS = {
   leaseTtlMs: 120_000,
   heartbeatIntervalMs: 10_000,
   reaperIntervalMs: 15_000,
-  shutdownDrainMs: 10_000,
+  shutdownDrainMs: 30_000,
   maxAttempts: 3,
   maxClaims: 8,
   processReaperIntervalMs: 30_000,
@@ -993,11 +1039,8 @@ function orgBrandingFromEnv(env: NodeJS.ProcessEnv): Config["brandingDefault"] {
 function harnessEnvStrict(value: string | undefined): Config["harness"] {
   if (value === undefined || value.trim() === "") return "mock";
   const harness = value.trim();
-  if (harness === "mock" || harness === "pi" || harness === "opencode" || harness === "codex" || harness === "claude")
-    return harness;
-  throw new Error(
-    `HARNESS=${JSON.stringify(value)} is not recognized — use mock, pi, opencode, codex, or claude, or unset it.`,
-  );
+  if (harness === "mock" || harness === "pi" || harness === "claude") return harness;
+  throw new Error(`HARNESS=${JSON.stringify(value)} is not recognized — use mock, pi, or claude, or unset it.`);
 }
 
 export function enabledSandboxBackends(config: Config): Array<Config["sandboxBackend"]> {
@@ -1008,6 +1051,7 @@ export function enabledSandboxBackends(config: Config): Array<Config["sandboxBac
     agent37: Boolean(config.agent37Sandbox?.apiKey),
     superserve: Boolean(config.superserveSandbox?.apiKey && config.superserveSandbox?.template),
     e2b: Boolean(config.e2bSandbox?.apiKey),
+    "do-managed-agents": Boolean(config.managedAgentsSandbox?.apiToken),
     modal: Boolean(config.modalSandbox?.tokenId && config.modalSandbox?.tokenSecret),
     aws: Boolean(config.awsSandbox?.s3Bucket),
     porter: Boolean(config.porterSandbox?.token),
@@ -1031,11 +1075,12 @@ function sandboxBackendEnvStrict(value: string | undefined, name = "SANDBOX_BACK
     backend === "modal" ||
     backend === "agent37" ||
     backend === "superserve" ||
+    backend === "do-managed-agents" ||
     backend === "porter"
   )
     return backend;
   throw new Error(
-    `${name}=${JSON.stringify(value)} is not recognized — use aws, local, sprites, smolmachines, e2b, modal, porter, agent37, or superserve, or unset it.`,
+    `${name}=${JSON.stringify(value)} is not recognized — use aws, local, sprites, smolmachines, e2b, modal, porter, agent37, superserve, or do-managed-agents, or unset it.`,
   );
 }
 
@@ -1071,14 +1116,18 @@ function sharingPostureEnvStrict(value: string | undefined): SharingPosture {
   );
 }
 
-function securityScreenBackendEnvStrict(value: string | undefined): Config["securityScreenBackend"] {
-  if (value === undefined || value.trim() === "") return "off";
-  const backend = value.trim().toLowerCase();
-  if (backend === "off" || backend === "model" || backend === "proxy") return backend;
-  throw new Error(
-    `SECURITY_SCREEN_BACKEND=${JSON.stringify(value)} is not recognized — use off, model, or proxy, or unset it.`,
-  );
+function choiceEnvStrict<T extends string>(name: string, value: string | undefined, choices: readonly T[]): T {
+  if (value === undefined || value.trim() === "") return choices[0]!;
+  const choice = value.trim().toLowerCase();
+  if ((choices as readonly string[]).includes(choice)) return choice as T;
+  throw new Error(`${name}=${JSON.stringify(value)} is not recognized — use ${choices.join(", ")}, or unset it.`);
 }
+
+const RETIRED_SECURITY_SCREEN_ENV = [
+  "SECURITY_SCREEN_BACKEND",
+  "SECURITY_SCREEN_ALL_POSTURES",
+  "SECURITY_SCREEN_PROXY_ROLLOUT",
+] as const;
 
 function csvPaths(value: string | undefined): string[] | undefined {
   if (value === undefined) return undefined;
@@ -1148,6 +1197,14 @@ function modelProviderEnvStrict(env: NodeJS.ProcessEnv): ModelProvider | undefin
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const token = env.SPEND_EXPORT_TOKEN;
+  if (token) {
+    const reused = Object.entries(env).some(([name, value]) => name !== "SPEND_EXPORT_TOKEN" && value === token);
+    if (!isStrongSigningSecret(token) || !isBearerSecret(token) || reused)
+      throw new Error(
+        "SPEND_EXPORT_TOKEN must be at least 32 characters, have no surrounding whitespace and differ from every other environment value",
+      );
+  }
   if (env.BACKGROUND_DEPLOYMENT_ID !== undefined) {
     if (!env.BACKGROUND_DEPLOYMENT_ID.trim() || env.BACKGROUND_DEPLOYMENT_ID.length > 256)
       throw new Error("BACKGROUND_DEPLOYMENT_ID must be nonempty and at most 256 characters");
@@ -1167,26 +1224,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const harness = harnessEnvStrict(env.HARNESS);
   const codexAuthCredential = env.CODEX_AUTH_CREDENTIAL?.trim() || undefined;
   const claudeAuthCredential = env.CLAUDE_AUTH_CREDENTIAL?.trim() || undefined;
-  const codexAuthCandidate = harness === "codex" && !codexAuthCredential ? codexAuthFileForEnv(env, true) : undefined;
-  const codexOAuthConfigured = Boolean(codexAuthCandidate && readCodexOAuthAuthFile(codexAuthCandidate));
-  const secretEnv =
-    codexOAuthConfigured && codexAuthCandidate
-      ? { ...env, CODEX_AUTH_FILE: codexAuthCandidate }
-      : { ...env, CODEX_AUTH_FILE: undefined };
+  const codexAuthFile = codexAuthCredential ? undefined : codexAuthFileForEnv(env);
+  if (env.NODE_ENV === "production" && codexAuthFile) {
+    throw new Error(
+      "CODEX_AUTH_FILE is supported for local development only; production must use CODEX_AUTH_CREDENTIAL (keychain custody)",
+    );
+  }
+  if (codexAuthFile) {
+    try {
+      loadCodexAuthFile(codexAuthFile);
+    } catch (error) {
+      throw new Error(`CODEX_AUTH_FILE is unusable: ${errMessage(error)}`, { cause: error });
+    }
+  }
   const deployAppsDomain = deployAppsDomainEnv(env, env.DEPLOY_PROVIDER ?? "docker");
-  const missingSecrets = validateCoreSecretEnv(secretEnv);
+  const missingSecrets = validateCoreSecretEnv(env);
   if (missingSecrets.length) {
     throw new Error(`missing or insecure required core secrets: ${missingSecrets.join(", ")}`);
-  }
-  if (harness === "codex" && !env.OPENAI_API_KEY?.trim() && !codexOAuthConfigured && !codexAuthCredential) {
-    throw new Error(
-      "HARNESS=codex needs OPENAI_API_KEY, a keychain credential via CODEX_AUTH_CREDENTIAL, or a readable ChatGPT OAuth auth.json via CODEX_AUTH_FILE (or ~/.codex/auth.json)",
-    );
-  }
-  if (env.NODE_ENV === "production" && codexOAuthConfigured) {
-    throw new Error(
-      "CODEX_AUTH_FILE is supported for local Codex harnesses only; production must use CODEX_AUTH_CREDENTIAL (keychain custody)",
-    );
   }
   const modelProvider = modelProviderEnvStrict(env);
   for (const key of ["SESSION_STORE", "RUN_STORE", "ARTIFACT_STORE"] as const) {
@@ -1228,6 +1282,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       "[config] SANDBOX_BACKEND=e2b without E2B_EGRESS_PROXY_URL — sandboxes run with NO egress enforcement (fail-open); set E2B_EGRESS_PROXY_URL to the public egress proxy so E2B's network rules admit only that host.",
     );
   }
+  if (env.SANDBOX_BACKEND === "do-managed-agents" && !env.DO_AGENTS_EGRESS_PROXY_URL) {
+    console.warn(
+      "[config] SANDBOX_BACKEND=do-managed-agents without DO_AGENTS_EGRESS_PROXY_URL — sandboxes run with NO egress enforcement (fail-open); set DO_AGENTS_EGRESS_PROXY_URL to the public egress proxy so the session's egress allowlist admits only that host.",
+    );
+  }
+  if (env.DO_AGENTS_API_TOKEN && !env.DO_AGENTS_SNAPSHOT_S3_BUCKET) {
+    console.warn(
+      "[config] do-managed-agents sandbox backend enabled without DO_AGENTS_SNAPSHOT_S3_BUCKET — pause preserves the microVM, but a destroyed session takes the home with it; set DO_AGENTS_SNAPSHOT_S3_BUCKET so a replacement session can hydrate from a portable snapshot.",
+    );
+  }
   if (env.MODAL_TOKEN_ID && env.MODAL_TOKEN_SECRET && !env.MODAL_EGRESS_PROXY_URL) {
     console.warn(
       "[config] modal sandbox backend enabled without MODAL_EGRESS_PROXY_URL — sandboxes run with NO egress enforcement (fail-open); set MODAL_EGRESS_PROXY_URL to the public https egress proxy so Modal's outbound allowlist admits only that host.",
@@ -1252,7 +1316,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (env.DEPLOY_PROVIDER === "porter" && !env.PORTER_DEPLOY_APPS_DOMAIN && !env.DEPLOY_APPS_DOMAIN) {
     console.warn(
-      "[config] DEPLOY_PROVIDER=porter without an apps domain — published apps use hostnames assigned by the cluster and are reachable signed-in at /d/<app>/; set DEPLOY_APPS_DOMAIN to a domain you control to serve each app on its own subdomain.",
+      "[config] DEPLOY_PROVIDER=porter without an apps domain — published apps are reachable signed-in at /d/<app>/ only; set DEPLOY_APPS_DOMAIN to a domain you control to serve each app on its own subdomain.",
     );
   }
   for (const [selected, label] of [
@@ -1267,11 +1331,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (env.NODE_ENV === "production" && !env.SANDBOX_BACKEND?.trim()) {
     throw new Error(
-      "SANDBOX_BACKEND must be set explicitly in production — use sprites, smolmachines, e2b, modal, porter, agent37, superserve, aws, or local.",
+      "SANDBOX_BACKEND must be set explicitly in production — use sprites, smolmachines, e2b, modal, porter, agent37, superserve, do-managed-agents, aws, or local.",
     );
   }
   const sandboxBackend = sandboxBackendEnvStrict(env.SANDBOX_BACKEND);
-  const sandboxScopeDefaults: SandboxScopeDefaults = {};
+  const legacySandboxScopeDefaults: LegacySandboxScopeDefaults = {};
   if (env.SANDBOX_SCOPE_BACKENDS) {
     const values: unknown = JSON.parse(env.SANDBOX_SCOPE_BACKENDS);
     if (!values || typeof values !== "object" || Array.isArray(values))
@@ -1280,11 +1344,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       const parsed = parseScopeId(kind + ":scope").kind;
       if (!parsed || parsed !== kind || typeof value !== "string" || !value.trim())
         throw new Error("Invalid SANDBOX_SCOPE_BACKENDS entry: " + kind);
-      sandboxScopeDefaults[parsed] = sandboxBackendEnvStrict(value, "SANDBOX_SCOPE_BACKENDS." + kind);
+      legacySandboxScopeDefaults[parsed] = sandboxBackendEnvStrict(value, "SANDBOX_SCOPE_BACKENDS." + kind);
     }
   }
-  const superserveSelected =
-    sandboxBackend === "superserve" || Object.values(sandboxScopeDefaults).includes("superserve");
+  const superserveSelected = sandboxBackend === "superserve";
   if (superserveSelected && !env.SUPERSERVE_TEMPLATE?.trim()) {
     throw new Error(
       "SANDBOX_BACKEND=superserve requires SUPERSERVE_TEMPLATE, the ready qm-agent-<release> template that carries the agent toolchain.",
@@ -1311,24 +1374,34 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       `[config] ${retiredBrainEnv.join(", ")} ${retiredBrainEnv.length === 1 ? "is" : "are"} retired and ignored — the brain integration was removed; point an external knowledge server at MEMORY_PROVIDER_CONFIG (docs/memory-providers.md). Remove the variables.`,
     );
   }
-  const securityScreenBackend = securityScreenBackendEnvStrict(env.SECURITY_SCREEN_BACKEND);
-  const securityScreenAllPostures =
-    boolEnvStrict("SECURITY_SCREEN_ALL_POSTURES", env.SECURITY_SCREEN_ALL_POSTURES) ?? false;
-  if (securityScreenAllPostures && securityScreenBackend === "off") {
-    throw new Error("SECURITY_SCREEN_ALL_POSTURES requires an enabled SECURITY_SCREEN_BACKEND");
+  const retiredScreenEnv = RETIRED_SECURITY_SCREEN_ENV.filter((name) => env[name]?.trim());
+  const retiredScreenOff =
+    retiredScreenEnv.length === 1 &&
+    env.SECURITY_SCREEN_BACKEND?.trim().toLowerCase() === "off" &&
+    !env.SECURITY_SCREEN?.trim();
+  if (retiredScreenOff) {
+    console.warn("[config] SECURITY_SCREEN_BACKEND=off is retired and read as SECURITY_SCREEN=off. Replace it.");
+  } else if (retiredScreenEnv.length) {
+    throw new Error(
+      `${retiredScreenEnv.join(", ")} ${retiredScreenEnv.length === 1 ? "is" : "are"} retired — set SECURITY_SCREEN=off|observe|enforce and SECURITY_SCREEN_CLASSIFIER=model|proxy instead, and remove the old variables.`,
+    );
   }
+  const securityScreen = choiceEnvStrict("SECURITY_SCREEN", env.SECURITY_SCREEN, SECURITY_SCREEN_MODES);
+  const securityScreenClassifier = choiceEnvStrict("SECURITY_SCREEN_CLASSIFIER", env.SECURITY_SCREEN_CLASSIFIER, [
+    "model",
+    "proxy",
+  ] as const);
   const proxyProvider = env.SECURITY_SCREEN_PROXY_PROVIDER?.trim();
   const proxyEndpoint = env.SECURITY_SCREEN_PROXY_ENDPOINT?.trim();
   const proxyToken = env.SECURITY_SCREEN_PROXY_TOKEN?.trim();
-  const proxyRollout = env.SECURITY_SCREEN_PROXY_ROLLOUT?.trim().toLowerCase();
-  const hasProxyConfig = [proxyProvider, proxyEndpoint, proxyToken, proxyRollout].some(Boolean);
-  if (securityScreenBackend === "proxy" && (!proxyProvider || !proxyEndpoint || !proxyToken || !proxyRollout)) {
+  const hasProxyConfig = [proxyProvider, proxyEndpoint, proxyToken].some(Boolean);
+  if (securityScreenClassifier === "proxy" && (!proxyProvider || !proxyEndpoint || !proxyToken)) {
     throw new Error(
-      "SECURITY_SCREEN_BACKEND=proxy requires SECURITY_SCREEN_PROXY_PROVIDER, SECURITY_SCREEN_PROXY_ENDPOINT, SECURITY_SCREEN_PROXY_TOKEN, and SECURITY_SCREEN_PROXY_ROLLOUT",
+      "SECURITY_SCREEN_CLASSIFIER=proxy requires SECURITY_SCREEN_PROXY_PROVIDER, SECURITY_SCREEN_PROXY_ENDPOINT, and SECURITY_SCREEN_PROXY_TOKEN",
     );
   }
-  if (securityScreenBackend !== "proxy" && hasProxyConfig) {
-    throw new Error("SECURITY_SCREEN_PROXY_* requires SECURITY_SCREEN_BACKEND=proxy");
+  if (securityScreenClassifier !== "proxy" && hasProxyConfig) {
+    throw new Error("SECURITY_SCREEN_PROXY_* requires SECURITY_SCREEN_CLASSIFIER=proxy");
   }
   if (proxyProvider && (proxyProvider.length > 63 || !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(proxyProvider))) {
     throw new Error("SECURITY_SCREEN_PROXY_PROVIDER must be a lowercase DNS label");
@@ -1347,9 +1420,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       );
     }
   }
-  if (proxyRollout && proxyRollout !== "shadow" && proxyRollout !== "enforce") {
-    throw new Error("SECURITY_SCREEN_PROXY_ROLLOUT must be shadow or enforce");
-  }
   const securityScreenTimeoutMs =
     numEnvStrict("SECURITY_SCREEN_TIMEOUT_MS", env.SECURITY_SCREEN_TIMEOUT_MS) ??
     CONFIG_DEFAULTS.securityScreenTimeoutMs;
@@ -1367,39 +1437,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     deployProvider !== "aws" &&
     deployProvider !== "docker" &&
     deployProvider !== "fly" &&
-    deployProvider !== "porter"
+    deployProvider !== "porter" &&
+    deployProvider !== "e2b"
   ) {
     throw new Error(
-      `DEPLOY_PROVIDER=${JSON.stringify(deployProvider)} is not recognized (expected aws, docker, fly, or porter)`,
+      `DEPLOY_PROVIDER=${JSON.stringify(deployProvider)} is not recognized (expected aws, docker, fly, porter, or e2b)`,
     );
   }
   let runStore: "memory" | "postgres" = env.SESSION_STORE === "postgres" ? "postgres" : "memory";
   if (env.RUN_STORE === "memory" || env.RUN_STORE === "postgres") runStore = env.RUN_STORE;
-  const codexEnv = { ...env };
-  if (codexOAuthConfigured && codexAuthCandidate) codexEnv.CODEX_AUTH_FILE = codexAuthCandidate;
-  else delete codexEnv.CODEX_AUTH_FILE;
   const providerBaseUrls = providerBaseUrlsFromEnv(env);
   const modelGateway = modelGatewayFromEnv(env);
-  const codexProcessEnv = Object.fromEntries(
-    [
-      "PATH",
-      "TMPDIR",
-      "LANG",
-      "LC_ALL",
-      "SSL_CERT_FILE",
-      "SSL_CERT_DIR",
-      "NODE_EXTRA_CA_CERTS",
-      "HTTP_PROXY",
-      "HTTPS_PROXY",
-      "NO_PROXY",
-      "ALL_PROXY",
-      "OPENAI_API_KEY",
-      "CODEX_ACCESS_TOKEN",
-      "HOME",
-      "CODEX_HOME",
-      "CODEX_AUTH_FILE",
-    ].flatMap((name) => (codexEnv[name] === undefined ? [] : [[name, codexEnv[name]]])),
-  ) as NodeJS.ProcessEnv;
+  const brokerCredentials = deploymentBrokerCredentialsFromEnv(env);
   const claudeProcessEnv = Object.fromEntries(
     [
       "PATH",
@@ -1418,7 +1467,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       "CLAUDE_CODE_OAUTH_TOKEN",
     ].flatMap((name) => (env[name] === undefined ? [] : [[name, env[name]]])),
   ) as NodeJS.ProcessEnv;
-  if (providerBaseUrls.openai) codexProcessEnv.OPENAI_BASE_URL = providerBaseUrls.openai;
   if (providerBaseUrls.anthropic) claudeProcessEnv.ANTHROPIC_BASE_URL = providerBaseUrls.anthropic;
   const turnWallClockMs =
     (numEnvStrict("TURN_WALL_CLOCK_SEC", env.TURN_WALL_CLOCK_SEC) ?? CONFIG_DEFAULTS.turnWallClockSec) * 1000;
@@ -1466,21 +1514,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     harness,
     securityPosture: securityPostureEnvStrict(env.HARNESS_SECURITY_POSTURE),
     sharingPosture: sharingPostureEnvStrict(env.HARNESS_SHARING_POSTURE),
-    securityScreenBackend,
-    securityScreenAllPostures,
-    ...(securityScreenBackend === "proxy"
-      ? {
-          securityScreenProxy: {
-            provider: proxyProvider!,
-            endpoint: proxyEndpoint!,
-            token: proxyToken!,
-            shadow: proxyRollout === "shadow",
-          },
-        }
+    securityScreen,
+    securityScreenClassifier,
+    ...(securityScreenClassifier === "proxy"
+      ? { securityScreenProxy: { provider: proxyProvider!, endpoint: proxyEndpoint!, token: proxyToken! } }
       : {}),
     sandboxBackend,
-    sandboxScopeDefaults,
-    sandboxResourcesEnabled: boolEnvStrict("SANDBOX_RESOURCES_ENABLED", env.SANDBOX_RESOURCES_ENABLED) ?? false,
+    legacySandboxScopeDefaults,
     deployProvider,
     ...(env.EGRESS_SERVICE_HOSTS
       ? {
@@ -1491,13 +1531,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       : {}),
     ...(orgBrandingFromEnv(env) ? { brandingDefault: orgBrandingFromEnv(env) } : {}),
     ...(env.PI_MODEL ? { modelId: env.PI_MODEL } : {}),
-    ...(env.OPENCODE_MODEL || env.PI_MODEL ? { opencodeModel: env.OPENCODE_MODEL || env.PI_MODEL } : {}),
-    ...(env.CODEX_MODEL ? { codexModel: env.CODEX_MODEL } : {}),
-    ...(env.CODEX_BIN ? { codexBinPath: env.CODEX_BIN } : {}),
-    ...(codexOAuthConfigured && codexAuthCandidate ? { codexAuthFile: codexAuthCandidate } : {}),
+    ...(codexAuthFile ? { codexAuthFile } : {}),
     ...(codexAuthCredential ? { codexAuthCredential } : {}),
     ...(claudeAuthCredential ? { claudeAuthCredential } : {}),
-    codexProcessEnv,
     ...(env.CLAUDE_MODEL ? { claudeModel: env.CLAUDE_MODEL } : {}),
     ...(env.CLAUDE_BIN ? { claudeBinPath: env.CLAUDE_BIN } : {}),
     claudeProcessEnv,
@@ -1510,6 +1546,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(modelProvider ? { modelProvider } : {}),
     providerBaseUrls,
     ...(modelGateway ? { modelGateway } : {}),
+    ...(brokerCredentials.length ? { brokerCredentials } : {}),
     ...(env.TRUSTED_OIDC_ADMIN_ISSUER ? { trustedOidcAdminIssuer: env.TRUSTED_OIDC_ADMIN_ISSUER } : {}),
     ...(env.ADMIN_GRANTS ? { adminGrants: env.ADMIN_GRANTS } : {}),
     ...(env.AUTH_ALLOWED_EMAILS
@@ -1530,7 +1567,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.AUTH_EMAIL_FROM?.trim() ? { emailFrom: env.AUTH_EMAIL_FROM.trim() } : {}),
     piCaptureRequests: boolEnvStrict("PI_CAPTURE_REQUESTS", env.PI_CAPTURE_REQUESTS) ?? true,
     piSystemCacheSplit: boolEnvStrict("PI_SYSTEM_CACHE_SPLIT", env.PI_SYSTEM_CACHE_SPLIT) ?? false,
-    sessionTapeMode: env.SESSION_TAPE_MODE === "shadow" ? "shadow" : "serve",
     rateLimitPerWindow:
       numEnvStrict("RATE_LIMIT_PER_WINDOW", env.RATE_LIMIT_PER_WINDOW) ?? CONFIG_DEFAULTS.rateLimitPerWindow,
     rateLimitWindowMs:
@@ -1555,6 +1591,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     swarmDefaults,
     runMaxAgeMs,
     runWaitMs: (turnWallClockMs > 0 ? turnWallClockMs : runMaxAgeMs) + 60_000,
+    sandboxCapabilityTtlMs: parseSandboxCapabilityTtlMs(env.SANDBOX_CAPABILITY_TTL_HOURS),
     backgroundJobTtlMs:
       (numEnvStrict("BACKGROUND_JOB_TTL_SEC", env.BACKGROUND_JOB_TTL_SEC) ?? CONFIG_DEFAULTS.backgroundJobTtlSec) *
       1000,
@@ -1566,9 +1603,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.BACKGROUND_DEPLOYMENT_ID
       ? { backgroundDeploymentId: env.BACKGROUND_DEPLOYMENT_ID, deploymentControlSecret: env.DEPLOYMENT_CONTROL_SECRET }
       : {}),
+    ...(env.SPEND_EXPORT_TOKEN ? { spendExportToken: env.SPEND_EXPORT_TOKEN } : {}),
     ...(env.GIT_SHA ? { buildSha: env.GIT_SHA } : {}),
-    ecsTaskProtection: boolEnvStrict("ECS_TASK_PROTECTION", env.ECS_TASK_PROTECTION) ?? true,
-    ...(env.ECS_AGENT_URI ? { ecsAgentUri: env.ECS_AGENT_URI } : {}),
     monitorPollMs: numEnvStrict("MONITOR_POLL_MS", env.MONITOR_POLL_MS) ?? CONFIG_DEFAULTS.monitorPollMs,
     skillSyncPollMs: numEnvStrict("SKILL_SYNC_POLL_MS", env.SKILL_SYNC_POLL_MS) ?? CONFIG_DEFAULTS.skillSyncPollMs,
     monitorHeartbeatMs:
@@ -1614,9 +1650,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     memoryCapture: parseMemoryCaptureMode(env.MEMORY_CAPTURE),
     memoryStrategy: parseMemoryStrategyKind(env.MEMORY_STRATEGY),
     ...(memoryProviderConfig ? { memoryProviderConfig } : {}),
-    ...(numEnvStrict("MEMORY_CONSOLIDATE_AFTER", env.MEMORY_CONSOLIDATE_AFTER) !== undefined
-      ? { memoryConsolidateAfter: numEnvStrict("MEMORY_CONSOLIDATE_AFTER", env.MEMORY_CONSOLIDATE_AFTER) }
-      : {}),
     memoryCaptureQuietMs:
       numEnvStrict("MEMORY_CAPTURE_QUIET_MS", env.MEMORY_CAPTURE_QUIET_MS) ?? DEFAULT_CAPTURE_QUIET_MS,
     ...(numEnvStrict("MEMORY_CAPTURE_MAX_TURNS", env.MEMORY_CAPTURE_MAX_TURNS) !== undefined
@@ -1670,6 +1703,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     porterSandbox: porterSandboxEnv(env),
     porterDeploy: porterDeployEnv(env),
     e2bSandbox: e2bSandboxEnv(env),
+    managedAgentsSandbox: managedAgentsSandboxEnv(env),
     modalSandbox: modalSandboxEnv(env),
     awsDeploy: {
       ...awsDeployEnv(env),

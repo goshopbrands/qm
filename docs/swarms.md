@@ -9,12 +9,17 @@ with a `Swarm worker` title. Worker transcripts remain read-only for ordinary me
 ## Deployment
 
 Use Postgres for production (`DATABASE_URL`, `SESSION_STORE=postgres`, and
-`RUN_STORE=postgres`) and enable the existing sandbox inventory with
-`SANDBOX_RESOURCES_ENABLED=true`. Configure a sandbox backend with its required
+`RUN_STORE=postgres`) (sandbox resources are always on). Configure a sandbox backend with its required
 credentials and deployment-specific settings. Workers use the provider of the scope's selected computer, or the deployment default when none is selected. An initial
 `backend` override chooses another configured provider that supports creation and
 retirement. That choice is stored once; later default changes never move workers
 to another provider, and the selected computer's files are never copied.
+
+Swarms are also gated per person by the `swarms` feature flag, off by default.
+Enable it for a person's personal scope (for example `personal:alice@example.com`)
+or the org scope in the admin feature-flag table. Without it the swarm routes refuse
+the caller, `/v1/apis` omits them, and existing swarms owned by that person stop
+reconciling and delivering. `SWARMS_ENABLED=false` remains the deployment kill switch.
 
 The `swarms` durable-map table has its own registered migration,
 `durable-map/swarms/0001`. Apply registered migrations through the normal QM deploy
@@ -48,12 +53,24 @@ human author. Request bodies cannot set identity, authorization, or provenance.
 }
 ```
 
+Any spawn — initial or later, by the root or by a worker — may choose the
+model for the workers it creates with optional `model`, `effort` (a thinking
+level) and `fastMode`, e.g.
+`{"action":"spawn","requestId":"r1","count":8,"model":"gpt-6.1-sol","effort":"medium","fastMode":false,"text":"..."}`.
+The choice is stored on each new member (visible in inspect), applies to every
+turn that worker takes, and is inherited by workers it spawns unless they choose
+again. Workers do not copy the root's runtime: fields nobody chose resolve like any
+subagent turn, from the org subagent default and then the owner's default. An
+unavailable model fails closed at dispatch.
+
 Optional `settings` overrides the defaults below at initial spawn. The backend
 can configure defaults with `SWARM_DEFAULTS`, a JSON object such as
 `{"agents":16,"turnMs":900000}`. Values must be positive safe integers within the
-safety bounds; unknown settings are rejected. Resolved settings and the chosen
-`backend` are stored once. Identical initial requests can be retried; subsequent
-spawns inherit the settings and cannot reconfigure the swarm.
+safety bounds; unknown settings are rejected. Resolved settings and the chosen `backend` are stored once. Identical
+initial requests can be retried. Later spawns by the root session may pass
+`settings` again to change any setting except `turnMs` (for example, to raise
+`agents`); workers inherit the settings and cannot reconfigure the swarm. The
+backend cannot change after creation.
 
 Omit `count` to spawn one; `contexts` also determines the count when provided. A
 single `context` supplies the same initial JSON to every worker. Context may be any
@@ -77,8 +94,14 @@ grants belong only to the session that received them, not its workers. A compute
 is not an authorization principal. Existing provider persistence behavior is
 unchanged; swarms add no filesystem snapshots, immutable copies, or restores.
 
-To add a shared forum, supply `forumSandboxId` naming an existing authorized sandbox
-in the same scope. Every worker still gets its own blank private computer.
+Every swarm gets one shared board computer in the swarm scope, created with the
+first worker. `inspect` returns it as `board.sandboxId`, and every worker carries
+it as `forumSandboxId`; the root session and all workers reach it with
+`execute`'s `sandbox_id`. Board creation is part of each worker's provisioning and
+fails that worker like any other provisioning failure. The board outlives worker
+cleanup so its files remain available to the root. To use an existing computer instead,
+supply `forumSandboxId` naming an authorized sandbox in the same scope; no board is
+then created. Every worker still gets its own blank private computer.
 The forum ID appears in peer metadata and the worker prompt; select it explicitly
 with `execute`'s `sandbox_id` for commands that should use the shared computer.
 This is not a new filesystem synchronization feature. Workers using a forum share
@@ -87,7 +110,7 @@ never retires the existing forum.
 
 ### Identity, peers, and character
 
-`GET /v1/swarm` returns `id`, `self`, `peers`, `backend`, `settings`, and `expiresAt`. Peer
+`GET /v1/swarm` returns `id`, `self`, `peers`, `backend`, `settings`, and `expiresAt` when a work window is set. Peer
 records keep trusted IDs, ancestry, session links, storage selection, and lifecycle
 state separate from arbitrary `context` data. Only this swarm is listed, not every
 session with the same owner, and never all private sessions in the organization.
@@ -133,8 +156,8 @@ delivery target, and the delivery layer also refuses swarm result delivery.
 
 Set `notify:false` for a durable message without a wakeup. Sending to oneself does
 not wake oneself. There are no automatic reply-to-reply notifications: agents
-explicitly decide whether a response warrants another turn. Every generated turn
-consumes the same finite notification budget.
+explicitly decide whether a response warrants another turn. When `notifications`
+is set, every generated turn consumes that budget.
 
 ### Ask, read, and tail
 
@@ -191,31 +214,52 @@ resource operations exhaust only this instance's resource capacity until a slot 
 released. Pending selection remains single-flight until its underlying database
 query settles, even when a sweep reports a selection timeout.
 
-## Defaults and safety bounds
+### Worker controls
 
-| Setting                                          | Default              | Maximum     |
-| ------------------------------------------------ | -------------------- | ----------- |
-| `agents` (root and failed reservations included) | 32                   | 64          |
-| `depth` below root                               | 4                    | 8           |
-| `spawnRequests`                                  | 32                   | 64          |
-| `messages` including initial work                | 128                  | 256         |
-| `notifications` including initial work           | 256                  | 1,024       |
-| `contextBytes` / `textBytes`                     | 8,192 each           | 16,384 each |
-| `lifetimeMs` from first spawn                    | 3,600,000            | 86,400,000  |
-| `turnMs` per notification                        | 600,000 (10 minutes) | 3,600,000   |
-| `waitMs` per read                                | 10,000               | 30,000      |
+`POST` with `{action:"control",memberId,state}` sets a worker to `paused`,
+`active`, or `stopped`. Humans in the swarm may control any worker; an agent may
+control only itself or its descendants. The root session cannot be controlled.
+Controls apply to descendants too. Pausing holds new notifications as pending
+until the worker is resumed; runs already queued continue. Stopping is terminal:
+pending notifications fail, unstarted queued runs are withdrawn, running turns are
+aborted, and later turns in that worker session are refused. `inspect` reports each
+peer's `control`. The web UI shows a Swarm strip on swarm sessions: a collapsed summary of
+active, starting, paused, stopped, and failed workers; when expanded, workers
+grouped under their parent (20 per group, with "show more"); per-worker Pause,
+Resume, and Stop; and Pause all, Resume all, and Stop all (with a confirm), which
+apply this action to the root's direct children so it cascades. The strip
+refreshes every few seconds only while workers are active and the tab is visible.
+
+## Defaults
+
+| Setting                                          | Default              |
+| ------------------------------------------------ | -------------------- |
+| `agents` (root and failed reservations included) | 32                   |
+| `depth` below root                               | 4                    |
+| `contextBytes` / `textBytes`                     | 8,192 each           |
+| `spawnRequests`                                  | unset (no limit)     |
+| `messages` including initial work                | unset (no limit)     |
+| `notifications` including initial work           | unset (no limit)     |
+| `lifetimeMs` from first spawn                    | unset (no limit)     |
+| `turnMs` per notification                        | 600,000 (10 minutes) |
+| `waitMs` per read                                | 10,000               |
 
 The root and at least one worker require `agents >= 2`. All other settings accept
-positive integers up to their maximum. Read requests can still use `waitMs:0`.
-Per-swarm budgets are reserved atomically with the messages and members consuming
-them. Both the orchestrator and independent worker cancellation honor the stored
-turn deadline; existing organization-wide limits can shorten it. Internal reconciliation limits, the 32-message read page, and
-bounded run retry counts are not swarm configuration.
+any positive integer; `turnMs` is limited only by the 2,147,483,647 ms timer ceiling. Read requests can still use `waitMs:0`.
+`spawnRequests`, `messages`, `notifications`, and `lifetimeMs` are off unless a
+spawn or `SWARM_DEFAULTS` sets them. When set, they are enforced as budgets that are
+reserved atomically with the members and messages that consume them. Both the
+orchestrator and independent worker cancellation honor the stored turn deadline;
+existing organization-wide limits can shorten it. Internal reconciliation limits,
+the 32-message read page, and bounded run retry counts are not swarm
+configuration.
 
-After expiration, history remains readable, but new work, notifications, and
-character changes are rejected. Human-initiated ordinary session turns remain
-ordinary QM actions. Workers and their durable results remain visible; computers
-can be retired through the existing sandbox inventory. There is no automatic
+When `lifetimeMs` is set and the window passes, history remains readable, but new
+work, notifications, and character changes are rejected until the root extends
+`lifetimeMs` on a later spawn. Swarms without `lifetimeMs` never expire. Human-initiated
+ordinary session turns remain ordinary QM actions.
+Workers and their durable results remain visible; computers can be retired
+through the existing sandbox inventory. There is no automatic
 filesystem export on retirement: publish useful outputs through existing Files
 or your version-control workflow first.
 

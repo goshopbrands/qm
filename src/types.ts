@@ -33,6 +33,14 @@ export function personalScope(principalId: string): ScopeId {
   return scopeId("personal", principalId);
 }
 
+export function scopeActor(scope: ScopeId): string {
+  return `system:${scope}`;
+}
+
+export function actsAsScope(principalId: string, scope: ScopeId): boolean {
+  return principalId === scopeActor(scope);
+}
+
 export function parseScopeId(id: ScopeId): { kind: ScopeKind | null; ref: string } {
   const sep = id.indexOf(":");
   if (sep < 0) return { kind: null, ref: "" };
@@ -55,6 +63,7 @@ export function isSharedScope(id: ScopeId | undefined): boolean {
 export type ConversationKind = "dm" | "channel" | "group";
 
 export interface Conversation {
+  teamIds?: string[];
   kind: ConversationKind;
   threadRef: string;
   channelRef?: string;
@@ -68,6 +77,8 @@ export interface Conversation {
 export type SessionType = "dm" | "channel" | "group";
 
 export interface SpawnMeta {
+  slackSource?: TurnRequest["slackSource"];
+  externalSlack?: TurnRequest["externalSlack"];
   surfaceTools?: boolean;
   deliveryCandidates?: TurnRequest["deliveryCandidates"];
   origin?: TurnOrigin;
@@ -87,12 +98,8 @@ export interface SpawnMeta {
   fastMode?: boolean;
 }
 
-export interface SessionStatus {
-  emoji: string;
-  text: string;
-}
-
 export interface Session {
+  clientTools?: ClientToolDeclaration[];
   id: string;
   type: SessionType;
   scopeId: ScopeId;
@@ -104,7 +111,7 @@ export interface Session {
   archived?: boolean;
   pinned?: boolean;
   color?: string;
-  status?: SessionStatus | null;
+  unread?: boolean;
   forkedFrom?: { sessionId: string; title?: string | null };
   forkBoundarySeq?: number;
   parentSessionId?: string;
@@ -113,9 +120,13 @@ export interface Session {
   hasEntries?: boolean;
   working?: boolean;
   awaitingInput?: boolean;
+  lastTurnFailed?: boolean;
+  canContinue?: boolean;
   backgroundJobs?: number;
   watches?: number;
   crons?: number;
+  /** Set while a working session pursues a goal: banked active time, the running turn's start, and the floor. */
+  goal?: { objective: string; activeMs: number; runningSince?: number; floor?: Record<string, number> };
 }
 
 export type EntryType =
@@ -176,7 +187,7 @@ export interface GrantedHandle {
   carried?: true;
   handlePath: string;
   ownerScopeId: ScopeId;
-  ownerPath: string;
+  fileId: string;
   permission: Permission;
 }
 
@@ -202,6 +213,7 @@ export interface TriggerBase {
 export interface Destination {
   slackAccountId?: string;
   slackTeamId?: string;
+  slackPolicyNamespace?: string;
   keychainAskId?: string;
   deploymentAccess?: { deploymentId: string; requesterId: string };
   commandApprovalId?: string;
@@ -212,18 +224,16 @@ export interface Destination {
   relaySender?: string;
   threadTs?: string;
   editRef?: string;
-  taskList?: Array<{
-    id: string;
-    title: string;
-    status: "pending" | "in_progress" | "completed" | "skipped" | "failed";
-  }>;
   unfurlLinks?: boolean;
   react?: { messageTs: string; emoji: string };
   delete?: { messageTs: string };
   pin?: { messageTs: string; remove?: boolean };
   identity?: string;
   debugFooter?: string;
-  webTranscript?: { kind: "reply" } | { kind: "turn_failure"; notBefore: number; runId?: string };
+  webTranscript?:
+    | { kind: "reply" }
+    | { kind: "slack_reply"; sessionId: string; ts: string; name: string }
+    | { kind: "turn_failure"; notBefore: number; runId?: string };
 }
 
 export interface CandidateDestination extends Destination {
@@ -282,10 +292,8 @@ export interface Cron extends TriggerBase {
   message?: string;
   loopId?: string;
   createdAt: number;
-  runAs?: "owner" | "scopeFloor" | "scopeShared";
-  ownerResourcesRequireOpen?: boolean;
-  members?: Principal[];
   unattendedGrants?: string[];
+  sessionRef?: string;
 
   fireLog?: CronFireLogEntry[];
   lastFireNote?: CronFireNote;
@@ -312,6 +320,7 @@ export interface Webhook extends TriggerBase {
 export interface Monitor extends TriggerBase {
   processId: string;
   command: string;
+  purpose?: string;
   threadRef: string;
   instructions?: string;
   pattern?: string;
@@ -334,6 +343,7 @@ export interface ShipActionPolicy {
 
 export interface LoopCaps {
   maxItemsPerFire?: number;
+  maxConcurrentItems?: number;
   maxOpenOutputs?: number;
   maxItemAttempts?: number;
 }
@@ -345,6 +355,16 @@ export interface LoopGovernorConfig {
   maxReturnRate?: number;
   returnRateMinDecisions?: number;
   staleFireMs?: number;
+}
+
+interface LoopTriageSetting {
+  enabled: boolean;
+  instructions?: string;
+}
+
+export interface LoopTriageConfig {
+  prioritize?: LoopTriageSetting;
+  consolidate?: LoopTriageSetting;
 }
 
 interface LoopPlaybookRevision {
@@ -369,12 +389,12 @@ export interface Loop extends TriggerBase {
   shipActions: ShipActionPolicy[];
   caps?: LoopCaps;
   governor?: LoopGovernorConfig;
+  triage?: LoopTriageConfig;
   state: LoopState;
   health: LoopHealth;
   healthReason?: string;
   throttle?: boolean;
   cronId?: string;
-  runAs?: "owner" | "scopeFloor" | "scopeShared";
   consecutiveFailedFires?: number;
   quarantineClearedBy?: string;
   quarantineClearedAt?: number;
@@ -400,8 +420,19 @@ export interface LoopThreadMessage {
   actorId?: string;
 }
 
+export type LoopItemPriority = "urgent" | "high" | "normal" | "low";
+
+export interface LoopItemTriage {
+  at: number;
+  priority?: LoopItemPriority;
+  reason?: string;
+  groupId?: string;
+  pinned?: Array<"priority" | "group">;
+}
+
 export interface LoopItem {
   previousLoopId?: string;
+  triage?: LoopItemTriage;
   inboxPreview?: LoopSourcePayload;
   id: string;
   loopId: string;
@@ -610,7 +641,6 @@ export type TurnOrigin =
       screenData?: string;
       destination?: Destination;
       useOwnerKeychain?: boolean;
-      ownerResourcesRequireOpen?: boolean;
     }
   | { kind: "direct" };
 
@@ -622,21 +652,25 @@ export interface ClientToolDeclaration {
 }
 
 export interface ClientToolResult {
+  images?: Array<{ data: string; mimeType: "image/png" | "image/jpeg" }>;
   content: string;
   structured?: unknown;
   isError?: boolean;
 }
 
 export interface TurnRequest {
-  slackSource?: { accountId: string; teamId: string; userId: string };
+  desktopClientId?: string;
+  slackSource?: { accountId: string; teamId: string; userId: string; externalPolicyNamespace?: string };
   externalSlack?: {
     accountId: string;
     teamId: string;
     userId: string;
     companyDomains: string[];
+    companyTeamIds: string[];
     serviceCredentials: string[];
   };
   sessionSenderId?: string;
+  delegatingRunId?: string;
   privateSessionMessage?: true;
   sessionMessageDepth?: number;
   surface: string;
@@ -664,7 +698,6 @@ export interface TurnRequest {
   securityScreenData?: string;
   triggerDestination?: Destination;
   ownerKeychainUnion?: boolean;
-  ownerResourcesRequireOpen?: boolean;
   unprompted?: boolean;
   liveActor?: boolean;
   botActor?: boolean;
@@ -754,13 +787,20 @@ export interface CommandApprovalGrant {
   approvalKey?: string;
 }
 
+export interface TurnRuntime {
+  harnessId: string;
+  modelId: string;
+  label?: string;
+  change?: { rule: string } | { agent: "task" | "scope" };
+}
+
 export interface TurnResult {
   status: "ok" | "refused" | "failed" | "pending_approval" | "queued" | "silent" | "react";
   sessionId?: string;
   reply?: string;
   reactions?: string[];
   reason?: string;
-  refusalKind?: "security_quarantine" | "session_busy";
+  refusalKind?: "security_quarantine" | "session_busy" | "model_budget";
   adminUrl?: string;
   runId?: string;
   steered?: true;
@@ -769,4 +809,5 @@ export interface TurnResult {
   attachments?: OutgoingAttachment[];
   sourceUserSeq?: number;
   sourceAssistantEntrySeq?: number;
+  runtime?: TurnRuntime;
 }

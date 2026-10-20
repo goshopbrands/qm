@@ -1,4 +1,5 @@
 import "./support/auto-fake-sprites.ts";
+import { selectDefaultSandbox } from "./support/default-sandbox.ts";
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -851,7 +852,7 @@ test("broker route: a slug NOT in the token's set is refused (403)", async () =>
     assert.equal(res.status, 403);
     const denied = (await res.json()) as { error: string; message: string };
     assert.equal(denied.error, "not_entitled");
-    assert.match(denied.message, /own service_<slug> handle/);
+    assert.match(denied.message, /own handle \(its slug\)/);
   } finally {
     await srv.close();
   }
@@ -880,10 +881,10 @@ test("broker route: a control-plane token is rejected (cross-onramp wall); no to
       body: JSON.stringify({ credential: "x-firehose", url: "https://api.x.com/x" }),
     });
     assert.equal(r2.status, 401);
-    assert.match(((await r2.json()) as { message: string }).message, /select.*service_<slug> handle/);
+    assert.match(((await r2.json()) as { message: string }).message, /select.*handle \(its slug\)/);
     const r3 = await fetch(`${srv.base}/v1/credentials/git/x-firehose/org/repo.git/info/refs?service=git-upload-pack`);
     assert.equal(r3.status, 401);
-    assert.match(((await r3.json()) as { message: string }).message, /select.*service_<slug> handle/);
+    assert.match(((await r3.json()) as { message: string }).message, /select.*handle \(its slug\)/);
     const r4 = await fetch(`${srv.base}/v1/credentials/git/x-firehose/org/repo.git/info/refs?service=git-upload-pack`, {
       headers: { "x-agent-capability": "not-a-valid-token" },
     });
@@ -1062,10 +1063,11 @@ test("orchestrator vends a capability for only the requested org credential", as
     permission: "read",
     grantedBy: "admin",
   });
+  await selectDefaultSandbox(built, "U1", "personal:U1", "channel:C1");
   await built.app.turn(dm("!run echo hi"));
   assert.equal(executionEnv()?.AGENT_CREDENTIAL_TOKEN, undefined);
   const res = await built.app.turn(
-    dm(`!execute ${JSON.stringify({ command: "echo hi", credentials: ["service_x-firehose"] })}`),
+    dm(`!execute ${JSON.stringify({ command: "echo hi", credentials: ["x-firehose"] })}`),
   );
   assert.equal(res.status, "ok", res.reason);
   assert.equal(env()?.AGENT_CREDENTIAL_TOKEN, undefined);
@@ -1089,7 +1091,7 @@ test("orchestrator vends a capability for only the requested org credential", as
       audience: [actor],
       publishMembers: [actor],
     },
-    text: `!execute ${JSON.stringify({ command: "echo bot", credentials: ["service_x-firehose"] })}`,
+    text: `!execute ${JSON.stringify({ command: "echo bot", credentials: ["x-firehose"] })}`,
   });
   const botClaims = await verifyCapabilityToken(executionEnv()!.AGENT_CREDENTIAL_TOKEN!, TEST_CAPABILITY_SECRET);
   assert.equal(botClaims?.botActor, true);
@@ -1112,9 +1114,10 @@ test("orchestrator does NOT stamp a credential granted only to someone else", as
     permission: "read",
     grantedBy: "admin",
   });
+  await selectDefaultSandbox(built, "U1", "personal:U1");
 
   await assert.rejects(
-    built.app.turn(dm(`!execute ${JSON.stringify({ command: "echo hi", credentials: ["service_x-firehose"] })}`)),
+    built.app.turn(dm(`!execute ${JSON.stringify({ command: "echo hi", credentials: ["x-firehose"] })}`)),
     /not available/,
   );
   const res = await built.app.turn(dm("!run echo hi"));
@@ -1151,11 +1154,12 @@ test("a channel grantee stamps the credential in that channel's conversations an
     text: "!run echo hi",
   });
 
+  await selectDefaultSandbox(built, "U1", "channel:C1", "channel:C2", "personal:U1");
   await built.app.turn(channelTurn("C1"));
   assert.equal(executionEnv()?.AGENT_CREDENTIAL_TOKEN, undefined);
   let res = await built.app.turn({
     ...channelTurn("C1"),
-    text: `!execute ${JSON.stringify({ command: "echo hi", credentials: ["service_x-firehose"] })}`,
+    text: `!execute ${JSON.stringify({ command: "echo hi", credentials: ["x-firehose"] })}`,
   });
   assert.equal(res.status, "ok", res.reason);
   assert.equal(env()?.AGENT_CREDENTIAL_TOKEN, undefined);
@@ -1167,7 +1171,7 @@ test("a channel grantee stamps the credential in that channel's conversations an
   await assert.rejects(
     built.app.turn({
       ...channelTurn("C2"),
-      text: `!execute ${JSON.stringify({ command: "echo hi", credentials: ["service_x-firehose"] })}`,
+      text: `!execute ${JSON.stringify({ command: "echo hi", credentials: ["x-firehose"] })}`,
     }),
     /not available/,
   );
@@ -1176,7 +1180,7 @@ test("a channel grantee stamps the credential in that channel's conversations an
   assert.equal(env()?.AGENT_CREDENTIAL_TOKEN, undefined, "another channel must not get the credential");
 
   await assert.rejects(
-    built.app.turn(dm(`!execute ${JSON.stringify({ command: "echo hi", credentials: ["service_x-firehose"] })}`)),
+    built.app.turn(dm(`!execute ${JSON.stringify({ command: "echo hi", credentials: ["x-firehose"] })}`)),
     /not available/,
   );
   res = await built.app.turn(dm("!run echo hi"));
@@ -1186,6 +1190,7 @@ test("a channel grantee stamps the credential in that channel's conversations an
 
 test("orchestrator stamps nothing when the org has no service credentials (zero-cost common path)", async () => {
   const { built, env } = buildWithCapture();
+  await selectDefaultSandbox(built, "U1", "personal:U1");
   const res = await built.app.turn(dm("!run echo hi"));
   assert.equal(res.status, "ok", res.reason);
   assert.equal(env()?.AGENT_CREDENTIAL_TOKEN, undefined);
@@ -1211,17 +1216,10 @@ test("the system prompt advertises an entitled credential (host/methods/paths) s
   });
   const res = await built.app.turn(dm("!sysprompt"));
   const reply = res.reply ?? "";
-  assert.match(reply, /Shared org credentials available to you/);
-  assert.match(reply, /\/v1\/credentials\/broker/);
-  assert.match(reply, /x-agent-capability: \$AGENT_CREDENTIAL_TOKEN/);
-  assert.match(reply, /credentials: \["service_<slug>"\]/);
-  assert.match(reply, /without it the variable is empty and the broker answers 401/);
+  assert.match(reply, /### Organization/);
   assert.match(reply, /x-firehose.*X firehose.*api\.x\.com.*GET.*\/2\/tweets\/search\//s);
-  assert.match(reply, /clone\/fetch\/push using a shared org credential/);
-  assert.match(reply, /configured org account, not automatically the requesting user's account/);
-  assert.match(reply, /live personal OAuth connector does not switch this route's identity/);
-  assert.match(reply, /Choose among credentials authorized for this conversation/);
-  assert.match(reply, /does not identify the upstream username/);
+  assert.match(reply, /use-shared-credential/);
+  assert.doesNotMatch(reply, /curl -fsS -X POST.*credentials\/broker/);
 });
 
 test("the system prompt does NOT advertise a credential the session isn't entitled to", async () => {
@@ -1240,7 +1238,7 @@ test("the system prompt does NOT advertise a credential the session isn't entitl
     grantedBy: "admin",
   });
   const res = await built.app.turn(dm("!sysprompt"));
-  assert.doesNotMatch(res.reply ?? "", /Shared org credentials available to you/);
+  assert.doesNotMatch(res.reply ?? "", /### Organization/);
 });
 
 test("the published-apps switch defaults on, round-trips, survives a partial update, and rejects non-booleans", async () => {
@@ -1357,4 +1355,67 @@ test("usage summaries authorize before reads and include only the requested scop
   assert.deepEqual(body.summaries[0]!.recentUsagePrincipals, ["U1"]);
   assert.deepEqual(summarize.mock.calls[0]!.arguments, [["summary"]]);
   assert.doesNotMatch(JSON.stringify(body), /private|unlisted|U2/);
+});
+
+test("credential inventory and policy reordering do not resend unchanged credentials", async () => {
+  const { built } = buildWithCapture();
+  for (const slug of ["z-service", "a-service"]) {
+    await built.serviceCreds.setServiceCredential("org:default-org", {
+      slug,
+      name: slug,
+      secret: "s",
+      host: "api.example.com",
+      allowedMethods: ["POST", "GET"],
+      allowedPathPrefixes: ["/z", "/a"],
+    });
+    await built.acl.grant({
+      ownerScopeId: "org:default-org",
+      ref: `service-cred:${slug}`,
+      granteeScopeId: "org:default-org",
+      permission: "read",
+      grantedBy: "admin",
+    });
+  }
+  const first = await built.app.turn(dm("!sysprompt"));
+  assert.equal(first.status, "ok");
+  assert.match(first.reply ?? "", /z-service/);
+  assert.match(first.reply ?? "", /a-service/);
+  assert.match(first.reply ?? "", /### Organization/);
+  const list = built.serviceCreds.listServiceCredentials.bind(built.serviceCreds);
+  built.serviceCreds.listServiceCredentials = async (...args) =>
+    (await list(...args)).reverse().map((record) => ({
+      ...record,
+      allowedMethods: record.allowedMethods?.toReversed(),
+      allowedPathPrefixes: record.allowedPathPrefixes?.toReversed(),
+    }));
+  const second = await built.app.turn(dm("!sysprompt"));
+  assert.equal(second.status, "ok");
+  assert.match(second.reply ?? "", /<environment>/);
+  assert.doesNotMatch(second.reply ?? "", /## Credentials|No longer included: Credentials|service_[az]-service/);
+});
+
+test("broker accepts no-expiry sandbox tokens but still enforces credential disablement", async () => {
+  let calls = 0;
+  const srv = startBroker(async () => {
+    calls++;
+    return { status: 200, contentType: "text/plain", text: async () => "ok" };
+  });
+  try {
+    const credential = { slug: "probe", name: "Probe", secret: "synthetic", host: "api.example.com" };
+    await srv.built.serviceCreds.setServiceCredential("org:default-org", credential);
+    const token = (exp: number) =>
+      mintCapabilityToken(
+        { actorId: "U1", scopeId: "personal:U1", aud: CREDENTIAL_BROKER_AUD, credentials: ["probe"], exp },
+        SECRET,
+      );
+    const request = { credential: "probe", method: "GET", url: "https://api.example.com/probe" };
+    assert.equal((await broker(srv.base, await token(Date.now() - 1), request)).status, 401);
+    const unlimited = await token(0);
+    assert.equal((await broker(srv.base, unlimited, request)).status, 200);
+    await srv.built.serviceCreds.setServiceCredential("org:default-org", { ...credential, enabled: false });
+    assert.equal((await broker(srv.base, unlimited, request)).status, 404);
+    assert.equal(calls, 1);
+  } finally {
+    await srv.close();
+  }
 });
