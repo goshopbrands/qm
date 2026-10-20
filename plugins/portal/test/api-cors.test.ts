@@ -10,7 +10,8 @@ const upstream = createServer((req: IncomingMessage, res) => {
   req.on("end", () => {
     if (req.url === "/api/whoami") {
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ isAdmin: (req.headers.cookie ?? "").includes("admin=U-admin") }));
+      const isAdmin = (req.headers.cookie ?? "").includes("admin=U-admin");
+      return void res.end(JSON.stringify({ isAdmin, ...(isAdmin ? { role: "org_admin" } : {}) }));
     }
     res.writeHead(200, { "content-type": "application/json", vary: "accept-encoding" });
     res.end(JSON.stringify({ url: req.url, method: req.method, cookie: req.headers.cookie ?? null }));
