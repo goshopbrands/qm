@@ -89,6 +89,33 @@ test("automatic context renders overheard messages and preserves literal entitie
   assert.match(rendered.header, /stored Slack events/);
 });
 
+test("a top-level tag after a multi-day gap still sees earlier channel messages", async () => {
+  const { cache, readHistory, client } = fixture();
+  const trigger = 1_700_200_000;
+  await cache.ingest([
+    {
+      container: "C1",
+      ts: `${trigger - 3 * 86_400}.000001`,
+      text: "the Claude key errors when I chat",
+      authorId: "U1",
+    },
+  ]);
+  const serializer = createConversationSerializer({
+    ids,
+    directory,
+    externalParticipantsEnabled: async () => false,
+    readHistory,
+  });
+  const result = await serializer.serializeSlackConversation(
+    client,
+    { kind: "channel", channel: "C1", ts: `${trigger}.000002`, rawText: "help me debug this", userId: "U2", files: [] },
+    { audience: [] },
+  );
+  const overheard = renderConversationView(result.view).overheard;
+  const earlier = overheard.find((m) => m.ts === `${trigger - 3 * 86_400}.000001`);
+  assert.equal(earlier?.text, "the Claude key errors when I chat");
+});
+
 test("missing parent falls back once then the returned parent is stored for later turns", async () => {
   const { cache, readHistory, client } = fixture();
   await cache.ingest([{ container: "C1", ts: "2.000000", sub: "1.000000", text: "reply" }]);
@@ -400,3 +427,25 @@ test("automatic context keeps the thread parent and recent exchange but excludes
     false,
   );
 });
+
+for (const source of ["live", "mirror"] as const) {
+  test(`own status cards are excluded from ${source} history and backfill`, async () => {
+    const f = fixture();
+    const messages = [
+      { user: "U1", ts: "1", text: "question" },
+      { user: "UBOT", ts: "2", text: "Working", blocks: [{ type: "task_card", task_id: "qm_status:test" }] },
+      { user: "UBOT", ts: "3", text: "ordinary answer" },
+      { user: "UOTHER", ts: "4", text: "other bot task", blocks: [{ type: "task_card", task_id: "qm_status:other" }] },
+    ];
+    const read = createSlackHistoryReader({ core: f.core, ids, source });
+    const client = { conversations: { history: async () => ({ messages }), replies: async () => ({ messages }) } };
+    const result = await read(client, "C1", "1");
+    assert.deepEqual(
+      result.raw.map((m) => m.ts),
+      ["1", "3", "4"],
+    );
+    assert.ok(!(await f.cache.readMessages("C1", { limit: 100 })).some((m) => m.ts === "2"));
+    const expanded = await read(client, "C1", undefined, undefined, true);
+    assert.ok(!expanded.raw.some((m) => m.ts === "2"));
+  });
+}

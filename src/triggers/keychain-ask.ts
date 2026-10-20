@@ -7,32 +7,14 @@ import { principalDestination, withWebTranscriptText } from "../reach/reach.ts";
 import { swallow } from "../util/errors.ts";
 import { cronIdOf } from "../sessions/session-store.ts";
 import { samePerson } from "../directory/person.ts";
-import { keychainUseCommand } from "../api/contract.ts";
 
 function resolutionInput(ask: KeychainAsk, grant?: KeychainGrant): string {
   if (ask.status === "approved") {
-    const once = grant?.mode !== "standing";
-    return (
-      `Keychain ask \`${ask.id}\` was approved by its owner (${ask.ownerId}): ${once ? "one-time" : "standing"} ` +
-      `grant \`${ask.grantId}\` for this conversation (the owner's consent, verbatim: "${grant?.purpose ?? ask.purpose}" — act within it; ` +
-      `originally asked for: "${ask.purpose}"). Tell the requester and resume ` +
-      `the task it was for — load the credential with ` +
-      `\`${keychainUseCommand({ grant: String(ask.grantId) })}\` ` +
-      `and run the task in that same shell${once ? " (the grant is single-use)" : ""}.`
-    );
+    const scope = grant?.mode === "once" ? "for one credential use" : "until revoked";
+    return `The credential owner approved access ${scope}; it is now in this conversation's grants. Re-run the blocked command and continue. Tell the requester in one short line.`;
   }
-  if (ask.status === "declined") {
-    return (
-      `Keychain ask \`${ask.id}\` (purpose: "${ask.purpose}") was declined by its owner (${ask.ownerId})` +
-      `${ask.note ? ` — "${ask.note}"` : ""}. Tell the requester, and offer the alternatives: they can run the ` +
-      `service's own login here themselves, or register their own credential in their DM with me.`
-    );
-  }
-  return (
-    `Keychain ask \`${ask.id}\` to ${ask.ownerId} (purpose: "${ask.purpose}") expired without an answer. ` +
-    `Tell the requester, and offer the alternatives: re-send the ask, run the service's own login here ` +
-    `themselves, or register their own credential in their DM with me.`
-  );
+  const what = ask.status === "declined" ? "declined" : "did not answer";
+  return `The credential owner ${what} the access request. Tell the requester in one short line and offer to continue another way.`;
 }
 
 export interface AskResolutionDeps extends TriggerDeps {
@@ -42,10 +24,9 @@ export interface AskResolutionDeps extends TriggerDeps {
 }
 
 function fallbackText(ask: KeychainAsk): string {
-  let what = "expired without an answer";
-  if (ask.status === "approved") what = "was approved — the grant is active for this conversation";
-  else if (ask.status === "declined") what = `was declined${ask.note ? ` ("${ask.note}")` : ""}`;
-  return `Keychain ask \`${ask.id}\` (purpose: "${ask.purpose}") ${what}, but I couldn't resume the task automatically. Mention me here to pick it up.`;
+  if (ask.status === "approved")
+    return "Access approved, but the task could not restart on its own. It will have access the next time it runs.";
+  return ask.status === "declined" ? "Access was declined." : "The access request expired.";
 }
 
 export async function fireAskResolution(
@@ -64,7 +45,7 @@ export async function fireAskResolution(
       cron.archived ||
       (!cron.enabled && (cron.schedule.everyMs !== undefined || cron.schedule.cron !== undefined)) ||
       cron.ownerScopeId !== ask.requesterScopeId ||
-      (cron.runAs !== "scopeFloor" && !samePerson(cron.owner, ask.requesterId)))
+      !samePerson(cron.owner, ask.requesterId))
   ) {
     return {
       ran: false,
@@ -120,6 +101,7 @@ export interface DropResolution {
   destination?: Destination;
   threadRef?: string;
   grantId?: string;
+  credentialHandle?: string;
   granted: boolean;
   pendingSiblings?: string[];
 }
@@ -127,7 +109,7 @@ export interface DropResolution {
 function dropResolutionInput(drop: DropResolution): string {
   const waiting = !!drop.pendingSiblings?.length;
   const where = drop.granted
-    ? `now in the keychain and granted to this conversation — load it with \`${keychainUseCommand({ grant: String(drop.grantId) })}\`${waiting ? " when the task runs" : " and run the task in that same shell"}`
+    ? `now in the keychain and granted to this conversation — request \`${drop.credentialHandle}\` in execute.credentials${waiting ? " when the task runs" : " when resuming the task"}`
     : `now in your keychain and available here`;
   const next = waiting
     ? `Heads-up: other drop links from this conversation (${drop.pendingSiblings!.map((s) => `\`${s}\``).join(", ")}) haven't been filled yet — ` +

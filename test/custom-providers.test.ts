@@ -79,8 +79,6 @@ test("custom models are gated to pi and mock harnesses", () => {
   assert.equal(modelSupportedByHarness("acme-large", "pi"), true);
   assert.equal(modelSupportedByHarness("acme-large", "mock"), true);
   assert.equal(modelSupportedByHarness("acme-large", "claude"), false);
-  assert.equal(modelSupportedByHarness("acme-large", "codex"), false);
-  assert.equal(modelSupportedByHarness("acme-large", "opencode"), true);
 });
 
 test("a registered custom model is serviceable regardless of built-in key availability", () => {
@@ -159,26 +157,6 @@ test("registered models surface in the catalog and vanish on unregister", () => 
   assert.ok(!builtInModelCatalog().some((m) => m.id === "deepseek-chat"));
 });
 
-test("opencode modelRef routes slashed custom model ids to the registered provider, not a phantom slash-prefix", async () => {
-  const { modelRef } = await import("../src/harness/opencode-harness.ts");
-  setCustomProviders([
-    {
-      id: "litellm",
-      name: "LiteLLM",
-      protocol: "openai",
-      baseUrl: "https://litellm.example.com/v1",
-      models: [{ id: "bedrock/claude-opus-5" }],
-    },
-  ]);
-  try {
-    assert.deepEqual(modelRef("bedrock/claude-opus-5"), { providerID: "litellm", modelID: "bedrock/claude-opus-5" });
-    // built-in slash convention untouched
-    assert.deepEqual(modelRef("openrouter/auto"), { providerID: "openrouter", modelID: "auto" });
-  } finally {
-    setCustomProviders([]);
-  }
-});
-
 test("catalog cache invalidates immediately when the custom registry changes", async () => {
   const { selectableModelCatalog } = await import("../src/model/model-catalog.ts");
   const fetcher: typeof fetch = async () => new Response(JSON.stringify({ data: [] }), { status: 200 });
@@ -224,3 +202,33 @@ for (const field of ["contextWindow", "maxTokens"] as const) {
     );
   });
 }
+
+for (const protocol of ["openai", "openai-responses", "anthropic"] as const) {
+  for (const reasoning of [undefined, false, true]) {
+    test(`custom ${protocol} reasoning=${reasoning} survives persistence and runtime mappings`, async () => {
+      const spec = { ...GATEWAY, protocol, models: [{ ...GATEWAY.models[0]!, reasoning }] };
+      const backing = createMemoryMap<StoredCustomProvider>();
+      const store = createCustomProviderStore({ backing, keyMaterial: "reasoning-test" });
+      await store.upsert(spec, "local", "admin@example.com");
+      const reloaded = createCustomProviderStore({ backing, keyMaterial: "reasoning-test" });
+      setCustomProviders(await reloaded.enabled());
+      const model = resolveCustomModel("acme-large")!;
+      assert.equal(model.reasoning, reasoning ?? false);
+      const json = customModelsJson() as {
+        providers: Record<string, { models: Array<{ reasoning: boolean; cost: typeof model.cost }> }>;
+      };
+      assert.equal(json.providers[spec.id]!.models[0]!.reasoning, reasoning ?? false);
+      assert.deepEqual(json.providers[spec.id]!.models[0]!.cost, model.cost);
+      assert.deepEqual((await reloaded.statuses())[0]!.models, spec.models);
+    });
+  }
+}
+
+test("custom provider reasoning rejects non-boolean capabilities", () => {
+  for (const reasoning of ["true", "false", 0, 1, null, {}]) {
+    assert.throws(
+      () => validateCustomProviderSpec({ ...GATEWAY, models: [{ id: "acme-large", reasoning } as never] }),
+      /reasoning must be a boolean/,
+    );
+  }
+});

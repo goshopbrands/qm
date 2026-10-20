@@ -1,185 +1,145 @@
+import type { PoolClient } from "pg";
+import type { ScopeId } from "../types.ts";
 import { createPgPool, withPgTransaction } from "../persistence/pg-pool.ts";
-import { foldCapture, normalizeReplace, queryBullets, recallBody, type MemoryService } from "./memory-service.ts";
+import { createNotebookMemory, type FactStoreTx, type MemoryService } from "./memory-service.ts";
+import { isMemorySensitivity, type MemoryFact } from "./facts.ts";
 
 const SCHEMA = [
-  `CREATE TABLE IF NOT EXISTS memory_revisions(
-    id        BIGSERIAL PRIMARY KEY,
-    scope_id  TEXT   NOT NULL,
-    seq       BIGINT NOT NULL,
-    op        TEXT   NOT NULL,
-    body      TEXT   NOT NULL,
-    author    TEXT,
-    at        BIGINT NOT NULL,
-    UNIQUE (scope_id, seq)
+  `CREATE TABLE IF NOT EXISTS memory_facts(
+    id             BIGSERIAL PRIMARY KEY,
+    scope_id       TEXT    NOT NULL,
+    text           TEXT    NOT NULL,
+    sensitivity    TEXT    NOT NULL,
+    sources        TEXT[]  NOT NULL DEFAULT '{}',
+    source_unknown BOOLEAN NOT NULL,
+    author         TEXT,
+    created_at     BIGINT  NOT NULL,
+    updated_at     BIGINT  NOT NULL,
+    deleted_at     BIGINT
   )`,
-  `CREATE INDEX IF NOT EXISTS memory_revisions_by_scope ON memory_revisions(scope_id, seq DESC)`,
+  `CREATE INDEX IF NOT EXISTS memory_facts_live ON memory_facts(scope_id, id) WHERE deleted_at IS NULL`,
+  `DO $$
+  BEGIN
+    IF to_regclass('memory_revisions') IS NULL OR EXISTS (SELECT 1 FROM memory_facts) THEN RETURN; END IF;
+    WITH head AS (
+      SELECT DISTINCT ON (scope_id) scope_id, body, records, at
+        FROM memory_revisions ORDER BY scope_id, seq DESC
+    ),
+    snapshot AS (
+      SELECT h.scope_id, h.at, r.ord, r.rec->>'text' AS text,
+             COALESCE(r.rec->>'sensitivity', 'unknown') AS sensitivity,
+             ARRAY(SELECT DISTINCT s->>'scopeId' FROM jsonb_array_elements(COALESCE(r.rec->'sources', '[]')) s) AS sources,
+             COALESCE((r.rec->>'sourceUnknown')::boolean, true) AS source_unknown
+        FROM head h, jsonb_array_elements(h.records->'records') WITH ORDINALITY r(rec, ord)
+       WHERE h.records IS NOT NULL
+    ),
+    lines AS (
+      SELECT h.scope_id, h.at, l.ord, l.line,
+             sum(CASE WHEN l.line ~ '^\\s*$' OR l.line ~ '^([-*] |#{1,6} )' OR l.line ~ '^\\s*<!-- ' THEN 1 ELSE 0 END)
+               OVER (PARTITION BY h.scope_id ORDER BY l.ord) AS block
+        FROM head h, regexp_split_to_table(h.body, E'\\n') WITH ORDINALITY l(line, ord)
+       WHERE h.records IS NULL
+    ),
+    legacy AS (
+      SELECT scope_id, at, min(ord) AS ord, btrim(string_agg(line, E'\\n' ORDER BY ord), E' \\n\\t\\r') AS text,
+             'unknown' AS sensitivity, '{}'::text[] AS sources, true AS source_unknown
+        FROM lines
+       WHERE line !~ '^\\s*<!-- (consolidated: \\d{4}-\\d\\d-\\d\\d|captures-since-promote: \\d+) -->\\s*$'
+       GROUP BY scope_id, at, block
+    )
+    INSERT INTO memory_facts(scope_id, text, sensitivity, sources, source_unknown, created_at, updated_at)
+    SELECT scope_id, fact, sensitivity, sources, source_unknown,
+           COALESCE(CASE WHEN to_char(day, 'YYYY-MM-DD') = d THEN (extract(epoch FROM day) * 1000)::bigint END, at), at
+      FROM (SELECT g.*, regexp_replace(body, '^\\(\\d{4}-\\d\\d-\\d\\d\\)\\s*', '') AS fact,
+                   timestamp '2000-01-01' + make_interval(years => substr(d, 1, 4)::int - 2000,
+                     months => substr(d, 6, 2)::int - 1, days => substr(d, 9, 2)::int - 1) AS day
+              FROM (SELECT f.*, substring(body FROM '^\\((\\d{4}-\\d\\d-\\d\\d)\\)') AS d
+                      FROM (SELECT u.*, regexp_replace(btrim(regexp_replace(btrim(text), '^#{1,6} [^\\n]*\\n?', '')), '^[-*]\\s+', '') AS body
+                              FROM (SELECT * FROM snapshot UNION ALL SELECT * FROM legacy) u
+                             WHERE text !~ '^\\s*<!-- (consolidated|captures-since-promote)') f) g) x
+     WHERE btrim(fact) <> ''
+     ORDER BY scope_id, ord;
+  END $$`,
 ];
 
-export function createPostgresMemoryService(connectionString: string): MemoryService {
-  const { q, pool } = createPgPool(connectionString, "memory/store/0001", SCHEMA);
+type Row = Record<string, unknown>;
 
-  async function currentBody(scopeId: string): Promise<string> {
-    const rows = await q("SELECT body FROM memory_revisions WHERE scope_id = $1 ORDER BY seq DESC LIMIT 1", [scopeId]);
-    return (rows[0]?.body as string | undefined) ?? "";
-  }
-
-  async function currentHead(scopeId: string): Promise<{ body: string; seq: number; at?: number }> {
-    const rows = await q("SELECT body, seq, at FROM memory_revisions WHERE scope_id = $1 ORDER BY seq DESC LIMIT 1", [
-      scopeId,
-    ]);
-    return rows[0]
-      ? { body: String(rows[0].body ?? ""), seq: Number(rows[0].seq), at: Number(rows[0].at) }
-      : { body: "", seq: 0 };
-  }
-
-  async function conditionalReplace(
-    scopeId: string,
-    content: string,
-    expectedSeq: number,
-    author: string | undefined,
-    op: string,
-  ): Promise<boolean> {
-    const client = await (await pool()).connect();
-    try {
-      await client.query("BEGIN");
-      await client.query("SELECT pg_advisory_xact_lock(hashtext('memory'), hashtext($1))", [scopeId]);
-      const head = await client.query(
-        "SELECT body, seq FROM memory_revisions WHERE scope_id = $1 ORDER BY seq DESC LIMIT 1",
-        [scopeId],
-      );
-      const seq = Number(head.rows[0]?.seq ?? 0);
-      if (seq !== expectedSeq) {
-        await client.query("ROLLBACK");
-        return false;
-      }
-      const next = normalizeReplace(content);
-      if (next !== String(head.rows[0]?.body ?? "")) {
-        await client.query(
-          "INSERT INTO memory_revisions (scope_id, seq, op, body, author, at) VALUES ($1, $2, $3, $4, $5, $6)",
-          [scopeId, seq + 1, op, next, author ?? null, Date.now()],
-        );
-      }
-      await client.query("COMMIT");
-      return true;
-    } catch (e) {
-      await client.query("ROLLBACK");
-      throw e;
-    } finally {
-      client.release();
-    }
-  }
-
-  async function append(
-    scopeId: string,
-    op: string,
-    at: number,
-    author: string | undefined,
-    derive: (existing: string) => { body: string } | null,
-  ): Promise<void> {
-    await withPgTransaction(await pool(), async (client) => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtext('memory'), hashtext($1))", [scopeId]);
-      const head = await client.query(
-        "SELECT body, seq FROM memory_revisions WHERE scope_id = $1 ORDER BY seq DESC LIMIT 1",
-        [scopeId],
-      );
-      const existing = (head.rows[0]?.body as string | undefined) ?? "";
-      const next = derive(existing);
-      if (next && next.body !== existing) {
-        const seq = Number(head.rows[0]?.seq ?? 0) + 1;
-        await client.query(
-          "INSERT INTO memory_revisions (scope_id, seq, op, body, author, at) VALUES ($1, $2, $3, $4, $5, $6)",
-          [scopeId, seq, op, next.body, author ?? null, at],
-        );
-      }
-    });
-  }
-
+function fact(row: Row): MemoryFact {
+  const sensitivity = row.sensitivity;
   return {
-    async recall(scopeId) {
-      return recallBody(await currentBody(scopeId));
-    },
+    id: String(row.id),
+    text: String(row.text),
+    sensitivity: isMemorySensitivity(sensitivity) ? sensitivity : "unknown",
+    sources: (row.sources as string[] | null) ?? [],
+    sourceUnknown: row.source_unknown === true,
+    ...(row.author ? { author: String(row.author) } : {}),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+  };
+}
 
-    async capture(scopeId, facts, at, author) {
-      const trustedProvenance = author?.startsWith("cc:") === true;
-      const probe = foldCapture(await currentBody(scopeId), facts, at, trustedProvenance);
-      if (!probe.added) return 0;
-      let added = 0;
-      await append(scopeId, "capture", at, author, (existing) => {
-        const folded = foldCapture(existing, facts, at, trustedProvenance);
-        added = folded.added;
-        return folded.added ? { body: `${folded.body}\n` } : null;
-      });
-      return added;
-    },
+const LIVE = `SELECT id, text, sensitivity, sources, source_unknown, author, created_at, updated_at
+  FROM memory_facts WHERE scope_id = $1 AND deleted_at IS NULL ORDER BY id`;
 
-    async query(scopeId, q2, limit = 20) {
-      return queryBullets(await currentBody(scopeId), q2, limit);
+export function createPostgresMemoryService(connectionString: string): MemoryService {
+  const { q, pool } = createPgPool(connectionString, [
+    {
+      id: "memory/facts/0000-records-column",
+      statements: ["ALTER TABLE IF EXISTS memory_revisions ADD COLUMN IF NOT EXISTS records JSONB"],
     },
+    { id: "memory/facts/0001", statements: SCHEMA },
+  ]);
 
-    async read(scopeId) {
-      return currentBody(scopeId);
-    },
+  function tx(client: PoolClient, scopeId: ScopeId): FactStoreTx {
+    return {
+      list: async () => (await client.query(LIVE, [scopeId])).rows.map(fact),
+      async insert(f) {
+        await client.query(
+          `INSERT INTO memory_facts(scope_id, text, sensitivity, sources, source_unknown, author, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [scopeId, f.text, f.sensitivity, f.sources, f.sourceUnknown, f.author ?? null, f.createdAt, f.updatedAt],
+        );
+      },
+      async update(id, patch, at) {
+        await client.query(
+          `UPDATE memory_facts SET text = COALESCE($3, text), sensitivity = COALESCE($4, sensitivity),
+             sources = COALESCE($5, sources), source_unknown = COALESCE($6, source_unknown), updated_at = $7
+           WHERE scope_id = $1 AND id = $2`,
+          [
+            scopeId,
+            id,
+            patch.text ?? null,
+            patch.sensitivity ?? null,
+            patch.sources ?? null,
+            patch.sourceUnknown ?? null,
+            at,
+          ],
+        );
+      },
+      async remove(ids, at) {
+        await client.query(
+          "UPDATE memory_facts SET deleted_at = $3 WHERE scope_id = $1 AND id = ANY($2::bigint[]) AND deleted_at IS NULL",
+          [scopeId, ids, at],
+        );
+      },
+    };
+  }
 
-    async replace(scopeId, content, author) {
-      const next = normalizeReplace(content);
-      await append(scopeId, "replace", Date.now(), author, () => ({ body: next }));
-    },
-
-    async readHead(scopeId) {
-      const head = await currentHead(scopeId);
-      return {
-        content: head.body,
-        revision: String(head.seq),
-        ...(head.at !== undefined ? { updatedAt: head.at } : {}),
-      };
-    },
-
-    async replaceIfRevision(scopeId, content, revision, author) {
-      if (!/^\d+$/.test(revision)) return false;
-      return conditionalReplace(scopeId, content, Number(revision), author, "replace");
-    },
-
-    async history(scopeId, limit = 30) {
-      const rows = await q(
-        "SELECT seq, body, op, author, at FROM memory_revisions WHERE scope_id = $1 ORDER BY seq DESC LIMIT $2",
-        [scopeId, Math.max(1, Math.min(limit, 100))],
-      );
-      return rows.map((row) => ({
-        revision: String(row.seq),
-        content: String(row.body ?? ""),
-        operation: String(row.op),
-        ...(row.author ? { author: String(row.author) } : {}),
-        at: Number(row.at),
-      }));
-    },
-
-    async restore(scopeId, revision, expectedRevision, author) {
-      if (!/^\d+$/.test(revision) || !/^\d+$/.test(expectedRevision)) return false;
-      const rows = await q("SELECT body FROM memory_revisions WHERE scope_id = $1 AND seq = $2", [
-        scopeId,
-        Number(revision),
-      ]);
-      if (!rows[0]) return false;
-      return conditionalReplace(scopeId, String(rows[0].body ?? ""), Number(expectedRevision), author, "restore");
-    },
-
-    async updatedAt(scopeId) {
-      const rows = await q("SELECT at FROM memory_revisions WHERE scope_id = $1 ORDER BY seq DESC LIMIT 1", [scopeId]);
-      const at = rows[0]?.at;
-      return at == null ? undefined : Number(at);
-    },
-
+  return createNotebookMemory({
+    list: async (scopeId) => (await q(LIVE, [scopeId])).map(fact),
+    transact: async (scopeId, fn) =>
+      withPgTransaction(await pool(), async (client) => {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext('memory'), hashtext($1))", [scopeId]);
+        return fn(tx(client, scopeId));
+      }),
     async metadata() {
       const rows = await q(
-        `SELECT DISTINCT ON (scope_id) scope_id, octet_length(body) AS bytes, at
-           FROM memory_revisions ORDER BY scope_id, seq DESC`,
+        `SELECT scope_id, sum(octet_length(text)) AS bytes, max(updated_at) AS at
+           FROM memory_facts WHERE deleted_at IS NULL GROUP BY scope_id`,
       );
-      const out = new Map<string, { bytes: number; updatedAt?: number }>();
-      for (const r of rows) {
-        const bytes = Number(r.bytes ?? 0);
-        out.set(r.scope_id as string, { bytes, ...(r.at != null ? { updatedAt: Number(r.at) } : {}) });
-      }
-      return out;
+      return new Map(
+        rows.map((r) => [r.scope_id as ScopeId, { bytes: Number(r.bytes ?? 0), updatedAt: Number(r.at) }] as const),
+      );
     },
-  };
+  });
 }

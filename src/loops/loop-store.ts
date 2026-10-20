@@ -4,6 +4,7 @@ import type {
   LoopGovernorConfig,
   LoopHealth,
   LoopState,
+  LoopTriageConfig,
   Destination,
   RecipientConsent,
   ShipActionPolicy,
@@ -31,7 +32,6 @@ export interface CreateLoopInput extends CreateTriggerInput {
   caps?: LoopCaps;
   governor?: LoopGovernorConfig;
   cronId?: string;
-  runAs?: Loop["runAs"];
   schedule?: unknown;
 }
 
@@ -46,8 +46,8 @@ export interface LoopPatch {
   shipActions?: ShipActionPolicy[];
   caps?: LoopCaps;
   governor?: LoopGovernorConfig;
+  triage?: LoopTriageConfig;
   cronId?: string;
-  runAs?: Loop["runAs"];
   state?: LoopState;
   playbookEdit?: PlaybookEdit;
   restore?: Loop;
@@ -122,6 +122,17 @@ function stateFields(state: LoopState): Pick<Loop, "state" | "enabled"> {
   return { state, enabled: state === "enabled" };
 }
 
+function mergeTriage(current: LoopTriageConfig | undefined, patch: LoopTriageConfig): LoopTriageConfig {
+  const next: LoopTriageConfig = { ...current };
+  for (const key of ["prioritize", "consolidate"] as const) {
+    const change = patch[key];
+    if (!change) continue;
+    const { instructions, ...setting } = { ...current?.[key], ...change };
+    next[key] = { ...setting, ...(instructions ? { instructions } : {}) };
+  }
+  return next;
+}
+
 export function createLoopStore(backing: DurableMap<Loop> = createMemoryMap<Loop>()): LoopStore {
   if (!backing.update) throw new Error("loops need atomic durable updates");
   const atomicUpdate = backing.update.bind(backing);
@@ -149,7 +160,6 @@ export function createLoopStore(backing: DurableMap<Loop> = createMemoryMap<Loop
         contentPart(input.ownerConsentedAt),
         contentPart(input.recipientConsent),
         contentPart(input.cronId),
-        contentPart(input.runAs),
         contentPart(input.schedule),
       ]);
       const candidate: Loop = {
@@ -171,7 +181,6 @@ export function createLoopStore(backing: DurableMap<Loop> = createMemoryMap<Loop
         ...(input.caps ? { caps: input.caps } : {}),
         ...(input.governor ? { governor: input.governor } : {}),
         ...(input.cronId ? { cronId: input.cronId } : {}),
-        ...(input.runAs ? { runAs: input.runAs } : {}),
       };
       if (backing.insertIfAbsent) {
         const created = await backing.insertIfAbsent(contentId, candidate);
@@ -204,8 +213,8 @@ export function createLoopStore(backing: DurableMap<Loop> = createMemoryMap<Loop
         }
         if (patch.caps !== undefined) fields.caps = patch.caps;
         if (patch.governor !== undefined) fields.governor = patch.governor;
+        if (patch.triage !== undefined) fields.triage = mergeTriage(loop.triage, patch.triage);
         if (patch.cronId !== undefined) fields.cronId = patch.cronId;
-        if (patch.runAs !== undefined) fields.runAs = patch.runAs;
         if (patch.state !== undefined) Object.assign(fields, stateFields(patch.state));
         if (patch.quarantineClearedBy !== undefined) fields.quarantineClearedBy = patch.quarantineClearedBy;
         if (patch.quarantineClearedAt !== undefined) fields.quarantineClearedAt = patch.quarantineClearedAt;

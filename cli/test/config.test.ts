@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CONFIG_FILENAME,
+  awsWorkloadArchitecture,
   loadConfigAt,
   loadConfigInDir,
   localSandboxActive,
@@ -622,8 +623,7 @@ test("AWS validates release labels, unique coordinates, Fargate sizes, and owned
         },
       },
       ({ path }) => {
-        if (scopeBackend === "aws") assert.throws(() => loadConfigAt(path), /AWS_DEPLOY_IMAGE/);
-        else assert.equal(loadConfigAt(path).config.env.core?.DEPLOY_PROVIDER, "fly");
+        assert.equal(loadConfigAt(path).config.env.core?.DEPLOY_PROVIDER, "fly");
       },
     );
   }
@@ -895,11 +895,11 @@ test("sandbox shape errors: object, app non-empty string, env string-map, secret
     { sandbox: { secretEnv: ["1BAD"] }, rx: /not a valid env var name/ },
     {
       sandbox: { backend: "k8s", app: "acme-sandboxes" },
-      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*"agent37".*or "superserve"/,
+      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*"agent37".*"superserve".*or "e2b"/,
     },
     {
       sandbox: { backend: "fly", app: "acme-sandboxes" },
-      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*"agent37".*or "superserve"/,
+      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*"agent37".*"superserve".*or "e2b"/,
     },
     {
       sandbox: { backend: "aws", app: "acme-sandboxes" },
@@ -947,6 +947,21 @@ test("agent37 is a deployment backend on every target and rejects unused Fly set
   });
 });
 
+test("e2b is a deployment backend on every target and rejects unused Fly settings", () => {
+  for (const target of ["docker", "fly"] as const) {
+    withConfig({ target, sandbox: { backend: "e2b" } }, ({ path }) => {
+      const { config } = loadConfigAt(path);
+      assert.deepEqual(sandboxCoreEnv(config), {
+        env: { SANDBOX_BACKEND: "e2b" },
+        missingSecrets: [],
+      });
+    });
+  }
+  withConfig({ sandbox: { backend: "e2b", app: "unused" } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /"sandbox.backend": "e2b" ignores "sandbox.app"/);
+  });
+});
+
 test("superserve backend requires the agent template in env.core", () => {
   withConfig({ sandbox: { backend: "superserve" } }, ({ path }) => {
     assert.throws(() => loadConfigAt(path), /superserve sandbox backend requires env.core.SUPERSERVE_TEMPLATE/);
@@ -968,20 +983,6 @@ test("superserve backend requires the agent template in env.core", () => {
     {
       sandbox: { backend: "local" },
       env: { core: { SANDBOX_SCOPE_BACKENDS: JSON.stringify({ personal: "superserve" }) } },
-    },
-    ({ path }) => {
-      assert.throws(() => loadConfigAt(path), /superserve sandbox backend requires env.core.SUPERSERVE_TEMPLATE/);
-    },
-  );
-  withConfig(
-    {
-      sandbox: { backend: "local" },
-      env: {
-        core: {
-          SANDBOX_SCOPE_BACKENDS: JSON.stringify({ personal: "superserve" }),
-          SUPERSERVE_TEMPLATE: "qm-agent-1.0.0",
-        },
-      },
     },
     ({ path }) => assert.doesNotThrow(() => loadConfigAt(path)),
   );
@@ -1213,28 +1214,29 @@ test("secretEnv (per-service) validates service keys, env-var names, and managed
 
 test("securityScreen declares one external proxy and requires secret-store routing", () => {
   const securityScreen = {
-    backend: "proxy",
+    mode: "observe",
+    classifier: "proxy",
     provider: "example-screen",
     endpoint: "https://screen.example.test/classify",
-    rollout: "shadow",
   };
   withConfig(
     { securityScreen, secretEnv: { core: { SECURITY_SCREEN_PROXY_TOKEN: "EXAMPLE_SCREEN_TOKEN" } } },
     ({ path }) => assert.deepEqual(loadConfigAt(path).config.securityScreen, securityScreen),
   );
   withConfig({ securityScreen }, ({ path }) =>
-    assert.throws(() => loadConfigAt(path), /securityScreen requires secretEnv\.core\.SECURITY_SCREEN_PROXY_TOKEN/),
+    assert.throws(() => loadConfigAt(path), /classifier proxy requires secretEnv\.core\.SECURITY_SCREEN_PROXY_TOKEN/),
   );
   withConfig({ secretEnv: { core: { SECURITY_SCREEN_PROXY_TOKEN: "EXAMPLE_SCREEN_TOKEN" } } }, ({ path }) =>
     assert.throws(() => loadConfigAt(path), /SECURITY_SCREEN_PROXY_TOKEN requires securityScreen/),
   );
   for (const invalid of [
-    { ...securityScreen, backend: "sdk" },
+    { ...securityScreen, classifier: "sdk" },
+    { ...securityScreen, mode: "shadow" },
+    { ...securityScreen, backend: "proxy" },
     { ...securityScreen, provider: "Bad Provider" },
     { ...securityScreen, provider: "surface" },
     { ...securityScreen, provider: "origin" },
     { ...securityScreen, endpoint: "http://screen.example.test/classify" },
-    { ...securityScreen, rollout: "gradual" },
     { ...securityScreen, extra: true },
   ]) {
     withConfig(
@@ -1246,10 +1248,10 @@ test("securityScreen declares one external proxy and requires secret-store routi
 
 test("securityScreen owns its derived environment and keeps its token on core", () => {
   const securityScreen = {
-    backend: "proxy",
+    mode: "enforce",
+    classifier: "proxy",
     provider: "example-screen",
     endpoint: "https://screen.example.test/classify",
-    rollout: "enforce",
   };
   withConfig(
     {
@@ -1290,13 +1292,13 @@ test("securityScreen owns its derived environment and keeps its token on core", 
       securityScreen,
       secretEnv: {
         core: { SECURITY_SCREEN_PROXY_TOKEN: "EXAMPLE_SCREEN_TOKEN" },
-        slack: { SECURITY_SCREEN_PROXY_ROLLOUT: "EXAMPLE_SCREEN_ROLLOUT" },
+        slack: { SECURITY_SCREEN_CLASSIFIER: "EXAMPLE_SCREEN_CLASSIFIER" },
       },
     },
     ({ path }) =>
       assert.throws(
         () => loadConfigAt(path),
-        /secretEnv\.slack\.SECURITY_SCREEN_PROXY_ROLLOUT.*managed by securityScreen/,
+        /secretEnv\.slack\.SECURITY_SCREEN_CLASSIFIER.*managed by securityScreen/,
       ),
   );
   withConfig(
@@ -1350,18 +1352,23 @@ test("modelProvider must name a vendor the configured harness can bill", () => {
   withConfig({ modelProvider: "openrouter", env: { core: { HARNESS: "pi" } } }, ({ path }) => {
     assert.equal(loadConfigAt(path).config.modelProvider, "openrouter");
   });
-  withConfig({ modelProvider: "openrouter", env: { core: { HARNESS: "codex" } } }, ({ path }) => {
+  withConfig({ modelProvider: "openrouter", env: { core: { HARNESS: "claude" } } }, ({ path }) => {
     assert.throws(
       () => loadConfigAt(path),
-      /model provider "openrouter" cannot serve a base model on env.core.HARNESS "codex"/,
+      /model provider "openrouter" cannot serve a base model on env.core.HARNESS "claude"/,
     );
   });
-  withConfig({ modelProvider: "anthropic", env: { core: { HARNESS: "codex" } } }, ({ path }) => {
+  withConfig({ modelProvider: "openai", env: { core: { HARNESS: "claude" } } }, ({ path }) => {
     assert.throws(() => loadConfigAt(path), /cannot serve a base model/);
   });
-  withConfig({ modelProvider: "openai", env: { core: { HARNESS: "codex" } } }, ({ path }) => {
+  withConfig({ modelProvider: "openai", env: { core: { HARNESS: "pi" } } }, ({ path }) => {
     assert.equal(loadConfigAt(path).config.modelProvider, "openai");
   });
+  for (const harness of ["codex", "opencode"]) {
+    withConfig({ env: { core: { HARNESS: harness } } }, ({ path }) => {
+      assert.throws(() => loadConfigAt(path), new RegExp(`env.core.HARNESS "${harness}" is not recognized`));
+    });
+  }
   withConfig({ modelProvider: "openrouter" }, ({ path }) => {
     assert.equal(
       loadConfigAt(path).config.modelProvider,
@@ -1373,15 +1380,15 @@ test("modelProvider must name a vendor the configured harness can bill", () => {
 
 test("env.core.MODEL_PROVIDER is validated as the provider core will actually use", () => {
   withConfig(
-    { modelProvider: "openai", env: { core: { HARNESS: "codex", MODEL_PROVIDER: "anthropic" } } },
+    { modelProvider: "anthropic", env: { core: { HARNESS: "claude", MODEL_PROVIDER: "openai" } } },
     ({ path }) => {
-      assert.throws(() => loadConfigAt(path), /model provider "anthropic" cannot serve a base model/);
+      assert.throws(() => loadConfigAt(path), /model provider "openai" cannot serve a base model/);
     },
   );
   withConfig(
-    { modelProvider: "anthropic", env: { core: { HARNESS: "codex", MODEL_PROVIDER: "openai" } } },
+    { modelProvider: "openai", env: { core: { HARNESS: "claude", MODEL_PROVIDER: "anthropic" } } },
     ({ path }) => {
-      assert.equal(loadConfigAt(path).config.modelProvider, "anthropic", "the override decides, the declaration stays");
+      assert.equal(loadConfigAt(path).config.modelProvider, "openai", "the override decides, the declaration stays");
     },
   );
   withConfig({ env: { core: { HARNESS: "pi", MODEL_PROVIDER: "bedrock" } } }, ({ path }) => {
@@ -1431,20 +1438,30 @@ test("blank model provider overrides preserve the declared provider in runtime a
   );
 });
 
-test("screening defaults off and model screening requires an explicit backend", () => {
-  assert.deepEqual(securityScreenEnv({}), { SECURITY_SCREEN_BACKEND: "off" });
-  for (const backend of ["off", "model"] as const) {
-    withConfig({ securityScreen: { backend } }, ({ path }) => {
+test("screening defaults off and the model classifier needs no proxy settings", () => {
+  assert.deepEqual(securityScreenEnv({}), { SECURITY_SCREEN: "off" });
+  for (const mode of ["off", "observe", "enforce"] as const) {
+    withConfig({ securityScreen: { mode } }, ({ path }) => {
       const { config } = loadConfigAt(path);
-      assert.deepEqual(securityScreenEnv(config), { SECURITY_SCREEN_BACKEND: backend });
+      assert.deepEqual(securityScreenEnv(config), { SECURITY_SCREEN: mode });
     });
-    withConfig({ securityScreen: { backend, rollout: "enforce" } }, ({ path }) =>
-      assert.throws(() => loadConfigAt(path), /require backend proxy/),
+    withConfig({ securityScreen: { mode, provider: "example-screen" } }, ({ path }) =>
+      assert.throws(() => loadConfigAt(path), /require classifier proxy/),
     );
     withConfig(
-      { securityScreen: { backend }, secretEnv: { core: { SECURITY_SCREEN_PROXY_TOKEN: "TOKEN" } } },
-      ({ path }) => assert.throws(() => loadConfigAt(path), /requires securityScreen/),
+      { securityScreen: { mode }, secretEnv: { core: { SECURITY_SCREEN_PROXY_TOKEN: "TOKEN" } } },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /requires securityScreen classifier proxy/),
     );
+  }
+  withConfig({ securityScreen: { backend: "off" } }, ({ path }) =>
+    assert.deepEqual(securityScreenEnv(loadConfigAt(path).config), { SECURITY_SCREEN: "off" }),
+  );
+  for (const retired of [
+    { backend: "model" },
+    { mode: "enforce", allPostures: true },
+    { mode: "observe", rollout: "shadow" },
+  ]) {
+    withConfig({ securityScreen: retired }, ({ path }) => assert.throws(() => loadConfigAt(path), /retired/));
   }
 });
 
@@ -1473,47 +1490,40 @@ test("AWS ownership control is opt-in and reserves deployment identity allocatio
   );
 });
 
-test("deployment screening across postures is validated and rendered", () => {
-  for (const allPostures of [true, false]) {
-    withConfig({ securityScreen: { backend: "model", allPostures } }, ({ path }) => {
-      assert.deepEqual(securityScreenEnv(loadConfigAt(path).config), {
-        SECURITY_SCREEN_BACKEND: "model",
-        SECURITY_SCREEN_ALL_POSTURES: String(allPostures),
-      });
-    });
-  }
-  for (const securityScreen of [
-    { backend: "off", allPostures: true },
-    { backend: "model", allPostures: "true" },
-  ]) {
-    withConfig({ securityScreen }, ({ path }) => assert.throws(() => loadConfigAt(path), /allPostures/));
-  }
-  withConfig({ env: { core: { SECURITY_SCREEN_ALL_POSTURES: "true" } } }, ({ path }) =>
-    assert.throws(() => loadConfigAt(path), /managed by securityScreen/),
-  );
-});
-
-test("proxy deployment rendering retains the independent posture requirement", () => {
+test("proxy deployment rendering names the mode and classifier", () => {
   withConfig(
     {
       securityScreen: {
-        backend: "proxy",
+        mode: "enforce",
+        classifier: "proxy",
         provider: "fixture",
         endpoint: "https://screen.example.test/classify",
-        rollout: "enforce",
-        allPostures: true,
       },
       secretEnv: { core: { SECURITY_SCREEN_PROXY_TOKEN: "SCREEN_TOKEN" } },
     },
     ({ path }) => {
-      const { config } = loadConfigAt(path);
-      assert.deepEqual(securityScreenEnv(config), {
-        SECURITY_SCREEN_BACKEND: "proxy",
-        SECURITY_SCREEN_ALL_POSTURES: "true",
+      assert.deepEqual(securityScreenEnv(loadConfigAt(path).config), {
+        SECURITY_SCREEN: "enforce",
+        SECURITY_SCREEN_CLASSIFIER: "proxy",
         SECURITY_SCREEN_PROXY_PROVIDER: "fixture",
         SECURITY_SCREEN_PROXY_ENDPOINT: "https://screen.example.test/classify",
-        SECURITY_SCREEN_PROXY_ROLLOUT: "enforce",
       });
     },
   );
+});
+
+test("AWS built-in architecture defaults match published images and retain explicit choices", () => {
+  const workloads = ["core", "web-ui", "admin", "portal", "auth", "linear"];
+  const config = {
+    plugins: [{ name: "linear" }],
+    imageOverrides: {},
+    aws: { services: Object.fromEntries(workloads.map((name) => [name, {}])) },
+  } as unknown as import("../src/config.ts").QmConfig;
+  for (const workload of workloads) {
+    assert.equal(awsWorkloadArchitecture(config, workload), workload === "linear" ? "arm64" : "amd64");
+    for (const architecture of ["arm64", "amd64"] as const) {
+      config.aws!.services[workload]!.architecture = architecture;
+      assert.equal(awsWorkloadArchitecture(config, workload), architecture);
+    }
+  }
 });

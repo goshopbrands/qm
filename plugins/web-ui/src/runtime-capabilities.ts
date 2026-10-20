@@ -3,7 +3,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max" | "ultracode" | "auto" | "adaptive" | "default";
 
 export const EFFORT_LEVELS: Array<{ value: EffortLevel; label: string }> = [
-  { value: "auto", label: "Legacy default" },
+  { value: "auto", label: "Default" },
   { value: "adaptive", label: "Auto" },
   { value: "default", label: "Provider default" },
   { value: "low", label: "Low" },
@@ -19,15 +19,15 @@ export function effortLabel(level: EffortLevel): string {
 }
 
 export function harnessSupportsEffort(harnessId: string): boolean {
-  return harnessId === "pi" || harnessId === "codex" || harnessId === "claude";
+  return harnessId === "pi" || harnessId === "claude";
 }
 
 export function harnessSupportsFastMode(harnessId: string): boolean {
-  return harnessId === "pi" || harnessId === "claude" || harnessId === "codex" || harnessId === "opencode";
+  return harnessId === "pi" || harnessId === "claude";
 }
 
 export function harnessSupportsSteer(harnessId: string): boolean {
-  return harnessId === "pi" || harnessId === "claude" || harnessId === "codex" || harnessId === "opencode";
+  return harnessId === "pi" || harnessId === "claude";
 }
 
 export function defaultEffortForModel(model: Model<Api> | undefined): EffortLevel {

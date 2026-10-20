@@ -1,4 +1,3 @@
-import { sessionStatusMark } from "./session-status.ts";
 import { openSessionShare } from "./session-share";
 import { preserveTranscriptScroll } from "./transcript-viewport";
 import { html, nothing, render, type TemplateResult } from "lit";
@@ -7,6 +6,8 @@ import {
   Archive,
   ArrowUpLeft,
   Binoculars,
+  Bot,
+  Target,
   Box,
   Brain,
   Clock3,
@@ -52,9 +53,10 @@ import {
   type SplitEdge,
 } from "./split-layout";
 import { paneKindByKey, paneKindEntry } from "./pane-kinds";
-import { focusComposerOnPaneClick, preservingFocus } from "./pane-focus";
+import { focusComposerOnPaneClick, focusPaneComposer, preservingFocus } from "./pane-focus";
 import { attachTooltip, tip } from "./tooltip";
-import { icon, workingWave } from "./ui";
+import { workingWave } from "./ui";
+import { icon } from "./icons";
 import { contextsState, scopeTitle } from "./contexts";
 import type { DensityTier } from "./density";
 import { appState } from "./shell-state";
@@ -78,7 +80,7 @@ import {
   archiveSessionById,
   syncWorkingPulse,
 } from "./sessions";
-import { conversationBackground, type RowIndicators } from "./session-list";
+import { conversationBackground, rowIndicators, type RowIndicators } from "./session-list";
 import { scopeToolCount, setScopedSession, type SessionTool } from "./session-scope";
 import {
   fetchTranscript,
@@ -161,6 +163,11 @@ function pushRemoteSoon(payload: { updatedAt: number }): void {
 }
 
 function flushRemoteNow(): void {
+  if (persistTimer !== null) {
+    window.clearTimeout(persistTimer);
+    persistTimer = null;
+    persist();
+  }
   if (remoteTimer !== null) {
     window.clearTimeout(remoteTimer);
     remoteTimer = null;
@@ -250,6 +257,7 @@ function buildDock(): DockviewApi {
   api.onDidActivePanelChange((e) => {
     splitState.focusedId = e.panel?.id ?? null;
     syncDocumentTitle();
+    if (e.panel) focusPaneComposer(paneContents.get(e.panel.id)?.element);
   });
   api.onDidMaximizedGroupChange(() => {
     for (const a of groupActions) a.draw();
@@ -804,10 +812,13 @@ export function drawCanvas(): void {
 
 function computeHeaderSignature(): string {
   return (dockApi?.panels ?? [])
-    .map(
-      (p) =>
-        `${p.id}|${paneSession(p)?.id ?? ""}|${paneCrumb(p) ?? ""}|${paneTitle(p)}|${JSON.stringify(paneSession(p)?.status ?? null)}|${paneIsWorking(p)}|${paneAwaitsInput(p)}|${paneBackground(p)?.label ?? ""}|${paneKindBadge(p)}|${paneSession(p)?.parentSessionId ?? ""}|${sessionsState.list.find((row) => row.id === paneSession(p)?.parentSessionId)?.title ?? ""}`,
-    )
+    .map((p) => {
+      const session = paneSession(p);
+      const parent = session?.parentSessionId
+        ? sessionsState.list.find((row) => row.id === session.parentSessionId)
+        : undefined;
+      return `${p.id}|${session?.id ?? ""}|${paneCrumb(p) ?? ""}|${paneTitle(p)}|${paneIsWorking(p)}|${paneAwaitsInput(p)}|${paneBackground(p)?.label ?? ""}|${paneKindBadge(p)}|${session?.parentSessionId ?? ""}|${parent?.title ?? ""}`;
+    })
     .join("~");
 }
 
@@ -905,7 +916,8 @@ function paneIsWorking(panel: IDockviewPanel): boolean {
 }
 
 function paneAwaitsInput(panel: IDockviewPanel): boolean {
-  return Boolean(paneSession(panel)?.awaitingInput);
+  const session = paneSession(panel);
+  return session ? rowIndicators(session, null, sessionsState.list).awaiting : false;
 }
 
 function paneBackground(panel: IDockviewPanel): RowIndicators["background"] {
@@ -1231,7 +1243,7 @@ class PaneTab implements ITabRenderer {
             ? html`<span class="bg-chip" aria-label=${background.label} ${tip(background.label)}
                 >${background.jobs > 0 ? icon(Cog, 11) : nothing}${
                   background.watches > 0 ? icon(Binoculars, 11) : nothing
-                }${background.crons > 0 ? icon(Clock3, 11) : nothing}</span
+                }${background.crons > 0 ? icon(Clock3, 11) : nothing}${background.subagents > 0 ? icon(Bot, 11) : nothing}${background.goal ? icon(Target, 11) : nothing}</span
               >`
             : nothing
         }
@@ -1259,7 +1271,6 @@ class PaneTab implements ITabRenderer {
             : nothing
         }
         <span class="split-pane-title-text" dir="auto">${title}</span>
-        ${sessionStatusMark(paneSession(panel)?.status)}
         ${
           this.inStrip
             ? html`<span class="split-tab-actions">
@@ -1589,4 +1600,14 @@ function notePaneSession(paneId: string, sessionId: string | null, threadRef: st
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && splitState.active && dockApi?.hasMaximizedGroup()) dockApi.exitMaximizedGroup();
+});
+
+window.addEventListener("qm:cycle-tab", (e) => {
+  const step = (e as CustomEvent<unknown>).detail;
+  if (!dockApi || !canvasHost?.isConnected || (step !== 1 && step !== -1)) return;
+  const group = dockApi.groups.find((g) => g.element.contains(document.activeElement)) ?? dockApi.activeGroup;
+  const panels = group?.panels ?? [];
+  const at = group?.activePanel ? panels.indexOf(group.activePanel) : -1;
+  if (panels.length < 2 || at < 0) return;
+  activatePanel(panels[(at + step + panels.length) % panels.length]);
 });

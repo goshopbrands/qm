@@ -24,10 +24,10 @@ Slack  ⇄ (WebSocket)  slack surface (in core)  ── direct calls ──▶  
 ### Slack Agents (top-bar pin)
 
 The manifest enables Slack's [Agents & AI Apps](https://docs.slack.dev/ai/developing-agents)
-feature (`agent_view`) for one reason: users can pin the app to the Slack top bar and open
-it anywhere. Conversations in the resulting split pane are ordinary DM thread messages and
-flow through the normal DM machinery unchanged — none of the extra agent UI (status
-indicators, thread titles, context passing, suggested prompts) is implemented.
+feature (`agent_view`) so users can pin the app to the Slack top bar and open it anywhere.
+Conversations in the resulting split pane are ordinary DM thread messages and flow through
+the normal DM machinery unchanged. Thread titles, context passing and suggested prompts
+are not implemented. Activity cards are experimental and off by default.
 
 Two caveats:
 
@@ -38,6 +38,37 @@ Two caveats:
   `assistant_thread_context_changed` events (Slack requires both to enable the feature;
   the plugin acknowledges them as no-ops). Installs that don't update keep working
   exactly as before.
+
+### Optional activity cards
+
+In Admin → Customize → Feature flags, enable **Slack loading indicator (experimental)**
+for selected people or conversation scopes. It is off by default. The Slack app must
+support [`task_card`](https://docs.slack.dev/reference/block-kit/blocks/task-card-block)
+blocks and have `chat:write`.
+
+After QM commits to answering, one card is posted in the existing reply thread and
+updated in place: **Working**, **Waiting to resume**, **Background work**, **Monitoring**,
+or **No active work**. This describes recorded activity, not success, failure or delivery.
+Quiet ambient turns and unthreaded DMs do not create cards. Cards are visible to everyone
+in their thread; own status cards and edits are excluded from conversation history.
+
+Waiting cards survive turns and restarts. Only this conversation's registered background
+jobs and enabled, unexpired process monitors count, not recurring crons or agent prose.
+Unwatched exits become visible when checked, reconciled during sandbox setup, or expired.
+Commands and monitor instructions are never rendered. After more than five minutes,
+including waits, a subtle **Follow via QM Web** link opens the exact web conversation
+with normal authorization. Without a configured web URL, the link is omitted.
+
+A minute sweep refreshes activity and retries transient failures. Durable receipts and
+per-thread leases preserve card identity across workers; expired run leases are shown as
+waiting, not working. Slack has no conditional writes: late updates are repaired, and an
+ambiguous initial post can duplicate if Slack does not deduplicate `client_msg_id`.
+An outage can leave a stale card until recovery. Status calls have a separate five-second
+timeout and never delay reply delivery.
+
+Once no activity remains, the card settles without a spinner and is no longer tracked.
+Later work creates a fresh card. Disabling the flag settles existing cards without
+stopping work or deleting messages. Native session status and Stop events are not used.
 
 > **Running locally alongside another developer? Each dev needs their OWN app.**
 > See [Local dev with multiple developers](#local-dev-with-multiple-developers)
@@ -150,14 +181,10 @@ the tokens, core simply runs without Slack.
   approval (`pending_approval`) or _finished with a reply but skipped_ the gated command
   (collect-mode `ok` + `pendingApprovals`, what the real Pi harness does) — in the latter case
   the buttons are posted alongside the reply. Clicking re-runs the turn with the command approved.
-- **Channel agents can ask personal agents.** If a channel task needs a member's personal setup
-  (their env, browser login, resident CLI, connected app, or private files), the channel agent can
-  ask that person's personal agent instead of pretending the shared context has the resource. The
-  request appears in the original thread as `#channel agent → Name's personal agent`, and the target
-  person gets a DM with **Run with my setup** / **Decline** buttons. If they approve, the plugin runs
-  a normal DM-scoped turn as that user and posts the result back to the thread as
-  `Name's personal agent → #channel agent`. The target must already be an internal participant in
-  the channel conversation. In `HARNESS=mock`, use `!askagent <@USERID> task` to test the full flow.
+- **Hand-offs are plain DMs.** When channel work needs another member's own logins, files or
+  memory, the agent follows the `hand-off` skill: in Open conversations it uses the requester's own
+  access; otherwise it sends that person a DM through `POST /v1/reach` with the full request, and
+  says so only after reach confirms who it matched.
 - In an **externally-shared (Slack Connect) channel**, or any channel/mpim whose audience
   includes a **guest or external member**, it stays silent in-channel and replies privately
   (ephemeral) — and uploads no file there — internal-only (spec §9). Group DMs (mpim) aren't
@@ -233,7 +260,6 @@ your per-dev name + tokens live only in your local app and your gitignored `.env
 | channel `thread_ts` (root)                                                                                       | `threadRef` = `ch:<channel>:<root>` (one session per thread)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `TurnResult.reply`                                                                                               | posted in-thread; unprompted `refused` (`security_quarantine` included) → silent, addressed `refused` → requester-only (ephemeral in channels) except addressed `security_quarantine` → fixed in-thread acknowledgement; `pending_approval` (or `ok` + `pendingApprovals`, collect-mode) → Block Kit approval buttons                                                                                                                                                                                                                                                  |
 | Block Kit approval button (`block_actions`)                                                                      | `POST /v1/turns` with `approval` (`once` / `session` / `always` / deny)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `[[ask-agent: <@U…> \| task]]` in a channel reply                                                                | Slack strips the directive, DMs that user for consent, then runs `POST /v1/turns` as a DM-scoped personal-agent turn and posts the result back to the original thread                                                                                                                                                                                                                                                                                                                                                                                                  |
 | Pending `/v1/surface-context` request (hanging long-poll, source-authed)                                         | The agent's mid-turn context pull: core resolved the target (current conversation via the capability's opaque destination, or a directory-resolved public channel) and parked the request; the plugin enforces visibility (public, bot-member, not externally shared — or the current conversation itself, even private), fetches history with `before` paging + `match` filtering, and POSTs the messages back (`buildContextWindow`). The default injected window is small (`MAX_RECENT_MESSAGES`, env `SLACK_RECENT_MESSAGES`); context beyond it is pull, not push |
 
 ## Notes / next

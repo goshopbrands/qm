@@ -26,6 +26,7 @@ test("mixed deployment providers preserve Git updates, restore, reach, profiles 
   const applied: string[] = [];
   const destroyed: string[] = [];
   const alwaysOnChanges: string[] = [];
+  const rotationChecks: string[] = [];
   let reconciles = 0;
   let resolutions = 0;
   const modern: DeployProvider = {
@@ -40,6 +41,13 @@ test("mixed deployment providers preserve Git updates, restore, reach, profiles 
     logs: async () => "modern logs",
     setAlwaysOn: async (d) => {
       alwaysOnChanges.push(d.id);
+    },
+    rotationDue: async (d) => {
+      rotationChecks.push(d.id);
+      return true;
+    },
+    park: async (d) => {
+      destroyed.push(`parked:${d.id}`);
     },
   };
   const legacy: DeployProvider = {
@@ -101,6 +109,10 @@ test("mixed deployment providers preserve Git updates, restore, reach, profiles 
   await service.setDeploymentAlwaysOn(old.id, true);
   assert.equal((await store.get(old.id))!.alwaysOn, true);
   assert.deepEqual(alwaysOnChanges, []);
+  const warmedBefore = resolutions;
+  assert.equal(await service.maintainDeployments(), 1);
+  assert.deepEqual(rotationChecks, []);
+  assert.equal(resolutions, warmedBefore + 1);
   await service.archiveDeployment(old.id);
   assert.equal((await store.get(old.id))!.endpoint, null);
   assert.deepEqual(destroyed, [`modern:${fresh.id}`, `legacy:${old.id}`]);

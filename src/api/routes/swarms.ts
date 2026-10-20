@@ -3,6 +3,9 @@ import { errMessage } from "../../util/errors.ts";
 import type { SwarmCaller } from "../../swarms/swarm-service.ts";
 import { isObj } from "./shared.ts";
 import type { ApiCtx, Route } from "./route.ts";
+import { SPAWN_RUNTIME_FIELDS } from "../../swarms/swarm-runtime.ts";
+
+const ACTION_FIELDS: Record<string, string[]> = { context: ["context"], control: ["memberId", "state"] };
 
 async function swarmRequest(ctx: ApiCtx): Promise<void> {
   const { app, res, body, capability, actor, params, method, url } = ctx;
@@ -35,8 +38,8 @@ async function swarmRequest(ctx: ApiCtx): Promise<void> {
     const allowed = new Set([
       "action",
       ...(caller.kind === "human" ? ["runId"] : []),
-      ...(body.action === "context" ? ["context"] : ["requestId", "text"]),
-      ...(body.action === "spawn" ? ["count", "context", "contexts", "forumSandboxId"] : []),
+      ...(ACTION_FIELDS[String(body.action)] ?? ["requestId", "text"]),
+      ...(body.action === "spawn" ? ["count", "context", "contexts", "forumSandboxId", ...SPAWN_RUNTIME_FIELDS] : []),
       ...(body.action === "send" ? ["audience", "replyTo", "notify"] : []),
       ...(body.action === "spawn" ? ["settings", "backend"] : []),
     ]);
@@ -44,6 +47,12 @@ async function swarmRequest(ctx: ApiCtx): Promise<void> {
     if (body.action === "context") {
       if (!("context" in body)) throw new Error("context required");
       return sendJson(res, 200, await app.swarms.context(caller, body.context));
+    }
+    if (body.action === "control") {
+      if (typeof body.memberId !== "string" || !["active", "paused", "stopped"].includes(body.state as string))
+        throw new Error("memberId and state (active, paused or stopped) required");
+      const state = body.state as "active" | "paused" | "stopped";
+      return sendJson(res, 200, { member: await app.swarms.control(caller, { memberId: body.memberId, state }) });
     }
     if (typeof body.requestId !== "string" || typeof body.text !== "string")
       throw new Error("requestId and text required");
@@ -63,6 +72,9 @@ async function swarmRequest(ctx: ApiCtx): Promise<void> {
         ...(typeof body.forumSandboxId === "string" ? { forumSandboxId: body.forumSandboxId } : {}),
         ...(isObj(body.settings) ? { settings: body.settings } : {}),
         ...(typeof body.backend === "string" ? { backend: body.backend } : {}),
+        ...Object.fromEntries(
+          SPAWN_RUNTIME_FIELDS.filter((field) => field in body).map((field) => [field, body[field]]),
+        ),
       });
       return sendJson(res, 202, { members });
     }

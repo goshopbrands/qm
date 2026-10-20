@@ -5,11 +5,16 @@
 // model-provider credential, not like a personal connector.
 
 import { isValidMcpServerId, type McpServer, type McpServerAuthMode } from "../../../mcp/mcp-server-store.ts";
+import { PROVIDERS } from "../../../connectors/oauth.ts";
+import { discoverOAuth, httpsUrl, parseScopes, type DiscoveredOAuth } from "../../../mcp/oauth-discovery.ts";
 import { sendJson } from "../../http.ts";
 import type { ApiCtx } from "../route.ts";
 import { actsAsManager, audit, authorizeAdmin, orgScope } from "../shared.ts";
 
-const AUTH_MODES: McpServerAuthMode[] = ["none", "bearer", "client-credentials"];
+const normalizeHost = (host: string): string => host.toLowerCase().replace(/\.$/, "");
+const hostsOverlap = (a: string, b: string): boolean => a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
+
+const AUTH_MODES: McpServerAuthMode[] = ["none", "bearer", "client-credentials", "oauth-user"];
 
 async function actor(ctx: ApiCtx) {
   const scope = orgScope(ctx.deps);
@@ -79,11 +84,49 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
     return sendJson(ctx.res, 400, { error: "bad_request", message: `auth must be one of ${AUTH_MODES.join(", ")}` });
   }
   const existing = await ctx.deps.mcpServers.get(id);
-  const credentialScope = b.credentialScope ?? existing?.credentialScope ?? "shared";
+  const oauthUser = auth === "oauth-user";
+  if (oauthUser && PROVIDERS[id]) {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: `id ${id} is reserved by a built-in connector` });
+  }
+  const credentialScope = oauthUser ? "per-user" : (b.credentialScope ?? existing?.credentialScope ?? "shared");
   if (credentialScope !== "shared" && credentialScope !== "per-user") {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "credentialScope must be shared or per-user" });
   }
-  const credentialHost = b.credentialHost ?? existing?.credentialHost;
+  const requestedHost = b.credentialHost ?? existing?.credentialHost ?? (oauthUser ? parsed.hostname : undefined);
+  const credentialHost = typeof requestedHost === "string" ? normalizeHost(requestedHost) : requestedHost;
+  if (
+    oauthUser &&
+    typeof credentialHost === "string" &&
+    Object.values(PROVIDERS).some((p) => p.hosts.some((h) => hostsOverlap(credentialHost, h)))
+  ) {
+    return sendJson(ctx.res, 400, {
+      error: "bad_request",
+      message: "credentialHost is already used by another connector",
+    });
+  }
+  if (
+    oauthUser &&
+    typeof credentialHost === "string" &&
+    (await ctx.deps.mcpServers.list()).some(
+      (other) =>
+        other.id !== id &&
+        other.auth === "oauth-user" &&
+        typeof other.credentialHost === "string" &&
+        hostsOverlap(credentialHost, normalizeHost(other.credentialHost)),
+    )
+  ) {
+    return sendJson(ctx.res, 400, {
+      error: "bad_request",
+      message: "credentialHost overlaps another oauth-user server's",
+    });
+  }
+  for (const field of ["oauthAuthorizeUrl", "oauthTokenUrl"] as const) {
+    if (oauthUser && b[field] !== undefined && !httpsUrl(b[field])) {
+      return sendJson(ctx.res, 400, { error: "bad_request", message: `${field} must be an HTTPS URL` });
+    }
+  }
+  let oauthAuthorizeUrl = httpsUrl(b.oauthAuthorizeUrl) ?? (oauthUser ? existing?.oauthAuthorizeUrl : undefined);
+  let oauthTokenUrl = httpsUrl(b.oauthTokenUrl) ?? (oauthUser ? existing?.oauthTokenUrl : undefined);
   const credentialAccountType = b.credentialAccountType ?? existing?.credentialAccountType ?? "default";
   if (!["default", "personal", "company"].includes(credentialAccountType)) {
     return sendJson(ctx.res, 400, {
@@ -111,6 +154,12 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
       message: "per-user credentials require HTTPS (except loopback)",
     });
   }
+  let discovered: DiscoveredOAuth | undefined;
+  if (oauthUser && (!oauthAuthorizeUrl || !oauthTokenUrl)) {
+    discovered = await discoverOAuth(parsed);
+    oauthAuthorizeUrl ??= discovered.authorize;
+    oauthTokenUrl ??= discovered.token;
+  }
   if (await actsAsManager(ctx, authorized)) {
     const newSecret =
       (auth === "bearer" && typeof b.bearerToken === "string" && b.bearerToken) ||
@@ -119,17 +168,22 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
         b.clientId &&
         typeof b.clientSecret === "string" &&
         b.clientSecret);
-    if (existing && auth !== "none" && !newSecret)
+    if (existing && auth !== "none" && !oauthUser && !newSecret)
       return sendJson(ctx.res, 403, { error: "forbidden", message: "re-enter the secret to change this server" });
-    const host = parsed.hostname.toLowerCase();
-    const onCredentialHost =
-      typeof credentialHost === "string" &&
-      credentialHost.includes(".") &&
-      (host === credentialHost || host.endsWith(`.${credentialHost}`));
-    if (credentialScope === "per-user" && !onCredentialHost)
+    const onCredentialHost = (target: string): boolean => {
+      if (typeof credentialHost !== "string" || !credentialHost.includes(".")) return false;
+      const host = normalizeHost(new URL(target).hostname);
+      return host === credentialHost || host.endsWith(`.${credentialHost}`);
+    };
+    if (credentialScope === "per-user" && !onCredentialHost(url))
       return sendJson(ctx.res, 403, {
         error: "forbidden",
         message: "a per-user server's URL must be on its credential host",
+      });
+    if (oauthUser && [oauthAuthorizeUrl, oauthTokenUrl].some((endpoint) => endpoint && !onCredentialHost(endpoint)))
+      return sendJson(ctx.res, 403, {
+        error: "forbidden",
+        message: "an oauth-user server's OAuth endpoints must be on its credential host",
       });
   }
   const server: McpServer = {
@@ -141,6 +195,14 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
     ...(credentialScope === "per-user" ? { credentialHost, credentialAccountType } : {}),
     ...(auth === "bearer"
       ? { bearerToken: typeof b.bearerToken === "string" && b.bearerToken ? b.bearerToken : existing?.bearerToken }
+      : {}),
+    ...(oauthUser
+      ? {
+          clientId: typeof b.clientId === "string" && b.clientId ? b.clientId.trim() : existing?.clientId,
+          oauthAuthorizeUrl,
+          oauthTokenUrl,
+          oauthScopes: parseScopes(b.oauthScopes) ?? existing?.oauthScopes ?? discovered?.scopes ?? [],
+        }
       : {}),
     ...(auth === "client-credentials"
       ? {
@@ -162,8 +224,16 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
       message: "client-credentials auth requires clientId and clientSecret",
     });
   }
+  if (oauthUser && (!server.clientId || !server.oauthAuthorizeUrl || !server.oauthTokenUrl)) {
+    return sendJson(ctx.res, 400, {
+      error: "bad_request",
+      message:
+        "oauth-user auth requires clientId plus HTTPS oauthAuthorizeUrl and oauthTokenUrl, or OAuth metadata to discover them" +
+        (discovered?.errors.length ? ` (discovery: ${discovered.errors.join("; ")})` : ""),
+    });
+  }
   let toolNames: string[] | undefined;
-  if (b.validate !== false && ctx.deps.mcpToolService) {
+  if (b.validate !== false && !oauthUser && ctx.deps.mcpToolService) {
     try {
       toolNames = await ctx.deps.mcpToolService.probe(server);
     } catch (e) {

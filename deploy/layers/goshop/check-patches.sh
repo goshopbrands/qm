@@ -39,12 +39,13 @@ trap 'git -C "$root" worktree remove --force "$tree" >/dev/null 2>&1 || true; rm
 git worktree add --detach --quiet "$tree" "$ref"
 cp plugins/portal/test/apps-host-forwarding.test.ts "$tree/plugins/portal/test/"
 ln -s "$root/node_modules" "$tree/node_modules"
-(cd "$tree/plugins/portal" && npm ci --ignore-scripts --no-audit --no-fund --silent >/dev/null 2>&1) || {
-  echo "  PROBE ERROR: could not install $ref's portal dependencies (npm ci failed; network?)"
-  exit 1
-}
 status=0
-output="$(cd "$tree/plugins/portal" && node --test test/apps-host-forwarding.test.ts 2>&1)" || status=$?
+if (cd "$tree/plugins/portal" && npm ci --ignore-scripts --no-audit --no-fund --silent >/dev/null 2>&1); then
+  output="$(cd "$tree/plugins/portal" && node --test test/apps-host-forwarding.test.ts 2>&1)" || status=$?
+else
+  status=1
+  output="could not install $ref's portal dependencies (npm ci failed; network?)"
+fi
 passed="$(printf '%s\n' "$output" | sed -n 's/^ℹ pass \([0-9]*\)$/\1/p')"
 failed="$(printf '%s\n' "$output" | sed -n 's/^ℹ fail \([0-9]*\)$/\1/p')"
 if [ "$status" = 0 ]; then
@@ -75,6 +76,12 @@ elif grep -q dataDir <<<"$provider"; then
 else
   echo "  still needed: $ref's Fly deploy provider has no durable app data"
 fi
+direct_calls="$(git diff "$base" "$ref" -- src/deploy/deploy-service.ts | grep -E '^\+.*deps\.provider\.' || true)"
+if [ -n "$direct_calls" ]; then
+  echo "  upstream added deploy provider calls that bypass providerFor; route each through providerFor(d):"
+  printf '%s\n' "$direct_calls" | sed 's/^/    /'
+  review=1
+fi
 shared="$(git show "$ref:src/deploy/shared-deploy-provider.ts" 2>/dev/null || true)"
 if grep -q "export function appReporter" <<<"$shared"; then
   echo "  ADOPT CANDIDATE: $ref reports app start failures through appReporter and appLogs (src/deploy/shared-deploy-provider.ts) — wire the legacy provider into them and drop its exit-code diagnosis"
@@ -93,6 +100,9 @@ else
   echo "  RETIRE CANDIDATE: $ref no longer makes the unconditional pre-baked-runtime claim — check whether it now gates by backend or bootstraps the runtime, and verify on a fresh sprite"
   review=1
 fi
+if git show "$ref:src/skills/seed.ts" 2>/dev/null | grep -q respectArchived; then
+  echo "  RETIRE OPTION: $ref keeps admin-archived seed skills archived — restoring the directory is safe once production's browse record is confirmed archived"
+fi
 
 echo "== Patch 4: org manager role"
 report_touches src/admin/admin-service.ts src/admin/admin-grant-store.ts src/api/routes/shared.ts \
@@ -106,7 +116,23 @@ if [ -n "$new_routes" ]; then
   printf '%s\n' "$new_routes" | sed 's/^/    /'
   review=1
 fi
-new_checks="$(git diff "$base" "$ref" -- src plugins | grep -E '^\+.*(adminStatusOf|adminStatusFromGrants|canAdminister|\.isAdmin\b|org_admin|adminProbe|authorizeAdmin|requireScopedAdmin)' || true)"
+resources_status=0
+unclassified_resources="$(node --input-type=module -e '
+const [tree, root] = process.argv.slice(1);
+const { ADMIN_RESOURCES } = await import(`${tree}/src/api/routes/admin-resources.ts`);
+const { MANAGER_RESOURCES } = await import(`${root}/src/admin/manager-access.ts`);
+for (const r of ADMIN_RESOURCES) if (!MANAGER_RESOURCES.has(r.id)) console.log(r.id);
+' "$tree" "$root" 2>&1)" || resources_status=$?
+if [ "$resources_status" != 0 ]; then
+  echo "  PROBE ERROR: could not load $ref's admin resources — inspect before deciding:"
+  printf '%s\n' "$unclassified_resources" | tail -10 | sed 's/^/    /'
+  review=1
+elif [ -n "$unclassified_resources" ]; then
+  echo "  $ref has admin resources missing from MANAGER_RESOURCES; ask whether managers should get each, then classify it:"
+  printf '%s\n' "$unclassified_resources" | sed 's/^/    /'
+  review=1
+fi
+new_checks="$(git diff "$base" "$ref" -- src plugins | grep -E '^\+.*(adminStatusOf|adminStatusFromGrants|canAdminister|\.isAdmin\b|org_admin|actorIsOrgAdmin|adminProbe|authorizeAdmin|requireScopedAdmin)' || true)"
 if [ -n "$new_checks" ]; then
   echo "  upstream added admin-status checks; decide whether each should require role org_admin:"
   printf '%s\n' "$new_checks" | sed 's/^/    /'
@@ -124,8 +150,8 @@ else
 fi
 
 echo "== Patch 5: a broker call without its credential handle explains itself"
-report_touches plugins/portal/src/index.ts src/api/server.ts src/api/git-http-broker.ts src/api/credential-broker.ts src/auth/capability-token.ts \
-  src/core/orchestrator.ts src/api/agent-api-catalog.ts skills-seed/use-shared-credential
+report_touches plugins/portal/src/index.ts src/api/server.ts src/api/git-http-broker.ts src/api/credential-broker.ts \
+  src/auth/capability-token.ts src/api/agent-api-catalog.ts skills-seed/use-shared-credential
 upstream_portal="$(git show "$ref:plugins/portal/src/index.ts" 2>/dev/null || true)"
 upstream_skill="$(git show "$ref:skills-seed/use-shared-credential/SKILL.md" 2>/dev/null || true)"
 if [ -z "$upstream_portal" ] || [ -z "$upstream_skill" ]; then
@@ -134,13 +160,14 @@ if [ -z "$upstream_portal" ] || [ -z "$upstream_skill" ]; then
 else
   fixed=""
   grep -q '/v1/credentials/broker' <<<"$upstream_portal" && fixed="$fixed portal-routes-broker"
-  git grep -qF 'service_<slug>' "$ref" -- src/api/server.ts src/api/git-http-broker.ts src/auth/capability-token.ts && fixed="$fixed core-401-names-handle"
-  grep -q 'your environment has no `AGENT_CREDENTIAL_TOKEN`' <<<"$upstream_skill" || fixed="$fixed skill-reworded"
+  git grep -qiE 'capability token required.*handle' "$ref" -- src/api/server.ts src/auth/capability-token.ts && fixed="$fixed core-401-names-handle"
+  git grep -qF 'this session is not entitled to that credential' "$ref" -- src/api/credential-broker.ts || fixed="$fixed not-entitled-reworded"
+  grep -q '401' <<<"$upstream_skill" && fixed="$fixed skill-explains-401"
   if [ -n "$fixed" ]; then
-    echo "  RETIRE CANDIDATE: $ref changed:$fixed; follow Patch 5's retirement steps"
+    echo "  RETIRE CANDIDATE: $ref changed:$fixed; follow Patch 5's retirement steps for those parts"
     review=1
   else
-    echo "  still needed: $ref's portal 404s a broker call without a token, core's 401 does not name the handle, and the skill still reads an empty token as no credentials"
+    echo "  still needed: $ref's portal 404s a broker call without a token, core's 401 and 403 do not name the handle, and the skill does not explain a 401"
   fi
 fi
 

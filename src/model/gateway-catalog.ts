@@ -1,3 +1,4 @@
+import { isEmbeddingModel, type EmbeddingModel } from "./model-overlay.ts";
 import type { ModelGatewayTransportConfig } from "./provider-endpoints.ts";
 import { GATEWAY_MODEL_PREFIX, GATEWAY_PROVIDER, setGatewayModels, type GatewayModel } from "./gateway-models.ts";
 import { modelOfferedInWebui, selectableBaseModels } from "./pi-models.ts";
@@ -6,6 +7,14 @@ const MAX_BYTES = 2 * 1024 * 1024;
 const MAX_MODELS = 1_000;
 const TTL_MS = 5 * 60_000;
 const RETRY_MS = 30_000;
+const STALE_MS = 15 * 60_000;
+
+function transientFailure(error: unknown): boolean {
+  const status = (error as { status?: unknown } | null)?.status;
+  if (typeof status === "number") return status === 429 || status >= 500;
+  const name = (error as { name?: unknown } | null)?.name;
+  return name === "TimeoutError" || name === "AbortError" || error instanceof TypeError;
+}
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -27,9 +36,18 @@ function price(value: unknown): number | undefined {
     : undefined;
 }
 
-function parseModel(value: unknown, allowed: Set<string>, baseUrl: string): GatewayModel | undefined {
+function parseModel(value: unknown, allowed: Set<string>, baseUrl: string): GatewayModel | EmbeddingModel | undefined {
   const info = record(value);
   if (!info || !modelId(info.model_group) || !allowed.has(info.model_group)) return undefined;
+  if (info.mode === "embedding") {
+    return {
+      kind: "embedding",
+      id: GATEWAY_MODEL_PREFIX + info.model_group,
+      name: info.model_group,
+      provider: GATEWAY_PROVIDER,
+      baseUrl,
+    };
+  }
   if (info.mode !== "chat" || info.supports_function_calling !== true) return undefined;
   const contextWindow = tokens(info.max_input_tokens);
   const maxTokens = tokens(info.max_output_tokens);
@@ -76,6 +94,7 @@ function parseModel(value: unknown, allowed: Set<string>, baseUrl: string): Gate
       supportsReasoningEffort:
         Array.isArray(info.supported_openai_params) && info.supported_openai_params.includes("reasoning_effort"),
       supportsUsageInStreaming: true,
+      sendSessionAffinityHeaders: true,
       maxTokensField:
         Array.isArray(info.supported_openai_params) && info.supported_openai_params.includes("max_completion_tokens")
           ? "max_completion_tokens"
@@ -94,7 +113,8 @@ async function readCatalog(
     signal: AbortSignal.timeout(5_000),
     redirect: "error",
   });
-  if (!response.ok) throw new Error(`Gateway catalog returned HTTP ${response.status}`);
+  if (!response.ok)
+    throw Object.assign(new Error(`Gateway catalog returned HTTP ${response.status}`), { status: response.status });
   if (!response.body || Number(response.headers.get("content-length")) > MAX_BYTES)
     throw new Error("Gateway catalog exceeds size limit");
   const reader = response.body.getReader();
@@ -130,6 +150,7 @@ export function createGatewayCatalog(
   let discovered = false;
   let expiresAt = 0;
   let retryAt = 0;
+  let lastSuccessAt = 0;
   let inFlight: Promise<void> | undefined;
   const transport: ModelGatewayTransportConfig = {
     ...config,
@@ -163,12 +184,14 @@ export function createGatewayCatalog(
           models.map((model) => [model.id, model.id.slice(GATEWAY_MODEL_PREFIX.length)]),
         );
         for (const [id, target] of Object.entries(config.models)) {
-          if (allowed.has(target)) next[id] = target;
+          if (allowed.has(target) && !models.some((m) => m.id === GATEWAY_MODEL_PREFIX + target && isEmbeddingModel(m)))
+            next[id] = target;
         }
         routes = next;
         discovered = true;
         expiresAt = now() + TTL_MS;
         retryAt = expiresAt;
+        lastSuccessAt = now();
         const offeredAliases = new Set(
           selectableBaseModels()
             .filter(({ id }) => modelOfferedInWebui(id))
@@ -182,8 +205,12 @@ export function createGatewayCatalog(
               : [],
           ),
         );
-      } catch {
+      } catch (error) {
         retryAt = now() + RETRY_MS;
+        if (discovered && transientFailure(error) && now() - lastSuccessAt < STALE_MS) {
+          console.warn("[model] Gateway model discovery failed; keeping last known models and retrying in 30 seconds");
+          return;
+        }
         if (discovered || Object.keys(config.models).length === 0) {
           routes = {};
           expiresAt = 0;

@@ -1,4 +1,4 @@
-import { DEPLOY_RELEASE_AUD, verifyDeployReleaseCapability } from "../../auth/capability-token.ts";
+import { verifyDeployReleaseCapability } from "../../auth/capability-token.ts";
 import { CAPABILITY_HEADER } from "../contract.ts";
 import { headerValue, pipeToResponse, sendJson } from "../http.ts";
 import type { BaseCtx, Route } from "./route.ts";
@@ -23,5 +23,5 @@ async function getDeployRelease(ctx: BaseCtx): Promise<void> {
 }
 
 export const deployReleaseRoutes: ReadonlyArray<Route<BaseCtx>> = [
-  { method: "GET", path: "/v1/deploy-releases/:id", auth: { aud: DEPLOY_RELEASE_AUD }, handle: getDeployRelease },
+  { method: "GET", path: "/v1/deploy-releases/:id", auth: "public", handle: getDeployRelease },
 ];

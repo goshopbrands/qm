@@ -1,56 +1,8 @@
 export interface GoalStripState {
   objective: string;
-  status: "active" | "paused" | "complete" | "blocked";
+  status: "active" | "paused" | "complete" | "cancelled";
   floor?: string;
   createdAt: number;
-}
-
-interface ActivityLike {
-  type?: string;
-  payload?: unknown;
-}
-
-interface MessageLike {
-  work?: { activity?: ActivityLike[] };
-}
-
-const GOAL_TOOLS = new Set(["goal", "create_goal", "update_goal", "get_goal"]);
-
-function snapshotFrom(payload: unknown): GoalStripState | null | undefined {
-  const p = payload as { tool?: unknown; goal?: unknown } | null;
-  if (!p || typeof p !== "object" || typeof p.tool !== "string" || !GOAL_TOOLS.has(p.tool)) return undefined;
-  if (!("goal" in p)) return undefined;
-  if (p.goal === null) return null;
-  const goal = p.goal as {
-    objective?: unknown;
-    status?: unknown;
-    floor?: Record<string, unknown> | null;
-    createdAt?: unknown;
-  };
-  if (typeof goal !== "object" || typeof goal.objective !== "string" || !goal.objective.trim()) return undefined;
-  const status = goal.status;
-  if (status !== "active" && status !== "paused" && status !== "complete" && status !== "blocked") return undefined;
-  const floor = goalFloorLabel(goal.floor ?? null);
-  return {
-    objective: goal.objective,
-    status,
-    ...(floor ? { floor } : {}),
-    createdAt: typeof goal.createdAt === "number" ? goal.createdAt : Date.now(),
-  };
-}
-
-export function latestGoal(messages: readonly unknown[]): GoalStripState | null {
-  let latest: GoalStripState | null = null;
-  for (const message of messages) {
-    const activity = (message as MessageLike).work?.activity;
-    if (!activity) continue;
-    for (const item of activity) {
-      if (item?.type !== "tool_result") continue;
-      const snap = snapshotFrom(item.payload);
-      if (snap !== undefined) latest = snap;
-    }
-  }
-  return latest;
 }
 
 export function goalFloorLabel(floor: Record<string, unknown> | null): string | null {
@@ -83,4 +35,9 @@ export function goalObjectiveLabel(objective: string, max = 120): string {
     .replace(/\s+/g, " ")
     .trim();
   return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+}
+
+export function goalWorkedLabel(workedMs: number, floor?: string | null): string {
+  const worked = `${goalElapsedLabel(0, workedMs)} worked`;
+  return floor ? `${worked} · ${floor} floor` : worked;
 }

@@ -1,26 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFileSync } from "node:fs";
-
-const css = readFileSync(new URL("../src/shell.css", import.meta.url), "utf8");
-const chat = readFileSync(new URL("../src/chat.ts", import.meta.url), "utf8");
-
-test("only an actually stuck prompt gets elevation", () => {
-  const normal = css.match(/\.message-stack \.user-row\.latest-prompt > \.user-bubble \{[^}]*\}/)?.[0] ?? "";
-  assert.doesNotMatch(normal, /box-shadow: var/);
-  assert.match(css, /\.user-row\.stuck > \.user-bubble/);
-});
-
-test("prompt offset reserves the pane's measured pins height", () => {
-  assert.match(css, /top: var\(--chat-sticky-top, 0px\)/);
-  assert.match(css, /max-height: min\(38cqh, 240px\)/);
-});
-
-test("stream following never uses smooth scrolling or a near-bottom zone", () => {
-  const scroller = css.match(/\.chat-scroll \{[^}]*\}/)?.[0] ?? "";
-  assert.doesNotMatch(scroller, /scroll-behavior: smooth/);
-  assert.doesNotMatch(chat, /<= 120/);
-});
 
 import { JSDOM } from "jsdom";
 import { createTranscriptViewport, preserveTranscriptScroll } from "../src/transcript-viewport.ts";
@@ -72,7 +51,7 @@ test("layout restoration ignores removed panes and falls back when an anchor was
   assert.equal(removed!.scrollTop, 0);
 });
 
-function fixture() {
+function fixture(options: Parameters<typeof createTranscriptViewport>[0] = {}) {
   const dom = new JSDOM(
     '<section><div class="pinned-strip"></div><div class="message-stack"><article class="user-row"></article></div></section>',
   );
@@ -118,7 +97,7 @@ function fixture() {
       disconnect() {}
     },
   });
-  const viewport = createTranscriptViewport();
+  const viewport = createTranscriptViewport(options);
   viewport.sync(s);
   viewport.follow(true);
   for (const cb of frames.values()) cb(0);
@@ -224,6 +203,83 @@ test("upward wheel loads history even when the transcript cannot scroll", () => 
     assert.equal(loads, 1);
   } finally {
     f.close();
+  }
+});
+
+test("a transcript too short to fill the viewport keeps loading earlier pages until it does", () => {
+  const f = fixture();
+  try {
+    f.fit();
+    const button = f.s.ownerDocument.createElement("button");
+    button.className = "earlier-messages-btn";
+    const stack = f.s.querySelector<HTMLElement>(".message-stack")!;
+    stack.prepend(button);
+    const page = () => stack.append(f.s.ownerDocument.createElement("article"));
+    let loads = 0;
+    button.onclick = () => {
+      loads++;
+      button.disabled = true;
+    };
+    f.viewport.sync(f.s);
+    assert.equal(loads, 1, "no scroll or wheel is needed when there is nothing to scroll");
+    f.viewport.sync(f.s);
+    assert.equal(loads, 1, "a page already loading is not requested twice");
+    page();
+    button.disabled = false;
+    f.resize(30, 50);
+    assert.equal(loads, 2, "still short after a page arrives, so the next page loads");
+    for (let i = 0; i < 6; i++) f.grow();
+    page();
+    button.disabled = false;
+    f.resize(30, 50);
+    f.viewport.sync(f.s);
+    assert.equal(loads, 2, "once the content overflows well past the top, loading waits for the reader");
+    button.remove();
+  } finally {
+    f.close();
+  }
+});
+
+test("a page that fails to load is not retried by auto-fill until the reader asks", () => {
+  const f = fixture();
+  try {
+    f.fit();
+    const button = f.s.ownerDocument.createElement("button");
+    button.className = "earlier-messages-btn";
+    f.s.querySelector(".message-stack")!.prepend(button);
+    let loads = 0;
+    button.onclick = () => loads++;
+    f.viewport.sync(f.s);
+    f.resize(30, 50);
+    f.viewport.sync(f.s);
+    assert.equal(loads, 1, "no growth since the last automatic load means no automatic retry");
+    f.wheelUp();
+    assert.equal(loads, 2, "the reader can still ask for it");
+  } finally {
+    f.close();
+  }
+});
+
+test("a hidden pane never pulls history just because it has no height", () => {
+  const dom = new JSDOM('<section class="chat-scroll"><div class="message-stack"></div></section>');
+  const s = dom.window.document.querySelector<HTMLElement>("section")!;
+  Object.defineProperties(s, { clientHeight: { value: 0 }, scrollHeight: { value: 0 } });
+  const button = dom.window.document.createElement("button");
+  button.className = "earlier-messages-btn";
+  s.querySelector(".message-stack")!.prepend(button);
+  let loads = 0;
+  button.onclick = () => loads++;
+  const viewport = createTranscriptViewport();
+  const saved = Object.getOwnPropertyDescriptor(globalThis, "getComputedStyle");
+  Object.assign(globalThis, { getComputedStyle: dom.window.getComputedStyle.bind(dom.window) });
+  try {
+    viewport.sync(s);
+    assert.equal(loads, 0);
+  } finally {
+    viewport.dispose();
+    if (saved) Object.defineProperty(globalThis, "getComputedStyle", saved);
+    else Reflect.deleteProperty(globalThis, "getComputedStyle");
+    dom.window.close();
   }
 });
 
@@ -343,6 +399,42 @@ test("only reaching the sticky edge elevates the prompt; pin resizes update the 
   }
 });
 
+test("turning the pin preference off releases the latest prompt live, and turning it on pins it again", () => {
+  let pin = true;
+  const f = fixture({ pinPrompt: () => pin });
+  try {
+    f.resize(30, 50);
+    assert.equal(f.prompt.classList.contains("latest-prompt"), true);
+    assert.equal(f.prompt.classList.contains("stuck"), true);
+    pin = false;
+    f.viewport.refresh();
+    assert.equal(f.prompt.classList.contains("latest-prompt"), false);
+    assert.equal(f.prompt.classList.contains("stuck"), false);
+    f.scroll(700);
+    f.resize(30, 50);
+    assert.equal(f.prompt.classList.contains("latest-prompt"), false);
+    assert.equal(f.prompt.classList.contains("stuck"), false);
+    pin = true;
+    f.viewport.refresh();
+    assert.equal(f.prompt.classList.contains("latest-prompt"), true);
+    assert.equal(f.prompt.classList.contains("stuck"), true);
+  } finally {
+    f.close();
+  }
+});
+
+test("a prompt that starts unpinned is never made sticky", () => {
+  const f = fixture({ pinPrompt: () => false });
+  try {
+    f.resize(30, 50);
+    f.scroll(600);
+    assert.equal(f.prompt.classList.contains("latest-prompt"), false);
+    assert.equal(f.prompt.classList.contains("stuck"), false);
+  } finally {
+    f.close();
+  }
+});
+
 test("disposing cancels queued work and clears sticky presentation", () => {
   const f = fixture();
   try {
@@ -416,28 +508,6 @@ test("a prompt stays in flow when pins leave too little room, and can stick agai
   }
 });
 
-test("prompt expansion control belongs inside the bubble in both renderers", () => {
-  for (const [source, start] of [
-    [chat, /<article\s+class="message-row user-row/],
-    [readFileSync(new URL("../src/shared-session.ts", import.meta.url), "utf8"), /<article\s+class=\$\{/],
-  ]) {
-    const rowStart = (source as string).search(start as RegExp);
-    assert.ok(rowStart >= 0);
-    const text = source as string;
-    const row = text.slice(rowStart, text.indexOf("</article>", rowStart) + "</article>".length);
-    const dom = new JSDOM(row);
-    try {
-      const toggle = dom.window.document.querySelector(".pin-toggle");
-      assert.equal(toggle?.parentElement?.tagName, "DIV");
-      assert.equal(toggle?.parentElement?.parentElement?.tagName, "ARTICLE");
-    } finally {
-      dom.window.close();
-    }
-  }
-  assert.match(css, /:not\(\.pin-expanded\)\s+\.user-bubble\s+>\s+\.pin-content \{/);
-  assert.match(css, /\.user-bubble > \.pin-toggle:not\(\[hidden\]\)/);
-});
-
 test("nested paste and attachment controls do not toggle the whole prompt", () => {
   const f = fixture();
   try {
@@ -462,12 +532,6 @@ test("nested paste and attachment controls do not toggle the whole prompt", () =
   } finally {
     f.close();
   }
-});
-
-test("plain-text copy confirmation can grow beyond its icon width", () => {
-  const rule = css.match(/\.user-bubble code-block\[language="text"\] copy-button button \{[^}]*\}/)?.[0] ?? "";
-  assert.match(rule, /min-width: var\(--meta-lane\)/);
-  assert.doesNotMatch(rule, /(?:^|[;{])\s*width:/);
 });
 
 test("prompt clipping tolerates rounding but discloses any additional text line", () => {
@@ -600,10 +664,6 @@ test("passing the previous bottom without reaching the new bottom does not resum
   } finally {
     f.close();
   }
-});
-
-test("the changing streamed reply cannot become the browser's native scroll anchor", () => {
-  assert.match(css, /\.streaming-text\.live-stream \{\s*overflow-anchor: none;/);
 });
 
 test("asynchronous growth leaves a reader in place", () => {

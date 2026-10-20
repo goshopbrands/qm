@@ -1,4 +1,26 @@
+import { isObj } from "../util/objects.ts";
 import { LRUCache } from "lru-cache";
+
+export const SLACK_STATUS_TASK_PREFIX = "qm_status:";
+
+export function isOwnStatusCard(
+  message: { user?: string; bot_id?: string; blocks?: unknown[] },
+  botUserId: string,
+  ownBotId = "",
+): boolean {
+  const own = (botUserId && message.user === botUserId) || (ownBotId && message.bot_id === ownBotId);
+  return Boolean(
+    own &&
+    Array.isArray(message.blocks) &&
+    message.blocks.some(
+      (block) =>
+        isObj(block) &&
+        block.type === "task_card" &&
+        typeof block.task_id === "string" &&
+        block.task_id.startsWith(SLACK_STATUS_TASK_PREFIX),
+    ),
+  );
+}
 
 export function mentionsBot(text: string, botUserId: string): boolean {
   return botUserId ? text.includes(`<@${botUserId}>`) : false;
@@ -177,8 +199,12 @@ export async function dedupedRun(
   return true;
 }
 
-export function isBareStop(text: string): boolean {
-  return /^stop[.!]?$/i.test(text.trim());
+export function isBareStop(text: string, botHandle = ""): boolean {
+  const trimmed = text.trim();
+  const tag = botHandle ? `@${botHandle}` : "";
+  const afterTag = tag && trimmed.startsWith(tag) ? trimmed.slice(tag.length) : undefined;
+  const rest = afterTag !== undefined && /^\s/.test(afterTag) ? afterTag : trimmed;
+  return /^stop[.!]?$/i.test(rest.trim());
 }
 
 export function createInFlightThreadMap(): {
@@ -198,12 +224,13 @@ export function createInFlightThreadMap(): {
 
 export async function maybeInterceptStop(opts: {
   text: string;
+  botHandle?: string;
   threadRef: string;
   getInFlightRun: (threadRef: string) => string | undefined | Promise<string | undefined>;
   signalAbort: (runId: string) => Promise<void>;
   stopConversation?: (threadRef: string) => Promise<boolean>;
 }): Promise<boolean> {
-  if (!isBareStop(opts.text)) return false;
+  if (!isBareStop(opts.text, opts.botHandle)) return false;
   if (opts.stopConversation) return opts.stopConversation(opts.threadRef);
   const runId = await opts.getInFlightRun(opts.threadRef);
   if (!runId) return false;
