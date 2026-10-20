@@ -382,8 +382,6 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
     get: (deps) => deps.teams?.list(),
     apply: async (ctx, actor, scope) => {
       if (!ctx.deps.teams) return { error: "not available on this deployment", status: 404 };
-      if (await actsAsManager(ctx, actor))
-        return { error: "only an org admin can change team membership", status: 403 };
       const change = parseTeamChange(ctx.body);
       if ("error" in change) return change;
       await ctx.deps.teams.apply(change, actor.id);

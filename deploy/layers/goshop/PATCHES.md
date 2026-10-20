@@ -204,10 +204,11 @@ production record's state.
 **Change.** `skills-seed/browse/` is deleted. Nothing else is touched, to keep the core diff
 to a single directory and the retirement to a single `git checkout`.
 
-Core's browse support stays in place and inert: the orchestrator still injects
-`BROWSE_LAB_MAX_STEPS`, `BROWSE_LAB_MODEL`, and `BROWSE_LAB_MODEL_PROVIDER` into sandboxes,
-and the admin model settings still offer a browse model. Neither resolves a skill, so neither
-errors.
+Core's browse support stays in place without a skill to use it: the orchestrator still injects
+`BROWSE_LAB_MAX_STEPS`, `BROWSE_LAB_MODEL`, and `BROWSE_LAB_MODEL_PROVIDER` into sandboxes, and
+on all-internal turns also `BROWSE_LAB_BASE_URL` and a `BROWSE_LAB_MODEL_TOKEN` for
+`/v1/browser-model/chat/completions`; the admin model settings still offer a browse model.
+None of these resolves a skill, so none errors.
 
 Two references to the skill are knowingly left dangling, because removing them would mean
 patching 55 more core files and taking a merge conflict on each at every upstream sync:
@@ -217,8 +218,8 @@ patching 55 more core files and taking a merge conflict on each at every upstrea
   an agent rendering a template is pointed at a skill it will not find. The risk is that it
   hunts for the skill, or installs `browser-use` by hand — the very thing this patch exists
   to prevent.
-- `plugins/admin/public/index.html` still describes the service-credential delivery picker's
-  browser-provider key as being "for the browse skill".
+- `plugins/admin/ui/settings-credentials.ts` still describes the service-credential delivery
+  picker's browser-provider key as being "for the browse skill".
 
 If the template line proves to cause real confusion, remove it in a follow-up patch rather
 than folding it into this one.
@@ -233,8 +234,8 @@ because with the seed directory gone nothing re-publishes it.
 **Deployment settings it relies on.** Deploy core with `qm up --build-from=<this checkout>`.
 The deletion only reaches a deployment through `deploy/core/Dockerfile`'s
 `COPY skills-seed ./skills-seed`; a plain `qm up` pulls the upstream image, which still ships
-`skills-seed/browse`, and its next boot re-publishes the archived record and silently undoes
-the one-time step below.
+`skills-seed/browse`. Since v0.1.15 that boot leaves the archived record archived, but a fresh
+database, or a record that was deleted rather than archived, gets `browse` published.
 
 **Retirement signal.** `check-patches.sh` reads upstream's `skills-seed/browse/SKILL.md` and
 reports a retire candidate when the unconditional pre-baked-runtime claim is gone — that is,
@@ -263,8 +264,9 @@ _tool_, not a layer skill: `install.files` converge by content hash on every pro
 reach imageless machines, and tools do not collide with seed skill names. That needs this
 deployment's `sandbox/` directory (absent today, so `up` currently skips layer sync
 entirely), plus confirmation that the stock sprite image has `python3-venv` and that
-`pypi.org` and `files.pythonhosted.org` pass the egress proxy. The skill text would still
-need a core patch, since a layer cannot override a live seed skill by name.
+`pypi.org` and `files.pythonhosted.org` pass the egress proxy. For the skill text, a layer skill
+named `browse` can now replace the seed: once the seed record is archived,
+`foreignSkillCollision` skips it and the seed installer leaves it archived.
 
 ## Patch 4: org manager role
 
@@ -296,9 +298,12 @@ cannot redirect a secret someone else entered; a per-user MCP server they set mu
 credential host, since it receives each caller's own token. An `oauth-user` MCP server (added
 upstream in v0.1.15) holds no shared secret, so a manager may edit one without re-entry, but its
 URL and its OAuth authorize and token endpoints must all be on its credential host: every user's
-refresh token goes to the token endpoint. A manager cannot change team membership (the `teams`
-admin resource, behind upstream's `team_scopes` flag), because a team's members read its
-conversations.
+refresh token goes to the token endpoint, and its credential host may not equal, contain, or sit
+inside another `oauth-user` server's, because refreshes are routed by host suffix. A manager
+cannot change team membership (the `teams` admin resource, behind upstream's `team_scopes` flag),
+because a team's members read its conversations, and cannot change decision rules (the
+`decisions` resource, added upstream in v0.1.15), because a `turn_start` rule sends every turn's
+latest message, from every scope, to a provider the rule names.
 
 v0.1.15 replaced the memory `PUT` with `POST`, `PATCH`, and `DELETE` on `/v1/admin/memory`; they
 take the same scope check `PUT` had.
@@ -312,7 +317,10 @@ only.
 
 Known risk: a manager can write org-wide skills, org memory, and synced packs that reach every
 agent turn, including org admins', so a malicious manager could try prompt injection against an
-admin's agent; the audit log records who wrote them.
+admin's agent; the audit log records who wrote them. A manager can also add a custom model
+provider and make it the org's default model, which sends every scope's prompts to that
+provider's endpoint; both settings were allowed on 2026-09-29 and are left for the operator to
+reconsider.
 
 Org admins are unchanged. Roles are granted in the dashboard's Users view; `ADMIN_GRANTS` also
 accepts `:org_manager`.
@@ -321,7 +329,15 @@ Enforcement sits in `authorizeAdmin`, which every admin route calls, dashboard o
 managers it looks up the request in the table in `src/admin/manager-access.ts`. Every admin route
 is classified there as `allow`, `deny`, a scope check, or `narrowed` (the handler filters or
 checks the record itself). A route missing from the table is refused to managers, so an upstream
-route added later stays org-admin only until someone classifies it.
+route added later stays org-admin only until someone classifies it. Admin resources written
+through `PUT /v1/admin/scopes/:scope/:resource` have their own table, `MANAGER_RESOURCES`, with the
+same rule: an upstream resource added later is refused to managers until classified.
+`test/admin-manager-role.test.ts` fails while any route or resource is unclassified, and while any
+rule names a route that no longer exists, so a removed route cannot return pre-classified.
+
+The orchestrator keeps two flags: managers count as admins for upstream's native admin tool,
+whose every call goes through `authorizeAdmin`, while the "Acting for an org admin" prompt and
+the org-memory self-write need `role === "org_admin"`.
 
 **Files.** `src/admin/manager-access.ts` (new), `src/admin/admin-grant-store.ts`,
 `src/admin/admin-service.ts`, `src/api/routes/shared.ts`, `src/api/routes/admin/common.ts`,
@@ -330,8 +346,8 @@ route added later stays org-admin only until someone classifies it.
 `src/api/routes/admin/users.ts`, `src/api/routes/admin/sessions.ts` (no raw model requests for
 managers), `src/api/routes/skill-packs.ts` (readable import targets; pack source changes by its
 creator only), `src/api/app-sessions.ts` (promotion from readable scopes), `src/core/orchestrator.ts` (admin
-prompt for org admins only), `src/api/routes/admin-resources.ts` (secret re-entry; no team
-membership changes), `src/api/routes/admin/custom-providers.ts`, and `src/api/routes/admin/mcp-servers.ts` (secret
+prompt for org admins only; native admin tool for every admin), `src/api/routes/admin-resources.ts`
+(secret re-entry), `src/api/routes/admin/custom-providers.ts`, and `src/api/routes/admin/mcp-servers.ts` (secret
 re-entry; `oauth-user` endpoints on the credential host), `src/api/routes/admin/principal-links.ts` (an org admin sign-in cannot be linked onto a
 non-admin identity), `src/wiring.ts` (`canUseSandboxScope` bypass is org admin only),
 `plugins/portal/src/index.ts` (impersonation needs `org_admin`; the admin-login link checks
@@ -340,15 +356,17 @@ no "open web UI as" buttons), `plugins/admin/ui/users.ts` (Make manager; Revoke 
 roles; no role, impersonation, or teammate invite controls for managers),
 `plugins/admin/ui/user-detail.ts` (the keychain card is hidden when refused), and tests
 `test/admin-manager-role.test.ts`, `plugins/portal/test/router.test.ts`,
-`plugins/portal/test/admin-login-role.test.ts`, `plugins/admin/test/manager-users-view.test.ts`.
+`plugins/portal/test/admin-login-role.test.ts`, `plugins/portal/test/api-cors.test.ts` (its fake
+whoami reports the admin role), `plugins/admin/test/manager-users-view.test.ts`.
 
-**On every upstream sync.** `check-patches.sh` lists admin routes and admin-status checks that
-upstream added. For each one, ask the operator whether managers should get it, then add the
-route to `src/admin/manager-access.ts` accordingly. `test/admin-manager-role.test.ts` fails
-while any `/v1/admin` route is unclassified. Checks that are not routes (anything new that
-calls `adminStatusOf`, reads `.isAdmin`, or probes admin status in the portal or plugins)
-are not caught by that test, so read those diff lines and decide whether the new behavior
-should require `role === "org_admin"`.
+**On every upstream sync.** `check-patches.sh` lists admin routes, admin resources, and
+admin-status checks that upstream added. For each one, ask the operator whether managers should
+get it, then classify it in `src/admin/manager-access.ts` (`MANAGER_RULES` or
+`MANAGER_RESOURCES`). `test/admin-manager-role.test.ts` fails while any `/v1/admin` route or
+admin resource is unclassified. Checks that are neither (anything new that calls `adminStatusOf`,
+reads `.isAdmin`, reuses `actorIsOrgAdmin`, or probes admin status in the portal or plugins) are
+not caught by that test, so read those diff lines and decide whether the new behavior should
+require `role === "org_admin"`.
 
 **Retirement signal.** `check-patches.sh` reports a retire candidate when upstream's
 `AdminRole` gains a role besides `org_admin`, meaning upstream may have its own tiered

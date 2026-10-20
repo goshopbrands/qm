@@ -167,6 +167,22 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
         error: "forbidden",
         message: "an oauth-user server's OAuth endpoints must be on its credential host",
       });
+    const overlaps = (other: McpServer): boolean =>
+      typeof credentialHost === "string" &&
+      typeof other.credentialHost === "string" &&
+      (other.credentialHost === credentialHost ||
+        other.credentialHost.endsWith(`.${credentialHost}`) ||
+        credentialHost.endsWith(`.${other.credentialHost}`));
+    if (
+      oauthUser &&
+      (await ctx.deps.mcpServers.list()).some(
+        (other) => other.id !== id && other.auth === "oauth-user" && overlaps(other),
+      )
+    )
+      return sendJson(ctx.res, 403, {
+        error: "forbidden",
+        message: "an oauth-user server's credential host must not overlap another oauth-user server's",
+      });
   }
   const server: McpServer = {
     id,

@@ -11,7 +11,8 @@ import { buildApp, serverDeps } from "../src/wiring.ts";
 import type { ServerDeps } from "../src/api/deps.ts";
 import { testConfig } from "./support/test-config.ts";
 import { adminStatusFromGrants, parseAdminGrants } from "../src/admin/admin-service.ts";
-import { managerAccessFor, managerRefusal } from "../src/admin/manager-access.ts";
+import { MANAGER_RESOURCES, MANAGER_RULES, managerAccessFor, managerRefusal } from "../src/admin/manager-access.ts";
+import { ADMIN_RESOURCES } from "../src/api/routes/admin-resources.ts";
 import { adminRoutes } from "../src/api/routes/admin.ts";
 import { skillPackRoutes } from "../src/api/routes/skill-packs.ts";
 import { apiRoutes, rawRoutes } from "../src/api/routes/index.ts";
@@ -332,6 +333,16 @@ test("a manager must re-enter a stored secret to change where it is sent", async
       (await s.asManager("PUT", oauthServer, { ...oauth, url: "https://evil.example.com/mcp" })).status,
       403,
     );
+    const other = (credentialHost: string) => ({
+      ...oauth,
+      url: `https://mcp.${credentialHost}/mcp`,
+      credentialHost,
+      oauthAuthorizeUrl: `https://auth.${credentialHost}/authorize`,
+      oauthTokenUrl: `https://auth.${credentialHost}/token`,
+    });
+    for (const credentialHost of ["acme.com", "tools.acme.com"])
+      assert.equal((await s.asManager("PUT", "/v1/admin/mcp-servers/corp", other(credentialHost))).status, 403);
+    assert.equal((await s.asManager("PUT", "/v1/admin/mcp-servers/corp", other("example.org"))).status, 200);
   } finally {
     await s.close();
   }
@@ -650,6 +661,52 @@ test("every admin route has an explicit manager rule, so new admin routes are re
     if (!managerAccessFor(method, path)) unclassified.push(`${method} ${path}`);
   }
   assert.deepEqual(unclassified, []);
+});
+
+test("every admin resource has an explicit manager decision, so new resources are refused to managers until classified", async () => {
+  const ids = ADMIN_RESOURCES.map((r) => r.id);
+  assert.deepEqual(
+    ids.filter((id) => !MANAGER_RESOURCES.has(id)),
+    [],
+  );
+  assert.deepEqual(
+    [...MANAGER_RESOURCES.keys()].filter((id) => !ids.includes(id) && id !== "command-policy-simulate"),
+    [],
+  );
+  for (const resource of ["some-new-resource", "decisions", "teams"]) {
+    const refusal = await managerRefusal(
+      { method: "PUT", url: `/v1/admin/scopes/${q(ORG)}/${resource}` },
+      ORG,
+      async () => true,
+    );
+    assert.match(refusal ?? "", /limited to org admins/, resource);
+  }
+});
+
+test("a manager cannot add decision rules, which see every turn's latest message", async () => {
+  const s = await start();
+  try {
+    const rules = `/v1/admin/scopes/${q(ORG)}/decisions`;
+    const refused = await s.asManager("PUT", rules, { providers: [], rules: [] });
+    assert.equal(refused.status, 403);
+    assert.notEqual((await s.asAdmin("PUT", rules, { providers: [], rules: [] })).status, 403);
+  } finally {
+    await s.close();
+  }
+});
+
+test("every manager rule names a route that exists, so a removed route cannot come back pre-classified", () => {
+  const routes = [...adminRoutes, ...skillPackRoutes, ...apiRoutes, ...rawRoutes];
+  const orphaned = MANAGER_RULES.filter((rule) => {
+    const method = rule.method === "*" ? "GET" : rule.method;
+    const path = samplePath(rule.path);
+    return !routes.some((route) =>
+      "path" in route
+        ? route.path === rule.path && (rule.method === "*" || route.method === rule.method)
+        : route.match(method, path),
+    );
+  }).map((rule) => `${rule.method} ${rule.path}`);
+  assert.deepEqual(orphaned, []);
 });
 
 test("an unclassified admin route is refused to a manager", async () => {

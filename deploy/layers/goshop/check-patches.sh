@@ -39,12 +39,13 @@ trap 'git -C "$root" worktree remove --force "$tree" >/dev/null 2>&1 || true; rm
 git worktree add --detach --quiet "$tree" "$ref"
 cp plugins/portal/test/apps-host-forwarding.test.ts "$tree/plugins/portal/test/"
 ln -s "$root/node_modules" "$tree/node_modules"
-(cd "$tree/plugins/portal" && npm ci --ignore-scripts --no-audit --no-fund --silent >/dev/null 2>&1) || {
-  echo "  PROBE ERROR: could not install $ref's portal dependencies (npm ci failed; network?)"
-  exit 1
-}
 status=0
-output="$(cd "$tree/plugins/portal" && node --test test/apps-host-forwarding.test.ts 2>&1)" || status=$?
+if (cd "$tree/plugins/portal" && npm ci --ignore-scripts --no-audit --no-fund --silent >/dev/null 2>&1); then
+  output="$(cd "$tree/plugins/portal" && node --test test/apps-host-forwarding.test.ts 2>&1)" || status=$?
+else
+  status=1
+  output="could not install $ref's portal dependencies (npm ci failed; network?)"
+fi
 passed="$(printf '%s\n' "$output" | sed -n 's/^ℹ pass \([0-9]*\)$/\1/p')"
 failed="$(printf '%s\n' "$output" | sed -n 's/^ℹ fail \([0-9]*\)$/\1/p')"
 if [ "$status" = 0 ]; then
@@ -115,7 +116,13 @@ if [ -n "$new_routes" ]; then
   printf '%s\n' "$new_routes" | sed 's/^/    /'
   review=1
 fi
-new_checks="$(git diff "$base" "$ref" -- src plugins | grep -E '^\+.*(adminStatusOf|adminStatusFromGrants|canAdminister|\.isAdmin\b|org_admin|adminProbe|authorizeAdmin|requireScopedAdmin)' || true)"
+new_resources="$(git diff "$base" "$ref" -- src/api/routes/admin-resources.ts 'src/api/routes/*-resource.ts' | grep -E '^\+ *id: "' || true)"
+if [ -n "$new_resources" ]; then
+  echo "  upstream added admin resources; ask whether managers should get each, then classify it in MANAGER_RESOURCES:"
+  printf '%s\n' "$new_resources" | sed 's/^/    /'
+  review=1
+fi
+new_checks="$(git diff "$base" "$ref" -- src plugins | grep -E '^\+.*(adminStatusOf|adminStatusFromGrants|canAdminister|\.isAdmin\b|org_admin|actorIsOrgAdmin|adminProbe|authorizeAdmin|requireScopedAdmin)' || true)"
 if [ -n "$new_checks" ]; then
   echo "  upstream added admin-status checks; decide whether each should require role org_admin:"
   printf '%s\n' "$new_checks" | sed 's/^/    /'

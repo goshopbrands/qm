@@ -29,7 +29,7 @@ const personalScopeOf = scopeParam((p) => scopeId("personal", p.principalId ?? "
 
 const rule = (method: string, path: string, access: ManagerAccess): ManagerRule => ({ method, path, access });
 
-const RULES: readonly ManagerRule[] = [
+export const MANAGER_RULES: readonly ManagerRule[] = [
   rule("GET", "/v1/admin/whoami", allow),
   rule("GET", "/v1/admin/slack-installation", allow),
   rule("PUT", "/v1/admin/slack-installation", allow),
@@ -57,7 +57,6 @@ const RULES: readonly ManagerRule[] = [
   rule("GET", "/v1/admin/principal-links", allow),
   rule("POST", "/v1/admin/external-users", allow),
   rule("DELETE", "/v1/admin/external-users/:email", allow),
-  rule("GET", "/v1/admin/sandbox-routes", allow),
   rule("POST", "/v1/admin/skill-packs", allow),
   rule("GET", "/v1/admin/skill-packs", allow),
   rule("GET", "/v1/admin/skill-packs/:id/catalog", allow),
@@ -92,11 +91,6 @@ const RULES: readonly ManagerRule[] = [
     "/v1/admin/sandboxes/:scopeId",
     scopeParam((p) => p.scopeId ?? ""),
   ),
-  rule(
-    "POST",
-    "/v1/admin/sandbox-routes/:scopeId/migrate",
-    scopeParam((p) => p.scopeId ?? ""),
-  ),
 
   rule("GET", "/v1/admin/sessions", everyScope),
   rule("GET", "/v1/admin/runs", everyScope),
@@ -122,7 +116,6 @@ const RULES: readonly ManagerRule[] = [
   rule("POST", "/v1/admin/scopes/:scope/auto-flagger/test", deny),
   rule("GET", "/v1/admin/keychain", deny),
   rule("GET", "/v1/admin/security/flags", deny),
-  rule("POST", "/v1/admin/security/release", deny),
   rule("GET", "/v1/admin/slack-mirror", deny),
   rule("GET", "/v1/admin/slack-mirror/messages", deny),
   rule("GET", "/v1/admin/ambient-judgments", deny),
@@ -135,6 +128,43 @@ const RULES: readonly ManagerRule[] = [
   rule("POST", "/v1/admin/principal-links", deny),
   rule("DELETE", "/v1/admin/principal-links/:principalId", deny),
 ];
+
+export const MANAGER_RESOURCES: ReadonlyMap<string, boolean> = new Map([
+  ["security-posture", true],
+  ["sharing-posture", true],
+  ["auto-flagger", true],
+  ["approval-grant-modes", true],
+  ["command-policy", true],
+  ["command-policy-simulate", true],
+  ["soul", true],
+  ["ambient-policy", true],
+  ["egress", true],
+  ["feature-flags", true],
+  ["unfulfilled-insights", true],
+  ["external-slack-participants", true],
+  ["internal-member-overrides", true],
+  ["channel-header-pin-default", true],
+  ["org-ambient", true],
+  ["interactive-fast-mode", true],
+  ["individual-model-auth", true],
+  ["memory-embedding-model", true],
+  ["base-model", true],
+  ["runtime", true],
+  ["cron-runtime", true],
+  ["subagent-runtime", true],
+  ["fallback-runtime", true],
+  ["approved-harnesses", true],
+  ["webui-models", true],
+  ["people-directory-url", true],
+  ["ack-emoji", true],
+  ["branding", true],
+  ["browse-model", true],
+  ["browse-max-steps", true],
+  ["connectors", true],
+  ["service-credentials", true],
+  ["decisions", false],
+  ["teams", false],
+]);
 
 function decodeSegment(segment: string): string | null {
   try {
@@ -167,7 +197,7 @@ export function managerAccessFor(
   method: string,
   pathname: string,
 ): { rule: ManagerRule; access: ManagerAccess; params: Params } | null {
-  for (const r of RULES) {
+  for (const r of MANAGER_RULES) {
     if (r.method !== "*" && r.method !== method) continue;
     const params = matchPath(r.path, pathname);
     if (params) return { rule: r, access: r.access, params };
@@ -188,6 +218,7 @@ export async function managerRefusal(
   const found = managerAccessFor(req.method ?? "GET", pathname);
   if (!found || found.access.kind === "deny") return MANAGER_ACTION_REFUSED;
   const { access, params } = found;
+  if (params.resource !== undefined && MANAGER_RESOURCES.get(params.resource) !== true) return MANAGER_ACTION_REFUSED;
   if (access.kind === "allow") return null;
   const target = access.kind === "scope" && access.target ? access.target(params) : requested;
   if (parseScopeId(target).kind === "org") {

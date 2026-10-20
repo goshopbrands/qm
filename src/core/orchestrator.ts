@@ -1613,6 +1613,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         connectorEnv.BROWSE_LAB_MODEL_PROVIDER = "managed";
         connectorEnv.BROWSE_LAB_MODEL = browserSelection.model ?? "unavailable";
       }
+      let actorIsAdmin = false;
       let actorIsOrgAdmin = false;
       let orgMemoryWrite: ScopeId | undefined;
       let controlClaims: CapabilityClaims | undefined;
@@ -1634,6 +1635,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           const status = await deps.admin
             .adminStatusOf(actor)
             .catch(swallowAs("orchestrator: admin status for turn", { isAdmin: false }));
+          actorIsAdmin = status.isAdmin;
           actorIsOrgAdmin = "role" in status && status.role === "org_admin";
           if (
             actorIsOrgAdmin &&
@@ -2725,7 +2727,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 admin: {
                   call: createAdminCall(deps.apiBaseUrl, connectorEnv.AGENT_API_TOKEN),
                   operationsAvailable:
-                    actorIsOrgAdmin || Boolean(controlClaims?.grants?.some((grant) => grant.startsWith("admin."))),
+                    actorIsAdmin || Boolean(controlClaims?.grants?.some((grant) => grant.startsWith("admin."))),
                 },
               }
             : {}),
